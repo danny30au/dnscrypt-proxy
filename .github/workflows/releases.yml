@@ -29,8 +29,7 @@ jobs:
           go build \
             -trimpath \
             -tags "netgo osusergo" \
-            -pgo=auto
-            -ldflags="-s -w" \
+            -ldflags="-s -w" -pgo=auto \
             -o dnscrypt-proxy \
             ./dnscrypt-proxy
 
