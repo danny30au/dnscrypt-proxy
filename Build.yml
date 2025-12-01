@@ -1,0 +1,43 @@
+name: Build Optimized Go Binary
+
+on:
+  push:
+  workflow_dispatch:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    name: Build (Linux/AMD64)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go 1.25
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.4'
+          cache: true # Automatically caches Go modules and build artifacts
+
+      - name: Build Optimized Binary
+        env:
+          CGO_ENABLED: 0   # Static build (no libc dependency)
+          GOOS: linux
+          GOARCH: amd64
+          GOAMD64: v3      # Target AVX2 (Haswell+) for better crypto performance
+        run: |
+          go build \
+            -trimpath \
+            -ldflags="-s -w" \
+            -o dnscrypt-proxy \
+            ./dnscrypt-proxy
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dnscrypt-proxy-linux-amd64
+          path: dnscrypt-proxy
+          if-no-files-found: error
+          retention-days: 5
