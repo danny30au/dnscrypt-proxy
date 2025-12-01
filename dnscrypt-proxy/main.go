@@ -10,7 +10,6 @@ import (
 	"os/signal"
 	"runtime"
 	"syscall"
-    "arena"
 	"github.com/jedisct1/dlog"
 	"github.com/kardianos/service"
 )
