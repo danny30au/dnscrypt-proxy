@@ -1,7 +1,6 @@
 name: Build Optimized Go Binary
 
 on:
-  push:
   workflow_dispatch:
 
 jobs:
@@ -24,12 +23,13 @@ jobs:
           GOOS: linux
           GOARCH: amd64
           GOAMD64: v3      # Target AVX2 (Haswell+) for better crypto performance
-          GODEBUG: "thp=1,netdns=go"
+          GODEBUG: thp=1,netdns=go
           GOEXPERIMENT: arenas
         run: |
           go build \
             -trimpath \
             -tags "netgo osusergo" \
+            -pgo=auto
             -ldflags="-s -w" \
             -o dnscrypt-proxy \
             ./dnscrypt-proxy
