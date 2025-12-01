@@ -1,29 +1,40 @@
-name: Build OpenWrt Artifact (x86)
+name: Build Optimized Go Binary
 
 on:
- workflow_dispatch:
+  push:
+  workflow_dispatch:
+
 jobs:
-  build-gccgo:
+  build:
+    name: Build (Linux/AMD64)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - name: Install gccgo
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gccgo-go 
+      - name: Setup Go 1.25
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.4'
+          cache: true # Automatically caches Go modules and build artifacts
 
-      - name: Build with shared libgcc
+      - name: Build Optimized Binary
+        env:
+          CGO_ENABLED: 0   # Static build (no libc dependency)
+          GOOS: linux
+          GOARCH: amd64
+          GOAMD64: v3      # Target AVX2 (Haswell+) for better crypto performance
         run: |
-          # Use the 'go' command but force the compiler to be gccgo
-          # -shared-libgcc: Links libgcc dynamically (saves size)
-          # -O3: Maximum optimization
-          go build -compiler gccgo \
-            -gccgoflags "-O3 -shared-libgcc -Wl,--strip-all" \
-            -o myapp_x86 .
-            
+          go build \
+            -trimpath \
+            -ldflags="-s -w" \
+            -o dnscrypt-proxy \
+            ./dnscrypt-proxy
+
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: myapp-x86-gccgo
-          path: myapp_x86
+          name: dnscrypt-proxy-linux-amd64
+          path: dnscrypt-proxy
+          if-no-files-found: error
+          retention-days: 5
