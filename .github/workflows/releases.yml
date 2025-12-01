@@ -28,6 +28,7 @@ jobs:
         run: |
           go build \
             -trimpath \
+            -tags "netgo osusergo" \
             -ldflags="-s -w" \
             -o dnscrypt-proxy \
             ./dnscrypt-proxy
