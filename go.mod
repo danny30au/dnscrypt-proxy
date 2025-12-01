@@ -13,23 +13,23 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/hashicorp/go-immutable-radix v1.3.1
 	github.com/hectane/go-acl v0.0.0-20230122075934-ca0b05cb1adb
-	github.com/jedisct1/dlog v0.9.0
+	github.com/jedisct1/dlog v0.0.0-20241212093805-3c5fd791b405
 	github.com/jedisct1/go-clocksmith v0.0.0-20250224222044-e151f21a353a
-	github.com/jedisct1/go-dnsstamps v0.1.4
+	github.com/jedisct1/go-dnsstamps v0.0.0-20251112173516-191fc465df31
 	github.com/jedisct1/go-hpke-compact v0.0.0-20241212093903-5caa4621366f
 	github.com/jedisct1/go-ipcrypt v0.1.1
-	github.com/jedisct1/go-minisign v0.2.5
+	github.com/jedisct1/go-minisign v0.0.0-20241212093149-d2f9f49435c7
 	github.com/jedisct1/go-sieve-cache v0.1.7
 	github.com/jedisct1/xsecretbox v0.0.0-20241212092125-3afc4917ac41
 	github.com/k-sone/critbitgo v1.4.0
 	github.com/kardianos/service v1.2.4
 	github.com/lifenjoiner/dhcpdns v0.0.7
-	github.com/miekg/dns v1.1.69
+	github.com/miekg/dns v1.1.68
 	github.com/powerman/check v1.9.0
 	github.com/quic-go/quic-go v0.57.1
 	golang.org/x/crypto v0.45.0
 	golang.org/x/net v0.47.0
-	golang.org/x/sys v0.44.0
+	golang.org/x/sys v0.38.0
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 )
 
