@@ -24,7 +24,7 @@ jobs:
           GOARCH: amd64
           GOAMD64: v3      # Target AVX2 (Haswell+) for better crypto performance
           GODEBUG: thp=1,netdns=go
-          GOEXPERIMENT: arenas
+          GOEXPERIMENT: greenteagc
         run: |
           go build \
             -trimpath \
