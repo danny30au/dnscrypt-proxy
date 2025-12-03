@@ -354,11 +354,6 @@ func dddToByte(s []byte) byte {
 	return byte((s[0]-'0')*100 + (s[1]-'0')*10 + (s[2] - '0'))
 }
 
-// isDigit is a helper function to check if a byte is a digit.
-func isDigit(b byte) bool {
-	return b >= '0' && b <= '9'
-}
-
 // PackTXTRR processes an escape sequence string and returns packed bytes.
 // Optimized: eliminate unnecessary memory copy and pre-allocate capacity.
 func PackTXTRR(s string) []byte {
