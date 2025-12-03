@@ -1,7 +1,6 @@
 module github.com/dnscrypt/dnscrypt-proxy
 
 go 1.25.5
-toolchain go1.25.0
 
 exclude google.golang.org/genproto v0.0.0-20230410155749-daa745c078e1
 
