@@ -27,5 +27,5 @@ jobs:
           commit-message: "chore: update go modules to latest"
           title: "chore: update go modules"
           body: "Automated run of `go get -u ./...` and `go mod tidy`."
-          branch: "update-go-mods"
+          branch: "master"
           delete-branch: true
