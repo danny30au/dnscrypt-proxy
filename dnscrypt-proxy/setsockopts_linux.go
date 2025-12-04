@@ -18,9 +18,7 @@ func (proxy *Proxy) udpListenerConfig() (*net.ListenConfig, error) {
 					syscall.IPPROTO_IP,
 					syscall.IP_MTU_DISCOVER,
 					syscall.IP_PMTUDISC_DONT,
-	}, nil
-}
-
+					
 func (proxy *Proxy) tcpListenerConfig() (*net.ListenConfig, error) {
 	return &net.ListenConfig{
 		Control: func(network, address string, c syscall.RawConn) error {
