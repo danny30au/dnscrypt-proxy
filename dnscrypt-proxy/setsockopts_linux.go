@@ -18,9 +18,6 @@ func (proxy *Proxy) udpListenerConfig() (*net.ListenConfig, error) {
 					syscall.IPPROTO_IP,
 					syscall.IP_MTU_DISCOVER,
 					syscall.IP_PMTUDISC_DONT,
-				}}
-			return nil
-		},
 	}, nil
 }
 
