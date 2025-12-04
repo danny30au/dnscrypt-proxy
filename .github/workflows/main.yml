@@ -1,33 +1,67 @@
 name: Update Go Modules
+
 on:
+  workflow_dispatch: # Allows manual triggering
   schedule:
-    - cron: '0 20 * * 0' # Runs every Sunday at 8pm UTC (Monday morning AEDT)
-  workflow_dispatch: # Allows manual triggering from the Actions tab
+    - cron: '0 9 * * 1' # Runs every Monday at 9:00 AM UTC
 
 jobs:
-  update-deps:
+  update-modules:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
     steps:
-      - uses: actions/checkout@v6
-        with:
-         ref: 'master'
-        
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Setup Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v5
         with:
           go-version: 'stable'
+          cache: false # Disable caching to ensure we see fresh versions
 
-      - name: Update Dependencies
+      - name: Update Modules
+        id: update
         run: |
-          go get -u ./...
+          echo "Updating modules..."
+          # Update all direct and indirect dependencies to latest minor/patch
+          go get -u -t ./...
+          
+          # Tidy up go.mod and go.sum
           go mod tidy
+          
+          # Check if there are any changes
+          if git diff --quiet go.mod go.sum; then
+            echo "No updates found."
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "Updates found."
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Verify Build & Test
+        if: steps.update.outputs.has_changes == 'true'
+        run: |
+          # Verify the project still builds and tests pass with new versions
+          go build -v ./...
+          go test -v ./...
 
       - name: Create Pull Request
+        if: steps.update.outputs.has_changes == 'true'
         uses: peter-evans/create-pull-request@v7
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          commit-message: "chore: update go modules to latest"
-          title: "chore: update go modules"
-          body: "Automated run of `go get -u ./...` and `go mod tidy`."
-          branch: "update-dep"
+          commit-message: "chore(deps): update go modules to latest"
+          branch: chore/update-go-modules
           delete-branch: true
+          title: "chore(deps): update go modules"
+          body: |
+            This PR updates all Go modules to their latest minor/patch versions.
+            
+            ### Changes
+            - Ran `go get -u -t ./...`
+            - Ran `go mod tidy`
+            - Verified with `go test ./...`
+          labels: dependencies, go
