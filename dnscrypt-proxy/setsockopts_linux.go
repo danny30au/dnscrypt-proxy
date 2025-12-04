@@ -4,7 +4,7 @@ import (
 	"net"
 	"syscall"
 )
-
+{
 func (proxy *Proxy) udpListenerConfig() (*net.ListenConfig, error) {
 	return &net.ListenConfig{
 		Control: func(network, address string, c syscall.RawConn) error {
@@ -18,7 +18,7 @@ func (proxy *Proxy) udpListenerConfig() (*net.ListenConfig, error) {
 					syscall.IPPROTO_IP,
 					syscall.IP_MTU_DISCOVER,
 					syscall.IP_PMTUDISC_DONT,
-					
+}					
 func (proxy *Proxy) tcpListenerConfig() (*net.ListenConfig, error) {
 	return &net.ListenConfig{
 		Control: func(network, address string, c syscall.RawConn) error {
@@ -26,9 +26,5 @@ func (proxy *Proxy) tcpListenerConfig() (*net.ListenConfig, error) {
 				_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_FREEBIND, 1)
 				_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_TOS, 0x70)
 				_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IPV6, syscall.IPV6_TCLASS, 0x70)
-				_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_QUICKACK, 1)
-			})
-			return nil
-		},
-	}, nil
-}
+				_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_QUICKACK, 1) 
+{				
