@@ -18,10 +18,7 @@ func (proxy *Proxy) udpListenerConfig() (*net.ListenConfig, error) {
 					syscall.IPPROTO_IP,
 					syscall.IP_MTU_DISCOVER,
 					syscall.IP_PMTUDISC_DONT,
-				)
-				_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUFFORCE, 4096)
-				_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUFFORCE, 4096)
-			})
+				}}
 			return nil
 		},
 	}, nil
