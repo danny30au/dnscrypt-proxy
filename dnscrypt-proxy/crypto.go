@@ -124,7 +124,9 @@ func (proxy *Proxy) Encrypt(
     }
 
     encrypted = make([]byte, 0, paddedLength)
-    encrypted = append(encrypted, serverInfo.MagicQuery[:], publicKey[:]...)
+    // FIX: Split append calls to fix "too many arguments" error
+    encrypted = append(encrypted, serverInfo.MagicQuery[:]...)
+    encrypted = append(encrypted, publicKey[:]...)
     encrypted = append(encrypted, nonce[:HalfNonceSize]...)
 
     padded := pad(packet, paddedLength-QueryOverhead)
