@@ -13,9 +13,8 @@ import (
 )
 
 const (
-	myResolverHost   string = "resolver.dnscrypt.info."
-	nonexistentName  string = "nonexistent-zone.dnscrypt-test."
-	MaxDNSPacketSize int    = 4096
+	myResolverHost  string = "resolver.dnscrypt.info."
+	nonexistentName string = "nonexistent-zone.dnscrypt-test."
 )
 
 var (
@@ -88,18 +87,6 @@ func resolveQuery(server string, qName string, qType uint16, sendClientSubnet bo
 		return response, nil
 	}
 	return nil, errors.New("timeout after 3 attempts")
-}
-
-func ExtractHostAndPort(server string, defaultPort int) (string, int) {
-	host, port, err := net.SplitHostPort(server)
-	if err != nil {
-		return server, defaultPort
-	}
-	portNum := defaultPort
-	if port != "" {
-		fmt.Sscanf(port, "%d", &portNum)
-	}
-	return host, portNum
 }
 
 func Resolve(server string, name string, singleResolver bool) {
