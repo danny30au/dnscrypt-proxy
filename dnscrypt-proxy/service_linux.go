@@ -25,10 +25,12 @@ func ServiceManagerStartNotify() error {
 }
 
 func ServiceManagerReadyNotify() error {
-    sent, err := daemon.SdNotify(false, daemon.SdNotifyReady+"
-"+SdNotifyStatus+"Ready")
+    sent, err := daemon.SdNotify(false, daemon.SdNotifyReady)
     if err != nil {
         return fmt.Errorf("failed to notify systemd: %w", err)
+    }
+    if sent {
+        daemon.SdNotify(false, SdNotifyStatus+"Ready")
     }
     if !sent {
         // Not running under systemd supervision
@@ -67,9 +69,9 @@ func ServiceManagerStopNotify() error {
     if watchdogCancel != nil {
         watchdogCancel()
     }
-    if _, err := daemon.SdNotify(false, daemon.SdNotifyStopping+"
-"+SdNotifyStatus+"Stopping..."); err != nil {
+    if _, err := daemon.SdNotify(false, daemon.SdNotifyStopping); err != nil {
         return fmt.Errorf("failed to notify systemd: %w", err)
     }
+    daemon.SdNotify(false, SdNotifyStatus+"Stopping...")
     return nil
 }
