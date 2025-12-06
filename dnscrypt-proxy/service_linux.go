@@ -7,7 +7,7 @@ import (
     "fmt"
     "time"
 
-    "github.com/coreos/go-systemd/v22/daemon"
+    "github.com/coreos/go-systemd/daemon"
 )
 
 const SdNotifyStatus = "STATUS="
