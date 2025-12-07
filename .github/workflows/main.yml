@@ -16,10 +16,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6.0.1
+        uses: actions/checkout@v4
 
       - name: Setup Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v5
         with:
           go-version: 'stable'
           cache: false # Disable caching to ensure we see fresh versions
@@ -30,12 +30,13 @@ jobs:
           echo "Updating modules..."
           # Update all direct and indirect dependencies to latest minor/patch
           go get -u -t ./...
-          go mod vendor
           # Tidy up go.mod and go.sum
           go mod tidy
+          # Regenerate vendor directory to match go.mod/go.sum
+          go mod vendor
           
-          # Check if there are any changes
-          if git diff --quiet go.mod go.sum; then
+          # Check if there are any changes, including vendor/
+          if git diff --quiet go.mod go.sum vendor/; then
             echo "No updates found."
             echo "has_changes=false" >> $GITHUB_OUTPUT
           else
@@ -46,7 +47,8 @@ jobs:
       - name: Verify Build & Test
         if: steps.update.outputs.has_changes == 'true'
         run: |
-          # Verify the project still builds and tests pass with new versions
+          # Prefer using vendored deps when present
+          go env -w GOFLAGS="-mod=vendor"
           go build -v -o /dev/null ./...
           go test -v ./...
 
@@ -60,10 +62,11 @@ jobs:
           delete-branch: true
           title: "chore(deps): update go modules"
           body: |
-            This PR updates all Go modules to their latest minor/patch versions.
+            This PR updates all Go modules to their latest minor/patch versions and refreshes the vendor directory.
             
             ### Changes
             - Ran `go get -u -t ./...`
             - Ran `go mod tidy`
-            - Verified with `go test ./...`
+            - Ran `go mod vendor`
+            - Verified with `GOFLAGS=-mod=vendor go test ./...`
           labels: dependencies, go
