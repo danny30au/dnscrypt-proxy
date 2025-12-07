@@ -518,6 +518,3 @@ func (xTransport *XTransport) resolveUsingServers(
                 return ips, ttl, nil
             }
             if err == nil {
-                er
-}
-}
