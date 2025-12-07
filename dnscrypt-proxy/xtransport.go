@@ -520,3 +520,4 @@ func (xTransport *XTransport) resolveUsingServers(
             if err == nil {
                 er
 }
+}
