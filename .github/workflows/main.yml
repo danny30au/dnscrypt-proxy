@@ -30,10 +30,9 @@ jobs:
           echo "Updating modules..."
           # Update all direct and indirect dependencies to latest minor/patch
           go get -u -t ./...
-          
+          go mod vendor
           # Tidy up go.mod and go.sum
           go mod tidy
-          go mod vendor
           
           # Check if there are any changes
           if git diff --quiet go.mod go.sum; then
