@@ -1,5 +1,7 @@
 name: Update Go Modules
-
+permissions:
+  contents: write
+  
 on:
   workflow_dispatch: # Allows manual triggering
   schedule:
