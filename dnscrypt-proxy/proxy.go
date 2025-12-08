@@ -110,13 +110,6 @@ type Proxy struct {
 	ipCryptConfig                 *IPCryptConfig
 }
 
-
-var udpBufPool = sync.Pool{
-	New: func() interface{} {
-		return make([]byte, MaxDNSPacketSize-1)
-	},
-}
-
 func (proxy *Proxy) registerUDPListener(conn *net.UDPConn) {
 	proxy.listenersMu.Lock()
 	proxy.udpListeners = append(proxy.udpListeners, conn)
@@ -441,21 +434,12 @@ func (proxy *Proxy) updateRegisteredServers() error {
 func (proxy *Proxy) udpListener(clientPc *net.UDPConn) {
 	defer clientPc.Close()
 	for {
-		// Use the pool to get a buffer to minimize GC pressure
-		buffer := udpBufPool.Get().([]byte)
-
+		buffer := make([]byte, MaxDNSPacketSize-1)
 		length, clientAddr, err := clientPc.ReadFrom(buffer)
 		if err != nil {
-			udpBufPool.Put(buffer)
 			return
 		}
-
-		// Copy the actual data to a new, smaller slice.
-		packet := make([]byte, length)
-		copy(packet, buffer[:length])
-
-		udpBufPool.Put(buffer)
-
+		packet := buffer[:length]
 		if !proxy.clientsCountInc() {
 			dlog.Warnf("Too many incoming connections (max=%d)", proxy.maxClients)
 			dlog.Debugf("Number of goroutines: %d", runtime.NumGoroutine())
@@ -470,7 +454,6 @@ func (proxy *Proxy) udpListener(clientPc *net.UDPConn) {
 			) // respond synchronously, but only to cached/synthesized queries
 			continue
 		}
-
 		go func() {
 			defer proxy.clientsCountDec()
 			proxy.processIncomingQuery("udp", proxy.mainProto, packet, &clientAddr, clientPc, time.Now(), false)
@@ -585,25 +568,12 @@ func (proxy *Proxy) startAcceptingClients() {
 }
 
 func (proxy *Proxy) prepareForRelay(ip net.IP, port int, encryptedQuery *[]byte) {
-	// 10 bytes header + 16 bytes IP + 2 bytes port = 28 bytes overhead
-	// Pre-allocate the exact size to avoid multiple reallocations during append
-	totalSize := 10 + 16 + 2 + len(*encryptedQuery)
-
-	relayedQuery := make([]byte, totalSize)
-
-	// Header: 0xff * 8, 0x00 * 2
-	copy(relayedQuery[0:8], []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff})
-	// relayedQuery[8] and [9] are already 0 from make()
-
-	// IP
-	copy(relayedQuery[10:26], ip.To16())
-
-	// Port
-	binary.BigEndian.PutUint16(relayedQuery[26:28], uint16(port))
-
-	// Query
-	copy(relayedQuery[28:], *encryptedQuery)
-
+	anonymizedDNSHeader := []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00}
+	relayedQuery := append(anonymizedDNSHeader, ip.To16()...)
+	var tmp [2]byte
+	binary.BigEndian.PutUint16(tmp[0:2], uint16(port))
+	relayedQuery = append(relayedQuery, tmp[:]...)
+	relayedQuery = append(relayedQuery, *encryptedQuery...)
 	*encryptedQuery = relayedQuery
 }
 
@@ -621,7 +591,7 @@ func (proxy *Proxy) exchangeWithUDPServer(
 	var pc net.Conn
 	proxyDialer := proxy.xTransport.proxyDialer
 	if proxyDialer == nil {
-		pc, err = net.DialTimeout("udp", upstreamAddr.String(), serverInfo.Timeout)
+		pc, err = net.DialUDP("udp", nil, upstreamAddr)
 	} else {
 		pc, err = (*proxyDialer).Dial("udp", upstreamAddr.String())
 	}
@@ -693,31 +663,23 @@ func (proxy *Proxy) exchangeWithTCPServer(
 }
 
 func (proxy *Proxy) clientsCountInc() bool {
-	for {
-		count := atomic.LoadUint32(&proxy.clientsCount)
-		if count >= proxy.maxClients {
-			return false
-		}
-		if atomic.CompareAndSwapUint32(&proxy.clientsCount, count, count+1) {
-			dlog.Debugf("clients count: %d", count+1)
-			return true
-		}
+	// Optimistic increment: faster than CAS loop under contention
+	newCount := atomic.AddUint32(&proxy.clientsCount, 1)
+
+	if newCount > proxy.maxClients {
+		// We exceeded the limit, revert immediately
+		atomic.AddUint32(&proxy.clientsCount, ^uint32(0)) // -1
+		return false
 	}
+
+	dlog.Debugf("clients count: %d", newCount)
+	return true
 }
 
 func (proxy *Proxy) clientsCountDec() {
-	for {
-		count := atomic.LoadUint32(&proxy.clientsCount)
-		if count == 0 {
-			// Already at zero, nothing to do
-			break
-		}
-		if atomic.CompareAndSwapUint32(&proxy.clientsCount, count, count-1) {
-			dlog.Debugf("clients count: %d", count-1)
-			break
-		}
-		// CAS failed, retry with updated count
-	}
+	// Atomic decrement is safe because this is always paired with a successful Inc
+	newCount := atomic.AddUint32(&proxy.clientsCount, ^uint32(0)) // -1
+	dlog.Debugf("clients count: %d", newCount)
 }
 
 func (proxy *Proxy) getDynamicTimeout() time.Duration {
