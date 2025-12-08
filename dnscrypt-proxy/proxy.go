@@ -110,6 +110,13 @@ type Proxy struct {
 	ipCryptConfig                 *IPCryptConfig
 }
 
+
+var udpBufPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, MaxDNSPacketSize-1)
+	},
+}
+
 func (proxy *Proxy) registerUDPListener(conn *net.UDPConn) {
 	proxy.listenersMu.Lock()
 	proxy.udpListeners = append(proxy.udpListeners, conn)
@@ -434,12 +441,21 @@ func (proxy *Proxy) updateRegisteredServers() error {
 func (proxy *Proxy) udpListener(clientPc *net.UDPConn) {
 	defer clientPc.Close()
 	for {
-		buffer := make([]byte, MaxDNSPacketSize-1)
+		// Use the pool to get a buffer to minimize GC pressure
+		buffer := udpBufPool.Get().([]byte)
+
 		length, clientAddr, err := clientPc.ReadFrom(buffer)
 		if err != nil {
+			udpBufPool.Put(buffer)
 			return
 		}
-		packet := buffer[:length]
+
+		// Copy the actual data to a new, smaller slice.
+		packet := make([]byte, length)
+		copy(packet, buffer[:length])
+
+		udpBufPool.Put(buffer)
+
 		if !proxy.clientsCountInc() {
 			dlog.Warnf("Too many incoming connections (max=%d)", proxy.maxClients)
 			dlog.Debugf("Number of goroutines: %d", runtime.NumGoroutine())
@@ -454,6 +470,7 @@ func (proxy *Proxy) udpListener(clientPc *net.UDPConn) {
 			) // respond synchronously, but only to cached/synthesized queries
 			continue
 		}
+
 		go func() {
 			defer proxy.clientsCountDec()
 			proxy.processIncomingQuery("udp", proxy.mainProto, packet, &clientAddr, clientPc, time.Now(), false)
@@ -568,12 +585,25 @@ func (proxy *Proxy) startAcceptingClients() {
 }
 
 func (proxy *Proxy) prepareForRelay(ip net.IP, port int, encryptedQuery *[]byte) {
-	anonymizedDNSHeader := []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00}
-	relayedQuery := append(anonymizedDNSHeader, ip.To16()...)
-	var tmp [2]byte
-	binary.BigEndian.PutUint16(tmp[0:2], uint16(port))
-	relayedQuery = append(relayedQuery, tmp[:]...)
-	relayedQuery = append(relayedQuery, *encryptedQuery...)
+	// 10 bytes header + 16 bytes IP + 2 bytes port = 28 bytes overhead
+	// Pre-allocate the exact size to avoid multiple reallocations during append
+	totalSize := 10 + 16 + 2 + len(*encryptedQuery)
+
+	relayedQuery := make([]byte, totalSize)
+
+	// Header: 0xff * 8, 0x00 * 2
+	copy(relayedQuery[0:8], []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff})
+	// relayedQuery[8] and [9] are already 0 from make()
+
+	// IP
+	copy(relayedQuery[10:26], ip.To16())
+
+	// Port
+	binary.BigEndian.PutUint16(relayedQuery[26:28], uint16(port))
+
+	// Query
+	copy(relayedQuery[28:], *encryptedQuery)
+
 	*encryptedQuery = relayedQuery
 }
 
