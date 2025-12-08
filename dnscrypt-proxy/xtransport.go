@@ -506,4 +506,343 @@ func (xTransport *XTransport) resolveUsingServers(
                 err = errors.New("no IP addresses returned")
             }
             lastErr = err
-            dlog.Debugf("Resolver attempt %d fa
+            dlog.Debugf("Resolver attempt %d failed for [%s] using [%s] (%s): %v", attempt, host, resolver, proto, err)
+            if attempt < resolverRetryCount {
+                time.Sleep(delay)
+                if delay < resolverRetryMaxBackoff {
+                    delay *= 2
+                    if delay > resolverRetryMaxBackoff {
+                        delay = resolverRetryMaxBackoff
+                    }
+                }
+            }
+        }
+        dlog.Infof("Unable to resolve [%s] using resolver [%s] (%s): %v", host, resolver, proto, lastErr)
+    }
+    if lastErr == nil {
+        lastErr = errors.New("no IP addresses returned")
+    }
+    return nil, 0, lastErr
+}
+
+func (xTransport *XTransport) resolve(host string, returnIPv4, returnIPv6 bool) (ips []net.IP, ttl time.Duration, err error) {
+    protos := []string{"udp", "tcp"}
+    if xTransport.mainProto == "tcp" {
+        protos = []string{"tcp", "udp"}
+    }
+    if xTransport.ignoreSystemDNS {
+        if xTransport.internalResolverReady {
+            for _, proto := range protos {
+                ips, ttl, err = xTransport.resolveUsingServers(proto, host, xTransport.internalResolvers, returnIPv4, returnIPv6)
+                if err == nil {
+                    break
+                }
+            }
+        } else {
+            err = errors.New("dnscrypt-proxy service is not usable yet")
+            dlog.Notice(err)
+        }
+    } else {
+        ips, ttl, err = xTransport.resolveUsingSystem(host, returnIPv4, returnIPv6)
+        if err != nil {
+            err = errors.New("System DNS is not usable yet")
+            dlog.Notice(err)
+        }
+    }
+    if err != nil {
+        for _, proto := range protos {
+            if err != nil {
+                dlog.Noticef(
+                    "Resolving server host [%s] using bootstrap resolvers over %s",
+                    host,
+                    proto,
+                )
+            }
+            ips, ttl, err = xTransport.resolveUsingServers(proto, host, xTransport.bootstrapResolvers, returnIPv4, returnIPv6)
+            if err == nil {
+                break
+            }
+        }
+    }
+    if err != nil && xTransport.ignoreSystemDNS {
+        dlog.Noticef("Bootstrap resolvers didn't respond - Trying with the system resolver as a last resort")
+        ips, ttl, err = xTransport.resolveUsingSystem(host, returnIPv4, returnIPv6)
+    }
+    return ips, ttl, err
+}
+
+func (xTransport *XTransport) resolveAndUpdateCache(host string) error {
+    if xTransport.proxyDialer != nil || xTransport.httpProxyFunction != nil {
+        return nil
+    }
+    if ParseIP(host) != nil {
+        return nil
+    }
+    cachedIPs, expired, updating := xTransport.loadCachedIPs(host)
+    if len(cachedIPs) > 0 && (!expired || updating) {
+        return nil
+    }
+    xTransport.markUpdatingCachedIP(host)
+    ips, ttl, err := xTransport.resolve(host, xTransport.useIPv4, xTransport.useIPv6)
+    if ttl < MinResolverIPTTL {
+        ttl = MinResolverIPTTL
+    }
+    selectedIPs := ips
+    if (err != nil || len(selectedIPs) == 0) && len(cachedIPs) > 0 {
+        dlog.Noticef("Using stale [%v] cached address for a grace period", host)
+        selectedIPs = cachedIPs
+        ttl = ExpiredCachedIPGraceTTL
+        err = nil
+    }
+    if err != nil {
+        return err
+    }
+    if len(selectedIPs) == 0 {
+        if !xTransport.useIPv4 && xTransport.useIPv6 {
+            dlog.Warnf("no IPv6 address found for [%s]", host)
+        } else if xTransport.useIPv4 && !xTransport.useIPv6 {
+            dlog.Warnf("no IPv4 address found for [%s]", host)
+        } else {
+            dlog.Errorf("no IP address found for [%s]", host)
+        }
+        return nil
+    }
+    xTransport.saveCachedIPs(host, selectedIPs, ttl)
+    return nil
+}
+
+func (xTransport *XTransport) Fetch(
+    method string,
+    url *url.URL,
+    accept string,
+    contentType string,
+    body *[]byte,
+    timeout time.Duration,
+    compress bool,
+) ([]byte, int, *tls.ConnectionState, time.Duration, error) {
+    if timeout <= 0 {
+        timeout = xTransport.timeout
+    }
+    client := http.Client{
+        Transport: xTransport.transport,
+        Timeout:   timeout,
+    }
+    host, port := ExtractHostAndPort(url.Host, 443)
+    hasAltSupport := false
+    if xTransport.h3Transport != nil {
+        if xTransport.http3Probe {
+            client.Transport = xTransport.h3Transport
+            dlog.Debugf("Probing HTTP/3 transport for [%s]", url.Host)
+        } else {
+            xTransport.altSupport.RLock()
+            var altPort uint16
+            altPort, hasAltSupport = xTransport.altSupport.cache[url.Host]
+            xTransport.altSupport.RUnlock()
+            if hasAltSupport && altPort > 0 {
+                if int(altPort) == port {
+                    client.Transport = xTransport.h3Transport
+                    dlog.Debugf("Using HTTP/3 transport for [%s]", url.Host)
+                }
+            }
+        }
+    }
+    header := map[string][]string{"User-Agent": {"dnscrypt-proxy"}}
+    if len(accept) > 0 {
+        header["Accept"] = []string{accept}
+    }
+    if len(contentType) > 0 {
+        header["Content-Type"] = []string{contentType}
+    }
+    header["Cache-Control"] = []string{"max-stale"}
+    if body != nil {
+        h := sha512.Sum512(*body)
+        qs := url.Query()
+        qs.Add("body_hash", hex.EncodeToString(h[:32]))
+        url2 := *url
+        url2.RawQuery = qs.Encode()
+        url = &url2
+    }
+    if xTransport.proxyDialer == nil && strings.HasSuffix(host, ".onion") {
+        return nil, 0, nil, 0, errors.New("Onion service is not reachable without Tor")
+    }
+    if err := xTransport.resolveAndUpdateCache(host); err != nil {
+        dlog.Errorf(
+            "Unable to resolve [%v] - Make sure that the system resolver works, "+
+                "or that `bootstrap_resolvers` has been set to resolvers that can be reached",
+            host,
+        )
+        return nil, 0, nil, 0, err
+    }
+    if compress && body == nil {
+        header["Accept-Encoding"] = []string{"gzip"}
+    }
+    req := &http.Request{
+        Method: method,
+        URL:    url,
+        Header: header,
+        Close:  false,
+    }
+    if body != nil {
+        req.ContentLength = int64(len(*body))
+        req.Body = io.NopCloser(bytes.NewReader(*body))
+    }
+    start := time.Now()
+    resp, err := client.Do(req)
+    rtt := time.Since(start)
+    if err != nil && client.Transport == xTransport.h3Transport {
+        if xTransport.http3Probe {
+            dlog.Debugf("HTTP/3 probe failed for [%s]: [%s] - falling back to HTTP/2", url.Host, err)
+        } else {
+            dlog.Debugf("HTTP/3 connection failed for [%s]: [%s] - falling back to HTTP/2", url.Host, err)
+        }
+        xTransport.altSupport.Lock()
+        xTransport.altSupport.cache[url.Host] = 0
+        xTransport.altSupport.Unlock()
+        client.Transport = xTransport.transport
+        start = time.Now()
+        resp, err = client.Do(req)
+        rtt = time.Since(start)
+    }
+    if err == nil {
+        if resp == nil {
+            err = errors.New("Webserver returned an error")
+        } else if resp.StatusCode < 200 || resp.StatusCode > 299 {
+            err = errors.New(resp.Status)
+        }
+    } else {
+        dlog.Debugf("HTTP client error: [%v] - closing idle connections", err)
+        xTransport.transport.CloseIdleConnections()
+    }
+    statusCode := 503
+    if resp != nil {
+        defer resp.Body.Close()
+        statusCode = resp.StatusCode
+    }
+    if err != nil {
+        dlog.Debugf("[%s]: [%s]", req.URL, err)
+        if xTransport.tlsCipherSuite != nil && strings.Contains(err.Error(), "handshake failure") {
+            dlog.Warnf(
+                "TLS handshake failure - Try changing or deleting the " +
+                    "tls_cipher_suite value in the configuration file",
+            )
+            xTransport.tlsCipherSuite = nil
+            xTransport.rebuildTransport()
+        }
+        return nil, statusCode, nil, rtt, err
+    }
+    if xTransport.h3Transport != nil && !hasAltSupport {
+        skipAltSvcParsing := false
+        if xTransport.http3Probe {
+            xTransport.altSupport.RLock()
+            altPort, inCache := xTransport.altSupport.cache[url.Host]
+            xTransport.altSupport.RUnlock()
+            if inCache && altPort == 0 {
+                dlog.Debugf("Skipping Alt-Svc parsing for [%s] - previously failed HTTP/3 probe", url.Host)
+                skipAltSvcParsing = true
+            }
+        }
+        if !skipAltSvcParsing {
+            if alt, found := resp.Header["Alt-Svc"]; found {
+                dlog.Debugf("Alt-Svc [%s]: [%s]", url.Host, alt)
+                altPort := uint16(port & 0xffff)
+                for i, xalt := range alt {
+                    for j, v := range strings.Split(xalt, ";") {
+                        if i >= 8 || j >= 16 {
+                            break
+                        }
+                        v = strings.TrimSpace(v)
+                        if strings.HasPrefix(v, "h3=":") {
+                            v = strings.TrimPrefix(v, "h3=":")
+                            v = strings.TrimSuffix(v, """)
+                            if xAltPort, err := strconv.ParseUint(v, 10, 16); err == nil && xAltPort <= 65535 {
+                                altPort = uint16(xAltPort)
+                                dlog.Debugf("Using HTTP/3 for [%s]", url.Host)
+                                break
+                            }
+                        }
+                    }
+                }
+                xTransport.altSupport.Lock()
+                xTransport.altSupport.cache[url.Host] = altPort
+                dlog.Debugf("Caching altPort for [%v]", url.Host)
+                xTransport.altSupport.Unlock()
+            }
+        }
+    }
+    tls := resp.TLS
+    var bodyReader io.ReadCloser = resp.Body
+    if compress && resp.Header.Get("Content-Encoding") == "gzip" {
+        bodyReader, err = gzip.NewReader(io.LimitReader(resp.Body, MaxHTTPBodyLength))
+        if err != nil {
+            return nil, statusCode, tls, rtt, err
+        }
+        defer bodyReader.Close()
+    }
+    bin, err := io.ReadAll(io.LimitReader(bodyReader, MaxHTTPBodyLength))
+    if err != nil {
+        return nil, statusCode, tls, rtt, err
+    }
+    return bin, statusCode, tls, rtt, err
+}
+
+func (xTransport *XTransport) GetWithCompression(
+    url *url.URL,
+    accept string,
+    timeout time.Duration,
+) ([]byte, int, *tls.ConnectionState, time.Duration, error) {
+    return xTransport.Fetch("GET", url, accept, "", nil, timeout, true)
+}
+
+func (xTransport *XTransport) Get(
+    url *url.URL,
+    accept string,
+    timeout time.Duration,
+) ([]byte, int, *tls.ConnectionState, time.Duration, error) {
+    return xTransport.Fetch("GET", url, accept, "", nil, timeout, false)
+}
+
+func (xTransport *XTransport) Post(
+    url *url.URL,
+    accept string,
+    contentType string,
+    body *[]byte,
+    timeout time.Duration,
+) ([]byte, int, *tls.ConnectionState, time.Duration, error) {
+    return xTransport.Fetch("POST", url, accept, contentType, body, timeout, false)
+}
+
+func (xTransport *XTransport) dohLikeQuery(
+    dataType string,
+    useGet bool,
+    url *url.URL,
+    body []byte,
+    timeout time.Duration,
+) ([]byte, int, *tls.ConnectionState, time.Duration, error) {
+    if useGet {
+        qs := url.Query()
+        encBody := base64.RawURLEncoding.EncodeToString(body)
+        qs.Add("dns", encBody)
+        url2 := *url
+        url2.RawQuery = qs.Encode()
+        return xTransport.Get(&url2, dataType, timeout)
+    }
+    return xTransport.Post(url, dataType, dataType, &body, timeout)
+}
+
+func (xTransport *XTransport) DoHQuery(
+    useGet bool,
+    url *url.URL,
+    body []byte,
+    timeout time.Duration,
+) ([]byte, int, *tls.ConnectionState, time.Duration, error) {
+    return xTransport.dohLikeQuery("application/dns-message", useGet, url, body, timeout)
+}
+
+func (xTransport *XTransport) ObliviousDoHQuery(
+    useGet bool,
+    url *url.URL,
+    body []byte,
+    timeout time.Duration,
+) ([]byte, int, *tls.ConnectionState, time.Duration, error) {
+    return xTransport.dohLikeQuery("application/oblivious-dns-message", useGet, url, body, timeout)
+}
