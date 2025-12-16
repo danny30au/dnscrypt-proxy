@@ -15,15 +15,15 @@ jobs:
       - name: Setup Go 1.25
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25.4'
-          cache: true # Automatically caches Go modules and build artifacts
+          go-version: '1.25.5'
+          cache: true:
 
       - name: Build Optimized Binary
         env:
-          CGO_ENABLED: 0   # Static build (no libc dependency)
+          CGO_ENABLED: 0
           GOOS: linux
           GOARCH: amd64
-          GOAMD64: v3      # Target AVX2 (Haswell+) for better crypto performance
+          GOAMD64: v3
           GODEBUG: "thp=1,netdns=go"
         run: |
           go build \
