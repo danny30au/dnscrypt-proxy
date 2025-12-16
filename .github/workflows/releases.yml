@@ -1,7 +1,12 @@
+name: Build Optimized Go Binary
+
+on:
+  push:
+  workflow_dispatch:
+
 jobs:
-manual_workflow:
   build:
-    name: Build (Linux/AMD64 - Zen+)
+    name: Build (Linux/AMD64)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -10,21 +15,19 @@ manual_workflow:
       - name: Setup Go 1.25
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25.5'
-          cache: true
+          go-version: '1.25.4'
+          cache: true # Automatically caches Go modules and build artifacts
 
       - name: Build Optimized Binary
         env:
-          CGO_ENABLED: 0
+          CGO_ENABLED: 0   # Static build (no libc dependency)
           GOOS: linux
           GOARCH: amd64
-          GOAMD64: v3  # Optimal for Ryzen 3200G (Zen+ / AVX2)
+          GOAMD64: v3      # Target AVX2 (Haswell+) for better crypto performance
+          GODEBUG: "thp=1,netdns=go"
         run: |
-          # GODEBUG is runtime-only; apply "thp=1,netdns=go" on the target machine.
-          # If a 'default.pgo' file exists in the root, Go 1.25 will use it automatically.
           go build \
             -trimpath \
-            -tags "netgo osusergo" \
             -ldflags="-s -w" \
             -o dnscrypt-proxy \
             ./dnscrypt-proxy
@@ -32,7 +35,7 @@ manual_workflow:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: dnscrypt-proxy-linux-amd64-zenplus
+          name: dnscrypt-proxy-linux-amd64
           path: dnscrypt-proxy
           if-no-files-found: error
           retention-days: 5
