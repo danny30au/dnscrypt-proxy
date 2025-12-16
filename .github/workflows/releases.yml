@@ -1,4 +1,5 @@
 jobs:
+manual_workflow:
   build:
     name: Build (Linux/AMD64 - Zen+)
     runs-on: ubuntu-latest
