@@ -1,6 +1,11 @@
 version: 2
-on;
-   workflow_dispatch:
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: 'Pull request number'
+        required: true
    
 updates:
   # Maintain dependencies for GitHub Actions
