@@ -11,7 +11,7 @@ codeberg.org/miekg/dns/internal/unpack
 codeberg.org/miekg/dns/pool
 codeberg.org/miekg/dns/rdata
 codeberg.org/miekg/dns/svcb
-# github.com/BurntSushi/toml v1.5.0
+# github.com/BurntSushi/toml v1.6.0
 ## explicit; go 1.18
 github.com/BurntSushi/toml
 github.com/BurntSushi/toml/internal
