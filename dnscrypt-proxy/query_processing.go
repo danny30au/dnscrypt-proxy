@@ -88,9 +88,7 @@ func processDNSCryptQuery(
         }
         if retryOverTCP {
             serverProto = "tcp"
-            // Optimization: Reuse sharedKey from UDP attempt if possible, 
-            // though strict re-encryption is safer if nonce requirements differ.
-            // Here we stick to safe re-encryption logic but could optimize further.
+            // Optimization: We could reuse sharedKey here if protocol allows, but safe default is to re-encrypt
             sharedKey, encryptedQuery, clientNonce, err = proxy.Encrypt(serverInfo, query, serverProto)
             if err != nil {
                 pluginsState.returnCode = PluginsReturnCodeParseError
@@ -299,3 +297,110 @@ func processPlugins(
     response []byte,
 ) ([]byte, error) {
     var err error
+
+    response, err = pluginsState.ApplyResponsePlugins(&proxy.pluginsGlobals, response)
+    if err != nil {
+        pluginsState.returnCode = PluginsReturnCodeParseError
+        pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
+        serverInfo.noticeFailure(proxy)
+        return response, err
+    }
+
+    if pluginsState.action == PluginsActionDrop {
+        pluginsState.returnCode = PluginsReturnCodeDrop
+        pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
+        return response, nil
+    }
+
+    if pluginsState.synthResponse != nil {
+        // Optimization: Use buffer pool for synthesis packing
+        bufPtr := bufferPool.Get().(*[]byte)
+        if packed, packErr := pluginsState.synthResponse.PackBuffer(*bufPtr); packErr == nil {
+            // Must copy because we return the slice and it needs to persist beyond pool recycling
+            response = make([]byte, len(packed))
+            copy(response, packed)
+            bufferPool.Put(bufPtr)
+        } else {
+            bufferPool.Put(bufPtr)
+            pluginsState.returnCode = PluginsReturnCodeParseError
+            pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
+            return response, packErr
+        }
+    }
+
+    // Check rcode and handle failures
+    if rcode := Rcode(response); rcode == dns.RcodeServerFailure { // SERVFAIL
+        if pluginsState.dnssec {
+            dlog.Debug("A response had an invalid DNSSEC signature")
+        } else {
+            dlog.Infof("A response with status code 2 was received - this is usually a temporary, remote issue with the configuration of the domain name")
+            serverInfo.noticeFailure(proxy)
+        }
+    } else {
+        serverInfo.noticeSuccess(proxy)
+    }
+
+    return response, nil
+}
+
+// sendResponse - Sends the response back to the client
+func sendResponse(
+    proxy *Proxy,
+    pluginsState *PluginsState,
+    response []byte,
+    clientProto string,
+    clientAddr *net.Addr,
+    clientPc net.Conn,
+) {
+    if len(response) < MinDNSPacketSize || len(response) > MaxDNSPacketSize {
+        if len(response) == 0 {
+            pluginsState.returnCode = PluginsReturnCodeNotReady
+        } else {
+            pluginsState.returnCode = PluginsReturnCodeParseError
+        }
+        pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
+        return
+    }
+
+    var err error
+    if clientProto == "udp" {
+        if len(response) > pluginsState.maxUnencryptedUDPSafePayloadSize {
+            response, err = TruncatedResponse(response)
+            if err != nil {
+                pluginsState.returnCode = PluginsReturnCodeParseError
+                pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
+                return
+            }
+        }
+        clientPc.(net.PacketConn).WriteTo(response, *clientAddr)
+        if HasTCFlag(response) {
+            proxy.questionSizeEstimator.blindAdjust()
+        } else {
+            proxy.questionSizeEstimator.adjust(ResponseOverhead + len(response))
+        }
+    } else if clientProto == "tcp" {
+        response, err = PrefixWithSize(response)
+        if err != nil {
+            pluginsState.returnCode = PluginsReturnCodeParseError
+            pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
+            return
+        }
+        if clientPc != nil {
+            clientPc.Write(response)
+        }
+    }
+}
+
+// updateMonitoringMetrics - Updates monitoring metrics if enabled
+func updateMonitoringMetrics(
+    proxy *Proxy,
+    pluginsState *PluginsState,
+) {
+    if proxy.monitoringUI.Enabled && proxy.monitoringInstance != nil && pluginsState.questionMsg != nil {
+        proxy.monitoringInstance.UpdateMetrics(*pluginsState, pluginsState.questionMsg)
+    } else {
+        if pluginsState.questionMsg == nil {
+            dlog.Debugf("Question message is nil")
+        }
+    }
+}
