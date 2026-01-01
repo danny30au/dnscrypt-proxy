@@ -2,7 +2,6 @@ package main
 
 import (
     "net"
-    "sync"
     "sync/atomic"
     "time"
 
@@ -12,15 +11,8 @@ import (
     stamps "github.com/jedisct1/go-dnsstamps"
 )
 
-// Global buffer pool to reduce GC pressure [web:8][web:20]
-var bufferPool = sync.Pool{
-    New: func() interface{} {
-        b := make([]byte, MaxDNSPacketSize)
-        return &b
-    },
-}
-
 // Atomic counter for lock-free Round-Robin load balancing
+// Optimization: Replaces global mutex in rand.Intn [web:2]
 var odohLbCounter uint64
 
 // validateQuery - Performs basic validation on the incoming query
@@ -36,21 +28,11 @@ func validateQuery(query []byte) bool {
 
 // handleSynthesizedResponse - Handles a synthesized DNS response from plugins
 func handleSynthesizedResponse(pluginsState *PluginsState, synth *dns.Msg) ([]byte, error) {
-    bufPtr := bufferPool.Get().(*[]byte)
-    defer bufferPool.Put(bufPtr)
-
-    // Use PackBuffer with pooled slice to avoid allocations [web:16]
-    packed, err := synth.PackBuffer(*bufPtr)
-    if err != nil {
+    if err := synth.Pack(); err != nil {
         pluginsState.returnCode = PluginsReturnCodeParseError
         return nil, err
     }
-
-    // Copy result to a correctly sized slice for return
-    // (Still cheaper than Pack() because it avoids internal grow/resize overhead)
-    response := make([]byte, len(packed))
-    copy(response, packed)
-    return response, nil
+    return synth.Data, nil
 }
 
 // processDNSCryptQuery - Processes a query using the DNSCrypt protocol
@@ -88,7 +70,6 @@ func processDNSCryptQuery(
         }
         if retryOverTCP {
             serverProto = "tcp"
-            // Optimization: We could reuse sharedKey here if protocol allows, but safe default is to re-encrypt
             sharedKey, encryptedQuery, clientNonce, err = proxy.Encrypt(serverInfo, query, serverProto)
             if err != nil {
                 pluginsState.returnCode = PluginsReturnCodeParseError
@@ -108,17 +89,9 @@ func processDNSCryptQuery(
         if stale, ok := pluginsState.sessionData["stale"]; ok {
             dlog.Debug("Serving stale response")
             staleMsg := stale.(*dns.Msg)
-            
-            // Optimized stale packing
-            bufPtr := bufferPool.Get().(*[]byte)
-            if packed, packErr := staleMsg.PackBuffer(*bufPtr); packErr == nil {
-                // Manually copy and release since we can't defer in this conditional block efficiently
-                resp := make([]byte, len(packed))
-                copy(resp, packed)
-                bufferPool.Put(bufPtr)
-                return resp, nil
+            if packErr := staleMsg.Pack(); packErr == nil {
+                return staleMsg.Data, nil
             }
-            bufferPool.Put(bufPtr)
         }
         // If no stale response was served, return the original error
         if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
@@ -162,16 +135,9 @@ func processDoHQuery(
     if stale, ok := pluginsState.sessionData["stale"]; ok {
         dlog.Debug("Serving stale response")
         staleMsg := stale.(*dns.Msg)
-        
-        // Optimized stale packing
-        bufPtr := bufferPool.Get().(*[]byte)
-        if packed, packErr := staleMsg.PackBuffer(*bufPtr); packErr == nil {
-            resp := make([]byte, len(packed))
-            copy(resp, packed)
-            bufferPool.Put(bufPtr)
-            return resp, nil
+        if packErr := staleMsg.Pack(); packErr == nil {
+            return staleMsg.Data, nil
         }
-        bufferPool.Put(bufPtr)
     }
 
     // If no stale response was served, return the original error.
@@ -194,10 +160,10 @@ func processODoHQuery(
 
     serverInfo.noticeBegin(proxy)
 
-    // Optimization: Lock-free atomic Round-Robin instead of global rand mutex [web:2]
+    // Optimization: Lock-free atomic Round-Robin instead of global rand mutex
     idx := atomic.AddUint64(&odohLbCounter, 1)
     target := serverInfo.odohTargetConfigs[idx%uint64(len(serverInfo.odohTargetConfigs))]
-    
+
     odohQuery, err := target.encryptQuery(query)
     if err != nil {
         dlog.Errorf("Failed to encrypt query for [%v]", serverInfo.Name)
@@ -313,19 +279,12 @@ func processPlugins(
     }
 
     if pluginsState.synthResponse != nil {
-        // Optimization: Use buffer pool for synthesis packing
-        bufPtr := bufferPool.Get().(*[]byte)
-        if packed, packErr := pluginsState.synthResponse.PackBuffer(*bufPtr); packErr == nil {
-            // Must copy because we return the slice and it needs to persist beyond pool recycling
-            response = make([]byte, len(packed))
-            copy(response, packed)
-            bufferPool.Put(bufPtr)
-        } else {
-            bufferPool.Put(bufPtr)
+        if err = pluginsState.synthResponse.Pack(); err != nil {
             pluginsState.returnCode = PluginsReturnCodeParseError
             pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
-            return response, packErr
+            return response, err
         }
+        response = pluginsState.synthResponse.Data
     }
 
     // Check rcode and handle failures
