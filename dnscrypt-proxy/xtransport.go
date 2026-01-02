@@ -38,7 +38,7 @@ var hasAESGCMHardwareSupport = cpu.X86.HasAES && cpu.X86.HasPCLMULQDQ ||
 
 const (
     DefaultBootstrapResolver    = "9.9.9.9:53"
-    DefaultKeepAlive            = 5 * time.Second
+    DefaultKeepAlive            = 360 * time.Second
     DefaultTimeout              = 30 * time.Second
     ResolverReadTimeout         = 5 * time.Second
     SystemResolverIPTTL         = 12 * time.Hour
@@ -318,7 +318,7 @@ func (xTransport *XTransport) rebuildTransport() {
         DisableCompression:     true,
         MaxIdleConns:           1000,
         MaxIdleConnsPerHost:    100,
-        MaxConnsPerHost:        100,
+        MaxConnsPerHost:        0,
         IdleConnTimeout:        xTransport.keepAlive,
         ResponseHeaderTimeout:  timeout,
         ExpectContinueTimeout:  timeout,
