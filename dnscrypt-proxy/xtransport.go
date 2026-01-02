@@ -4,7 +4,7 @@ import (
     "bytes"
     "compress/gzip"
     "context"
-    "crypto/sha512"
+    "hash/fnv"
     "crypto/tls"
     "crypto/x509"
     "encoding/base64"
@@ -38,7 +38,7 @@ var hasAESGCMHardwareSupport = cpu.X86.HasAES && cpu.X86.HasPCLMULQDQ ||
 
 const (
     DefaultBootstrapResolver    = "9.9.9.9:53"
-    DefaultKeepAlive            = 360 * time.Second
+    DefaultKeepAlive            = 30 * time.Second
     DefaultTimeout              = 30 * time.Second
     ResolverReadTimeout         = 5 * time.Second
     SystemResolverIPTTL         = 12 * time.Hour
@@ -112,7 +112,7 @@ func NewXTransport() *XTransport {
     if err := isIPAndPort(DefaultBootstrapResolver); err != nil {
         panic("DefaultBootstrapResolver does not parse")
     }
-    xTransport := XTransport{
+    xTransport := &XTransport{
         cachedIPs:                CachedIPs{cache: make(map[string]*CachedIPItem)},
         altSupport:               AltSupport{cache: make(map[string]uint16)},
         keepAlive:                DefaultKeepAlive,
@@ -130,7 +130,7 @@ func NewXTransport() *XTransport {
     
     xTransport.gzipPool.New = func() any { return new(gzip.Reader) }
 
-return &xTransport
+    return xTransport
 }
 
 func ParseIP(ipStr string) net.IP {
@@ -531,7 +531,7 @@ func (xTransport *XTransport) rebuildTransport() {
         }
         h3Transport := &http3.Transport{DisableCompression: true, TLSClientConfig: &tlsClientConfig, Dial: dial}
         xTransport.h3Transport = h3Transport
-    xTransport.h3Client = &http.Client{Transport: xTransport.h3Transport}
+        xTransport.h3Client = &http.Client{Transport: xTransport.h3Transport}
     }
 }
 
@@ -804,9 +804,10 @@ func (xTransport *XTransport) Fetch(
     header["Cache-Control"] = []string{"max-stale"}
 
     if body != nil {
-        h := sha512.Sum512(*body)
+        h := fnv.New128a()
+        h.Write(*body)
         qs := url.Query()
-        qs.Add("body_hash", hex.EncodeToString(h[:32]))
+        qs.Add("body_hash", hex.EncodeToString(h.Sum(nil)))
         url2 := *url
         url2.RawQuery = qs.Encode()
         url = &url2
@@ -913,9 +914,9 @@ func (xTransport *XTransport) Fetch(
                             break
                         }
                         v = strings.TrimSpace(v)
-                        if strings.HasPrefix(v, "h3=\":") {
-                            v = strings.TrimPrefix(v, "h3=\":")
-                            v = strings.TrimSuffix(v, "\"")
+                        if strings.HasPrefix(v, "h3=":") {
+                            v = strings.TrimPrefix(v, "h3=":")
+                            v = strings.TrimSuffix(v, """)
                             if xAltPort, err := strconv.ParseUint(v, 10, 16); err == nil && xAltPort <= 65535 {
                                 altPort = uint16(xAltPort)
                                 dlog.Debugf("Using HTTP/3 for [%s]", url.Host)
