@@ -211,7 +211,7 @@ func (proxy *Proxy) Encrypt(
     relayIsNil := serverInfo.Relay == nil
 
     var publicKey *[32]byte
-    var sharedKey [32]byte
+    var computedSharedKey [32]byte
 
     if proxy.ephemeralKeys {
         var buf [HalfNonceSize + 32]byte
@@ -221,11 +221,13 @@ func (proxy *Proxy) Encrypt(
         // OPTIMIZATION: Use proxy's ephemeralPublicKeyScratch instead of stack var to avoid heap escape
         curve25519.ScalarBaseMult(&proxy.ephemeralPublicKeyScratch, &ephSk)
         publicKey = &proxy.ephemeralPublicKeyScratch
-        sharedKey = ComputeSharedKey(cryptoAlgo, &ephSk, &serverPk, nil)
+        computedSharedKey = ComputeSharedKey(cryptoAlgo, &ephSk, &serverPk, nil)
     } else {
-        sharedKey = serverInfo.SharedKey
+        computedSharedKey = serverInfo.SharedKey
         publicKey = &proxy.proxyPublicKey
     }
+
+    sharedKey = &computedSharedKey
 
     // OPTIMIZATION: Cache len(packet) to reduce repeated calls
     packetLen := len(packet)
@@ -249,7 +251,7 @@ func (proxy *Proxy) Encrypt(
     if QueryOverhead+packetLen+1 > paddedLength {
         retClientNonce := make([]byte, HalfNonceSize)
         copy(retClientNonce, clientNonceSlice)
-        return &sharedKey, nil, retClientNonce, ErrQuestionTooLarge
+        return sharedKey, nil, retClientNonce, ErrQuestionTooLarge
     }
 
     // OPTIMIZATION: Pre-calculate exact header layout
@@ -293,12 +295,12 @@ func (proxy *Proxy) Encrypt(
 
     // Encrypt
     if cryptoAlgo == XChacha20Poly1305 {
-        encrypted = xsecretbox.Seal(encrypted, nonce[:], paddedBuf, sharedKey[:])
+        encrypted = xsecretbox.Seal(encrypted, nonce[:], paddedBuf, computedSharedKey[:])
     } else {
         // OPTIMIZATION: Pool XSalsa nonce buffers to avoid per-call allocations
         xsalsaNoncePtr := xsalsaNoncePool.Get().(*[24]byte)
         copy(xsalsaNoncePtr[:], nonce[:])
-        encrypted = secretbox.Seal(encrypted, paddedBuf, xsalsaNoncePtr, &sharedKey)
+        encrypted = secretbox.Seal(encrypted, paddedBuf, xsalsaNoncePtr, &computedSharedKey)
         xsalsaNoncePool.Put(xsalsaNoncePtr)
     }
 
@@ -313,7 +315,7 @@ func (proxy *Proxy) Encrypt(
     retClientNonce := make([]byte, HalfNonceSize)
     copy(retClientNonce, clientNonceSlice)
 
-    return &sharedKey, encrypted, retClientNonce, nil
+    return sharedKey, encrypted, retClientNonce, nil
 }
 
 // Decrypt decrypts a DNS response.
