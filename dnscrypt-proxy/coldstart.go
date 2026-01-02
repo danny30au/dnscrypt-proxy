@@ -28,34 +28,39 @@ type CaptivePortalHandler struct {
 
 func (h *CaptivePortalHandler) Stop() {
     h.mu.Lock()
-    for _, conn := range h.conns {
+    // Optimization: Copy connections and clear slice inside lock,
+    // then close them outside the lock to minimize contention.
+    conns := h.conns
+    h.conns = nil
+    h.mu.Unlock()
+
+    for _, conn := range conns {
         // Closing the connection will cause ReadFrom to return an error,
         // unblocking the listener goroutines immediately.
         conn.Close()
     }
-    h.conns = nil
-    h.mu.Unlock()
     h.wg.Wait()
 }
 
-func (ipsMap *CaptivePortalMap) GetEntry(msg *dns.Msg) (dns.RR, *CaptivePortalEntryIPs) {
+// Optimization: Return bool for success instead of relying on nil pointers
+func (ipsMap *CaptivePortalMap) GetEntry(msg *dns.Msg) (dns.RR, *CaptivePortalEntryIPs, bool) {
     if len(msg.Question) != 1 {
-        return nil, nil
+        return nil, nil, false
     }
     question := msg.Question[0]
     hdr := question.Header()
     name, err := NormalizeQName(hdr.Name)
     if err != nil {
-        return nil, nil
+        return nil, nil, false
     }
     ips, ok := (*ipsMap)[name]
     if !ok {
-        return nil, nil
+        return nil, nil, false
     }
     if hdr.Class != dns.ClassINET {
-        return nil, nil
+        return nil, nil, false
     }
-    return question, &ips
+    return question, &ips, true
 }
 
 func HandleCaptivePortalQuery(msg *dns.Msg, question dns.RR, ips *CaptivePortalEntryIPs) *dns.Msg {
@@ -64,21 +69,38 @@ func HandleCaptivePortalQuery(msg *dns.Msg, question dns.RR, ips *CaptivePortalE
     hdr := question.Header()
     qtype := dns.RRToType(question)
 
-    if qtype == dns.TypeA {
+    isA := qtype == dns.TypeA
+    isAAAA := qtype == dns.TypeAAAA
+
+    if isA || isAAAA {
+        // Optimization: Calculate required capacity first to avoid slice growth
+        count := 0
         for _, ip := range *ips {
-            if ip.Is4() {
-                rr := new(dns.A)
-                rr.Hdr = dns.Header{Name: hdr.Name, Class: dns.ClassINET, TTL: ttl}
-                rr.A = rdata.A{Addr: ip}
-                respMsg.Answer = append(respMsg.Answer, rr)
+            if (isA && ip.Is4()) || (isAAAA && ip.Is6()) {
+                count++
             }
         }
-    } else if qtype == dns.TypeAAAA {
-        for _, ip := range *ips {
-            if ip.Is6() {
-                rr := new(dns.AAAA)
-                rr.Hdr = dns.Header{Name: hdr.Name, Class: dns.ClassINET, TTL: ttl}
-                rr.AAAA = rdata.AAAA{Addr: ip}
+
+        if count > 0 {
+            respMsg.Answer = make([]dns.RR, 0, count)
+            for _, ip := range *ips {
+                shouldInclude := (isA && ip.Is4()) || (isAAAA && ip.Is6())
+                if !shouldInclude {
+                    continue
+                }
+
+                var rr dns.RR
+                if isA {
+                    r := new(dns.A)
+                    r.Hdr = dns.Header{Name: hdr.Name, Class: dns.ClassINET, TTL: ttl}
+                    r.A = rdata.A{Addr: ip}
+                    rr = r
+                } else {
+                    r := new(dns.AAAA)
+                    r.Hdr = dns.Header{Name: hdr.Name, Class: dns.ClassINET, TTL: ttl}
+                    r.AAAA = rdata.AAAA{Addr: ip}
+                    rr = r
+                }
                 respMsg.Answer = append(respMsg.Answer, rr)
             }
         }
@@ -117,10 +139,10 @@ func addColdStartListener(
     h.wg.Add(1)
     go func() {
         defer h.wg.Done()
-        
+
         // Allocating buffer once outside the loop reuses memory for all packets
         buffer := make([]byte, MaxDNSPacketSize)
-        
+
         for {
             length, clientAddr, err := clientPc.ReadFrom(buffer)
             if err != nil {
@@ -139,15 +161,14 @@ func addColdStartListener(
                 continue
             }
 
-            question, ips := ipsMap.GetEntry(msg)
-            if ips == nil {
+            // Optimization: Use refactored GetEntry with bool return
+            question, ips, ok := ipsMap.GetEntry(msg)
+            if !ok {
                 continue
             }
 
             respMsg := HandleCaptivePortalQuery(msg, question, ips)
-            if respMsg == nil {
-                continue
-            }
+            // HandleCaptivePortalQuery always returns a valid msg now
 
             // Optimization: Use existing Pack() API which returns error only
             // and writes to respMsg.Data
@@ -200,8 +221,11 @@ func ColdStart(proxy *Proxy) (*CaptivePortalHandler, error) {
             )
         }
 
-        var ips []netip.Addr
-        for _, ipStr := range strings.Split(ipsStr, ",") {
+        // Optimization: Pre-allocate slice capacity based on split count
+        ipParts := strings.Split(ipsStr, ",")
+        var ips = make([]netip.Addr, 0, len(ipParts))
+        
+        for _, ipStr := range ipParts {
             ipStr = strings.TrimSpace(ipStr)
             if ip, err := netip.ParseAddr(ipStr); err == nil {
                 ips = append(ips, ip)
@@ -220,7 +244,7 @@ func ColdStart(proxy *Proxy) (*CaptivePortalHandler, error) {
     }
 
     handler := &CaptivePortalHandler{}
-    
+
     ok := false
     for _, listenAddrStr := range proxy.listenAddresses {
         if err := addColdStartListener(&ipsMap, listenAddrStr, handler); err == nil {
@@ -232,7 +256,7 @@ func ColdStart(proxy *Proxy) (*CaptivePortalHandler, error) {
         proxy.captivePortalMap = &ipsMap
         return handler, nil
     }
-    
+
     handler.Stop()
     return handler, err
 }
