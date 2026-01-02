@@ -457,9 +457,6 @@ func (xTransport *XTransport) rebuildTransport() {
         h2Transport.PingTimeout = 5 * time.Second
         h2Transport.AllowHTTP = false
         h2Transport.StrictMaxConcurrentStreams = true
-        h2Transport.MaxUploadBufferPerConnection = 16 * 1024 * 1024
-        h2Transport.MaxUploadBufferPerStream = 4 * 1024 * 1024
-        h2Transport.MaxEncoderHeaderTableSize = 4096
     }
     xTransport.transport = transport
     xTransport.httpClient = &http.Client{Transport: xTransport.transport}
