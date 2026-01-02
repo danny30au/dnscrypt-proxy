@@ -78,7 +78,7 @@ type Proxy struct {
     nxLogFile                     string
     proxySecretKey                [32]byte
     proxyPublicKey                [32]byte
-    ephemeralPublicKeyScratch     byte
+    ephemeralPublicKeyScratch     [32]byte
     ServerNames                   []string
     DisabledServerNames           []string
     requiredProps                 stamps.ServerInformalProperties
@@ -963,5 +963,6 @@ func NewProxy() *Proxy {
     }
 
 }
+
 
 
