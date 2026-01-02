@@ -4,7 +4,7 @@ import (
     "bytes"
     "compress/gzip"
     "context"
-    "crypto/sha512"
+    "hash/fnv"
     "crypto/tls"
     "crypto/x509"
     "encoding/base64"
@@ -32,13 +32,19 @@ import (
     "golang.org/x/sys/cpu"
 )
 
+
+var (
+    protoTCPFirst = []string{"tcp", "udp"}
+    protoUDPFirst = []string{"udp", "tcp"}
+)
+
 var hasAESGCMHardwareSupport = cpu.X86.HasAES && cpu.X86.HasPCLMULQDQ ||
     cpu.ARM64.HasAES && cpu.ARM64.HasPMULL ||
     cpu.S390X.HasAES && cpu.S390X.HasAESGCM
 
 const (
     DefaultBootstrapResolver    = "9.9.9.9:53"
-    DefaultKeepAlive            = 5 * time.Second
+    DefaultKeepAlive            = 30 * time.Second
     DefaultTimeout              = 30 * time.Second
     ResolverReadTimeout         = 5 * time.Second
     SystemResolverIPTTL         = 12 * time.Hour
@@ -112,7 +118,7 @@ func NewXTransport() *XTransport {
     if err := isIPAndPort(DefaultBootstrapResolver); err != nil {
         panic("DefaultBootstrapResolver does not parse")
     }
-    xTransport := XTransport{
+    xTransport := &XTransport{
         cachedIPs:                CachedIPs{cache: make(map[string]*CachedIPItem)},
         altSupport:               AltSupport{cache: make(map[string]uint16)},
         keepAlive:                DefaultKeepAlive,
@@ -130,7 +136,7 @@ func NewXTransport() *XTransport {
     
     xTransport.gzipPool.New = func() any { return new(gzip.Reader) }
 
-return &xTransport
+    return xTransport
 }
 
 func ParseIP(ipStr string) net.IP {
@@ -144,18 +150,20 @@ func uniqueNormalizedIPs(ips []net.IP) []net.IP {
         return nil
     }
     unique := make([]net.IP, 0, len(ips))
-    seen := make(map[string]struct{}, len(ips))
     for _, ip := range ips {
         if ip == nil {
             continue
         }
-        copyIP := append(net.IP(nil), ip...)
-        key := copyIP.String()
-        if _, ok := seen[key]; ok {
-            continue
+        isDuplicate := false
+        for _, existing := range unique {
+            if existing.Equal(ip) {
+                isDuplicate = true
+                break
+            }
         }
-        seen[key] = struct{}{}
-        unique = append(unique, copyIP)
+        if !isDuplicate {
+            unique = append(unique, append(net.IP(nil), ip...))
+        }
     }
     return unique
 }
@@ -318,7 +326,7 @@ func (xTransport *XTransport) rebuildTransport() {
         DisableCompression:     true,
         MaxIdleConns:           1000,
         MaxIdleConnsPerHost:    100,
-        MaxConnsPerHost:        100,
+        MaxConnsPerHost:        0,
         IdleConnTimeout:        xTransport.keepAlive,
         ResponseHeaderTimeout:  timeout,
         ExpectContinueTimeout:  timeout,
@@ -444,8 +452,15 @@ func (xTransport *XTransport) rebuildTransport() {
         }
     }
     transport.TLSClientConfig = &tlsClientConfig
-    if http2Transport, err := http2.ConfigureTransports(transport); err == nil && http2Transport != nil {
-    http2Transport.ReadIdleTimeout = timeout    http2Transport.PingTimeout = 5 * time.Second    http2Transport.AllowHTTP = false    http2Transport.StrictMaxConcurrentStreams = true    // Increase HTTP/2 flow control windows for better throughput    http2Transport.MaxUploadBufferPerConnection = 16 * 1024 * 1024    http2Transport.MaxUploadBufferPerStream = 4 * 1024 * 1024    // Keep default (4096) unless you want to tune it higher    http2Transport.MaxEncoderHeaderTableSize = 4096}
+    if h2Transport, err := http2.ConfigureTransports(transport); err == nil && h2Transport != nil {
+        h2Transport.ReadIdleTimeout = timeout
+        h2Transport.PingTimeout = 5 * time.Second
+        h2Transport.AllowHTTP = false
+        h2Transport.StrictMaxConcurrentStreams = true
+        h2Transport.MaxUploadBufferPerConnection = 16 * 1024 * 1024
+        h2Transport.MaxUploadBufferPerStream = 4 * 1024 * 1024
+        h2Transport.MaxEncoderHeaderTableSize = 4096
+    }
     xTransport.transport = transport
     xTransport.httpClient = &http.Client{Transport: xTransport.transport}
     if xTransport.http3 {
@@ -529,7 +544,7 @@ func (xTransport *XTransport) rebuildTransport() {
         }
         h3Transport := &http3.Transport{DisableCompression: true, TLSClientConfig: &tlsClientConfig, Dial: dial}
         xTransport.h3Transport = h3Transport
-    xTransport.h3Client = &http.Client{Transport: xTransport.h3Transport}
+        xTransport.h3Client = &http.Client{Transport: xTransport.h3Transport}
     }
 }
 
@@ -642,9 +657,9 @@ func (xTransport *XTransport) resolveUsingServers(
 }
 
 func (xTransport *XTransport) resolve(host string, returnIPv4, returnIPv6 bool) (ips []net.IP, ttl time.Duration, err error) {
-    protos := []string{"udp", "tcp"}
+    protos := protoUDPFirst
     if xTransport.mainProto == "tcp" {
-        protos = []string{"tcp", "udp"}
+        protos = protoTCPFirst
     }
     if xTransport.ignoreSystemDNS {
         if xTransport.internalResolverReady {
@@ -792,7 +807,8 @@ func (xTransport *XTransport) Fetch(
         }
     }
 
-    header := map[string][]string{"User-Agent": {"dnscrypt-proxy"}}
+    header := make(http.Header, 10)
+    header.Set("User-Agent", "dnscrypt-proxy")
     if len(accept) > 0 {
         header["Accept"] = []string{accept}
     }
@@ -802,9 +818,9 @@ func (xTransport *XTransport) Fetch(
     header["Cache-Control"] = []string{"max-stale"}
 
     if body != nil {
-        h := sha512.Sum512(*body)
+        h := fnv.New128a(); h.Write(*body)
         qs := url.Query()
-        qs.Add("body_hash", hex.EncodeToString(h[:32]))
+        qs.Add("body_hash", hex.EncodeToString(h.Sum(nil)))
         url2 := *url
         url2.RawQuery = qs.Encode()
         url = &url2
@@ -911,9 +927,9 @@ func (xTransport *XTransport) Fetch(
                             break
                         }
                         v = strings.TrimSpace(v)
-                        if strings.HasPrefix(v, "h3=\":") {
-                            v = strings.TrimPrefix(v, "h3=\":")
-                            v = strings.TrimSuffix(v, "\"")
+                        if strings.HasPrefix(v, `h3=":`) {
+                            v = strings.TrimPrefix(v, `h3=":`)
+                            v = strings.TrimSuffix(v, `"`)
                             if xAltPort, err := strconv.ParseUint(v, 10, 16); err == nil && xAltPort <= 65535 {
                                 altPort = uint16(xAltPort)
                                 dlog.Debugf("Using HTTP/3 for [%s]", url.Host)
