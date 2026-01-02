@@ -42,25 +42,25 @@ func (h *CaptivePortalHandler) Stop() {
     h.wg.Wait()
 }
 
-// Optimization: Return bool for success instead of relying on nil pointers
-func (ipsMap *CaptivePortalMap) GetEntry(msg *dns.Msg) (dns.RR, *CaptivePortalEntryIPs, bool) {
+// Fixed: Reverted to original signature to satisfy interface/external calls
+func (ipsMap *CaptivePortalMap) GetEntry(msg *dns.Msg) (dns.RR, *CaptivePortalEntryIPs) {
     if len(msg.Question) != 1 {
-        return nil, nil, false
+        return nil, nil
     }
     question := msg.Question[0]
     hdr := question.Header()
     name, err := NormalizeQName(hdr.Name)
     if err != nil {
-        return nil, nil, false
+        return nil, nil
     }
     ips, ok := (*ipsMap)[name]
     if !ok {
-        return nil, nil, false
+        return nil, nil
     }
     if hdr.Class != dns.ClassINET {
-        return nil, nil, false
+        return nil, nil
     }
-    return question, &ips, true
+    return question, &ips
 }
 
 func HandleCaptivePortalQuery(msg *dns.Msg, question dns.RR, ips *CaptivePortalEntryIPs) *dns.Msg {
@@ -161,14 +161,16 @@ func addColdStartListener(
                 continue
             }
 
-            // Optimization: Use refactored GetEntry with bool return
-            question, ips, ok := ipsMap.GetEntry(msg)
-            if !ok {
+            // Fixed: Use original calling convention
+            question, ips := ipsMap.GetEntry(msg)
+            if ips == nil {
                 continue
             }
 
             respMsg := HandleCaptivePortalQuery(msg, question, ips)
-            // HandleCaptivePortalQuery always returns a valid msg now
+            if respMsg == nil {
+                continue
+            }
 
             // Optimization: Use existing Pack() API which returns error only
             // and writes to respMsg.Data
