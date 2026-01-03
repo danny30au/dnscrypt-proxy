@@ -1,51 +1,26 @@
 package main
 
 import (
-"context"
 "encoding/json"
 "errors"
 "fmt"
 "math/rand"
 "os"
+"path"
 "path/filepath"
 "strconv"
 "strings"
-"sync"
 "time"
 
 "github.com/BurntSushi/toml"
 "github.com/jedisct1/dlog"
 stamps "github.com/jedisct1/go-dnsstamps"
-"golang.org/x/sync/errgroup"
-"golang.org/x/sync/semaphore"
 )
 
 const (
 MaxTimeout             = 3600
 DefaultNetprobeAddress = "9.9.9.9:53"
 )
-
-// ServerNameLookup provides O(1) thread-safe server name lookup
-type ServerNameLookup struct {
-mu    sync.RWMutex
-names map[string]bool
-}
-
-func NewServerNameLookup(names []string) *ServerNameLookup {
-sl := &ServerNameLookup{
-names: make(map[string]bool, len(names)),
-}
-for _, name := range names {
-sl.names[strings.ToLower(name)] = true
-}
-return sl
-}
-
-func (sl *ServerNameLookup) Contains(name string) bool {
-sl.mu.RLock()
-defer sl.mu.RUnlock()
-return sl.names[strings.ToLower(name)]
-}
 
 type Config struct {
 LogLevel                 int                `toml:"log_level"`
@@ -74,65 +49,65 @@ BlockIPv6                bool               `toml:"block_ipv6"`
 BlockUnqualified         bool               `toml:"block_unqualified"`
 BlockUndelegated         bool               `toml:"block_undelegated"`
 EnableHotReload          bool               `toml:"enable_hot_reload"`
-Cache                    bool               `toml:"cache"`
-CacheSize                int                `toml:"cache_size"`
-CacheNegTTL              uint32             `toml:"cache_neg_ttl"`
-CacheNegMinTTL           uint32             `toml:"cache_neg_min_ttl"`
-CacheNegMaxTTL           uint32             `toml:"cache_neg_max_ttl"`
-CacheMinTTL              uint32             `toml:"cache_min_ttl"`
-CacheMaxTTL              uint32             `toml:"cache_max_ttl"`
-RejectTTL                uint32             `toml:"reject_ttl"`
-CloakTTL                 uint32             `toml:"cloak_ttl"`
-QueryLog                 QueryLogConfig     `toml:"query_log"`
-NxLog                    NxLogConfig        `toml:"nx_log"`
-BlockName                BlockNameConfig    `toml:"blocked_names"`
-BlockNameLegacy          BlockNameConfigLegacy `toml:"blacklist"`
-WhitelistNameLegacy      WhitelistNameConfigLegacy `toml:"whitelist"`
-AllowedName              AllowedNameConfig  `toml:"allowed_names"`
-BlockIP                  BlockIPConfig      `toml:"blocked_ips"`
-BlockIPLegacy            BlockIPConfigLegacy `toml:"ip_blacklist"`
-AllowIP                  AllowIPConfig      `toml:"allowed_ips"`
-ForwardFile              string             `toml:"forwarding_rules"`
-CloakFile                string             `toml:"cloaking_rules"`
-CaptivePortals           CaptivePortalsConfig `toml:"captive_portals"`
-StaticsConfig            map[string]StaticConfig `toml:"static"`
-SourcesConfig            map[string]SourceConfig `toml:"sources"`
+Cache                    bool
+CacheSize                int                         `toml:"cache_size"`
+CacheNegTTL              uint32                      `toml:"cache_neg_ttl"`
+CacheNegMinTTL           uint32                      `toml:"cache_neg_min_ttl"`
+CacheNegMaxTTL           uint32                      `toml:"cache_neg_max_ttl"`
+CacheMinTTL              uint32                      `toml:"cache_min_ttl"`
+CacheMaxTTL              uint32                      `toml:"cache_max_ttl"`
+RejectTTL                uint32                      `toml:"reject_ttl"`
+CloakTTL                 uint32                      `toml:"cloak_ttl"`
+QueryLog                 QueryLogConfig              `toml:"query_log"`
+NxLog                    NxLogConfig                 `toml:"nx_log"`
+BlockName                BlockNameConfig             `toml:"blocked_names"`
+BlockNameLegacy          BlockNameConfigLegacy       `toml:"blacklist"`
+WhitelistNameLegacy      WhitelistNameConfigLegacy   `toml:"whitelist"`
+AllowedName              AllowedNameConfig           `toml:"allowed_names"`
+BlockIP                  BlockIPConfig               `toml:"blocked_ips"`
+BlockIPLegacy            BlockIPConfigLegacy         `toml:"ip_blacklist"`
+AllowIP                  AllowIPConfig               `toml:"allowed_ips"`
+ForwardFile              string                      `toml:"forwarding_rules"`
+CloakFile                string                      `toml:"cloaking_rules"`
+CaptivePortals           CaptivePortalsConfig        `toml:"captive_portals"`
+StaticsConfig            map[string]StaticConfig     `toml:"static"`
+SourcesConfig            map[string]SourceConfig     `toml:"sources"`
 BrokenImplementations    BrokenImplementationsConfig `toml:"broken_implementations"`
-SourceRequireDNSSEC      bool               `toml:"require_dnssec"`
-SourceRequireNoLog       bool               `toml:"require_nolog"`
-SourceRequireNoFilter    bool               `toml:"require_nofilter"`
-SourceDNSCrypt           bool               `toml:"dnscrypt_servers"`
-SourceDoH                bool               `toml:"doh_servers"`
-SourceODoH               bool               `toml:"odoh_servers"`
-SourceIPv4               bool               `toml:"ipv4_servers"`
-SourceIPv6               bool               `toml:"ipv6_servers"`
-MaxClients               uint32             `toml:"max_clients"`
-TimeoutLoadReduction     float64            `toml:"timeout_load_reduction"`
-BootstrapResolversLegacy []string           `toml:"fallback_resolvers"`
-BootstrapResolvers       []string           `toml:"bootstrap_resolvers"`
-IgnoreSystemDNS          bool               `toml:"ignore_system_dns"`
-AllWeeklyRanges          map[string]WeeklyRangesStr `toml:"schedules"`
-LogMaxSize               int                `toml:"log_files_max_size"`
-LogMaxAge                int                `toml:"log_files_max_age"`
-LogMaxBackups            int                `toml:"log_files_max_backups"`
-TLSDisableSessionTickets bool               `toml:"tls_disable_session_tickets"`
-TLSCipherSuite           []uint16           `toml:"tls_cipher_suite"`
-TLSPreferRSA             bool               `toml:"tls_prefer_rsa"`
-TLSKeyLogFile            string             `toml:"tls_key_log_file"`
-NetprobeAddress          string             `toml:"netprobe_address"`
-NetprobeTimeout          int                `toml:"netprobe_timeout"`
-OfflineMode              bool               `toml:"offline_mode"`
-HTTPProxyURL             string             `toml:"http_proxy"`
-RefusedCodeInResponses   bool               `toml:"refused_code_in_responses"`
-BlockedQueryResponse     string             `toml:"blocked_query_response"`
-QueryMeta                []string           `toml:"query_meta"`
-CloakedPTR               bool               `toml:"cloak_ptr"`
-AnonymizedDNS            AnonymizedDNSConfig `toml:"anonymized_dns"`
-DoHClientX509Auth        DoHClientX509AuthConfig `toml:"doh_client_x509_auth"`
-DoHClientX509AuthLegacy  DoHClientX509AuthConfig `toml:"tls_client_auth"`
-DNS64                    DNS64Config        `toml:"dns64"`
-EDNSClientSubnet         []string           `toml:"edns_client_subnet"`
-IPEncryption             IPEncryptionConfig `toml:"ip_encryption"`
+SourceRequireDNSSEC      bool                        `toml:"require_dnssec"`
+SourceRequireNoLog       bool                        `toml:"require_nolog"`
+SourceRequireNoFilter    bool                        `toml:"require_nofilter"`
+SourceDNSCrypt           bool                        `toml:"dnscrypt_servers"`
+SourceDoH                bool                        `toml:"doh_servers"`
+SourceODoH               bool                        `toml:"odoh_servers"`
+SourceIPv4               bool                        `toml:"ipv4_servers"`
+SourceIPv6               bool                        `toml:"ipv6_servers"`
+MaxClients               uint32                      `toml:"max_clients"`
+TimeoutLoadReduction     float64                     `toml:"timeout_load_reduction"`
+BootstrapResolversLegacy []string                    `toml:"fallback_resolvers"`
+BootstrapResolvers       []string                    `toml:"bootstrap_resolvers"`
+IgnoreSystemDNS          bool                        `toml:"ignore_system_dns"`
+AllWeeklyRanges          map[string]WeeklyRangesStr  `toml:"schedules"`
+LogMaxSize               int                         `toml:"log_files_max_size"`
+LogMaxAge                int                         `toml:"log_files_max_age"`
+LogMaxBackups            int                         `toml:"log_files_max_backups"`
+TLSDisableSessionTickets bool                        `toml:"tls_disable_session_tickets"`
+TLSCipherSuite           []uint16                    `toml:"tls_cipher_suite"`
+TLSPreferRSA             bool                        `toml:"tls_prefer_rsa"`
+TLSKeyLogFile            string                      `toml:"tls_key_log_file"`
+NetprobeAddress          string                      `toml:"netprobe_address"`
+NetprobeTimeout          int                         `toml:"netprobe_timeout"`
+OfflineMode              bool                        `toml:"offline_mode"`
+HTTPProxyURL             string                      `toml:"http_proxy"`
+RefusedCodeInResponses   bool                        `toml:"refused_code_in_responses"`
+BlockedQueryResponse     string                      `toml:"blocked_query_response"`
+QueryMeta                []string                    `toml:"query_meta"`
+CloakedPTR               bool                        `toml:"cloak_ptr"`
+AnonymizedDNS            AnonymizedDNSConfig         `toml:"anonymized_dns"`
+DoHClientX509Auth        DoHClientX509AuthConfig     `toml:"doh_client_x509_auth"`
+DoHClientX509AuthLegacy  DoHClientX509AuthConfig     `toml:"tls_client_auth"`
+DNS64                    DNS64Config                 `toml:"dns64"`
+EDNSClientSubnet         []string                    `toml:"edns_client_subnet"`
+IPEncryption             IPEncryptionConfig          `toml:"ip_encryption"`
 }
 
 func newConfig() Config {
@@ -144,7 +119,7 @@ LocalDoH:        LocalDoHConfig{Path: "/dns-query"},
 MonitoringUI: MonitoringUIConfig{
 Enabled:        false,
 ListenAddress:  "127.0.0.1:8080",
-Username:       "admin",
+Username:       "admin", // Set to empty string to disable authentication
 Password:       "changeme",
 EnableQueryLog: false,
 PrivacyLevel:   2,
@@ -344,26 +319,20 @@ ShowCerts               *bool
 }
 
 func findConfigFile(configFile *string) (string, error) {
-paths := []string{*configFile}
-if !filepath.IsAbs(*configFile) {
-if exePath, err := os.Executable(); err == nil {
-paths = append(paths, filepath.Join(filepath.Dir(exePath), *configFile))
-}
-if pwd, err := os.Getwd(); err == nil {
-paths = append(paths, filepath.Join(pwd, *configFile))
+if _, err := os.Stat(*configFile); os.IsNotExist(err) {
+cdLocal()
+if _, err := os.Stat(*configFile); err != nil {
+return "", err
 }
 }
-
-for _, p := range paths {
-if info, err := os.Stat(p); err == nil && !info.IsDir() {
-if abs, err := filepath.Abs(p); err == nil {
-return abs, nil
+pwd, err := os.Getwd()
+if err != nil {
+return "", err
 }
-return p, nil
+if filepath.IsAbs(*configFile) {
+return *configFile, nil
 }
-}
-
-return "", fmt.Errorf("Unable to load the configuration file [%s] -- Maybe use the -config command-line switch?", *configFile)
+return path.Join(pwd, *configFile), nil
 }
 
 func ConfigLoad(proxy *Proxy, flags *ConfigFlags) error {
@@ -683,42 +652,17 @@ return nil
 }
 
 func (config *Config) loadSources(proxy *Proxy) error {
-ctx := context.Background()
-sem := semaphore.NewWeighted(4)
-var g errgroup.Group
-var mu sync.Mutex
-
 for cfgSourceName, cfgSource_ := range config.SourcesConfig {
-cfgSourceName := cfgSourceName
 cfgSource := cfgSource_
 rand.Shuffle(len(cfgSource.URLs), func(i, j int) {
 cfgSource.URLs[i], cfgSource.URLs[j] = cfgSource.URLs[j], cfgSource.URLs[i]
 })
-
-g.Go(func() error {
-if err := sem.Acquire(ctx, 1); err != nil {
+if err := config.loadSource(proxy, cfgSourceName, &cfgSource); err != nil {
 return err
 }
-defer sem.Release(1)
-
-source, err := config.loadSourceOptimized(proxy, cfgSourceName, &cfgSource)
-if err != nil {
-return err
 }
-
-mu.Lock()
-proxy.sources = append(proxy.sources, source)
-mu.Unlock()
-return nil
-})
-}
-
-if err := g.Wait(); err != nil {
-return err
-}
-
-for name, cfg := range config.StaticsConfig {
-if stamp, err := stamps.NewServerStampFromString(cfg.Stamp); err == nil {
+for name, config := range config.StaticsConfig {
+if stamp, err := stamps.NewServerStampFromString(config.Stamp); err == nil {
 if stamp.Proto == stamps.StampProtoTypeDNSCryptRelay || stamp.Proto == stamps.StampProtoTypeODoHRelay {
 dlog.Debugf("Adding [%s] to the set of available static relays", name)
 registeredServer := RegisteredServer{name: name, stamp: stamp, description: "static relay"}
@@ -751,7 +695,7 @@ return err
 return nil
 }
 
-func (config *Config) loadSourceOptimized(proxy *Proxy, cfgSourceName string, cfgSource *SourceConfig) (*Source, error) {
+func (config *Config) loadSource(proxy *Proxy, cfgSourceName string, cfgSource *SourceConfig) error {
 if len(cfgSource.URLs) == 0 {
 if len(cfgSource.URL) == 0 {
 dlog.Debugf("Missing URLs for source [%s]", cfgSourceName)
@@ -760,10 +704,10 @@ cfgSource.URLs = []string{cfgSource.URL}
 }
 }
 if cfgSource.MinisignKeyStr == "" {
-return nil, fmt.Errorf("Missing Minisign key for source [%s]", cfgSourceName)
+return fmt.Errorf("Missing Minisign key for source [%s]", cfgSourceName)
 }
 if cfgSource.CacheFile == "" {
-return nil, fmt.Errorf("Missing cache file for source [%s]", cfgSourceName)
+return fmt.Errorf("Missing cache file for source [%s]", cfgSourceName)
 }
 if cfgSource.FormatStr == "" {
 cfgSource.FormatStr = "v2"
@@ -785,17 +729,9 @@ cfgSource.Prefix,
 if err != nil {
 if len(source.bin) <= 0 {
 dlog.Criticalf("Unable to retrieve source [%s]: [%s]", cfgSourceName, err)
-return nil, err
+return err
 }
 dlog.Infof("Downloading [%s] failed: %v, using cache file to startup", source.name, err)
-}
-return source, nil
-}
-
-func (config *Config) loadSource(proxy *Proxy, cfgSourceName string, cfgSource *SourceConfig) error {
-source, err := config.loadSourceOptimized(proxy, cfgSourceName, cfgSource)
-if err != nil {
-return err
 }
 proxy.sources = append(proxy.sources, source)
 return nil
