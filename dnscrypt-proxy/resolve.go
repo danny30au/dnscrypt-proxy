@@ -147,7 +147,8 @@ host = "[::1]"
 }
 server = fmt.Sprintf("%s:%d", host, port)
 
-fmt.Printf("Resolving [%s] using %s port %d
+fmt.Printf("Resolving [%s] using " + 
+" %s port %d
 
 ", name, host, port)
 name = fqdn(name)
@@ -184,7 +185,8 @@ for _, txt := range answer.(*dns.TXT).Txt {
 if strings.HasPrefix(txt, "Resolver IP: ") {
 ip = strings.TrimPrefix(txt, "Resolver IP: ")
 } else if strings.HasPrefix(txt, "EDNS0 client subnet: ") {
-clientSubnet = strings.TrimPrefix(txt, "EDNS0 client subnet: ")
+clientSubnet = strings.TrimPrefix(txt, "EDNS0 " + 
+"client subnet: ")
 }
 }
 if ip != "" {
@@ -250,13 +252,15 @@ fmt.Printf("DNSSEC        : ")
 if response.AuthenticatedData {
 fmt.Println("yes, the resolver supports DNSSEC")
 } else {
-fmt.Println("no, the resolver doesn't support DNSSEC")
+fmt.Println("no, the resolver " + 
+"doesn't support DNSSEC")
 }
 }
 
 fmt.Printf("ECS           : ")
 if clientSubnet != "" {
-fmt.Println("client network address is sent to authoritative servers")
+fmt.Println("client network address is sent " + 
+"to authoritative servers")
 } else {
 fmt.Println("ignored or selective")
 }
