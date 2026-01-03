@@ -7,7 +7,6 @@ import (
 "fmt"
 "math/rand"
 "os"
-"path"
 "path/filepath"
 "strconv"
 "strings"
@@ -25,13 +24,6 @@ const (
 MaxTimeout             = 3600
 DefaultNetprobeAddress = "9.9.9.9:53"
 )
-
-// bufferPool reuses strings.Builder to reduce memory allocations
-var bufferPool = sync.Pool{
-New: func() any {
-return new(strings.Builder)
-},
-}
 
 // ServerNameLookup provides O(1) thread-safe server name lookup
 type ServerNameLookup struct {
@@ -82,65 +74,65 @@ BlockIPv6                bool               `toml:"block_ipv6"`
 BlockUnqualified         bool               `toml:"block_unqualified"`
 BlockUndelegated         bool               `toml:"block_undelegated"`
 EnableHotReload          bool               `toml:"enable_hot_reload"`
-Cache                    bool
-CacheSize                int                         `toml:"cache_size"`
-CacheNegTTL              uint32                      `toml:"cache_neg_ttl"`
-CacheNegMinTTL           uint32                      `toml:"cache_neg_min_ttl"`
-CacheNegMaxTTL           uint32                      `toml:"cache_neg_max_ttl"`
-CacheMinTTL              uint32                      `toml:"cache_min_ttl"`
-CacheMaxTTL              uint32                      `toml:"cache_max_ttl"`
-RejectTTL                uint32                      `toml:"reject_ttl"`
-CloakTTL                 uint32                      `toml:"cloak_ttl"`
-QueryLog                 QueryLogConfig              `toml:"query_log"`
-NxLog                    NxLogConfig                 `toml:"nx_log"`
-BlockName                BlockNameConfig             `toml:"blocked_names"`
-BlockNameLegacy          BlockNameConfigLegacy       `toml:"blacklist"`
-WhitelistNameLegacy      WhitelistNameConfigLegacy   `toml:"whitelist"`
-AllowedName              AllowedNameConfig           `toml:"allowed_names"`
-BlockIP                  BlockIPConfig               `toml:"blocked_ips"`
-BlockIPLegacy            BlockIPConfigLegacy         `toml:"ip_blacklist"`
-AllowIP                  AllowIPConfig               `toml:"allowed_ips"`
-ForwardFile              string                      `toml:"forwarding_rules"`
-CloakFile                string                      `toml:"cloaking_rules"`
-CaptivePortals           CaptivePortalsConfig        `toml:"captive_portals"`
-StaticsConfig            map[string]StaticConfig     `toml:"static"`
-SourcesConfig            map[string]SourceConfig     `toml:"sources"`
+Cache                    bool               `toml:"cache"`
+CacheSize                int                `toml:"cache_size"`
+CacheNegTTL              uint32             `toml:"cache_neg_ttl"`
+CacheNegMinTTL           uint32             `toml:"cache_neg_min_ttl"`
+CacheNegMaxTTL           uint32             `toml:"cache_neg_max_ttl"`
+CacheMinTTL              uint32             `toml:"cache_min_ttl"`
+CacheMaxTTL              uint32             `toml:"cache_max_ttl"`
+RejectTTL                uint32             `toml:"reject_ttl"`
+CloakTTL                 uint32             `toml:"cloak_ttl"`
+QueryLog                 QueryLogConfig     `toml:"query_log"`
+NxLog                    NxLogConfig        `toml:"nx_log"`
+BlockName                BlockNameConfig    `toml:"blocked_names"`
+BlockNameLegacy          BlockNameConfigLegacy `toml:"blacklist"`
+WhitelistNameLegacy      WhitelistNameConfigLegacy `toml:"whitelist"`
+AllowedName              AllowedNameConfig  `toml:"allowed_names"`
+BlockIP                  BlockIPConfig      `toml:"blocked_ips"`
+BlockIPLegacy            BlockIPConfigLegacy `toml:"ip_blacklist"`
+AllowIP                  AllowIPConfig      `toml:"allowed_ips"`
+ForwardFile              string             `toml:"forwarding_rules"`
+CloakFile                string             `toml:"cloaking_rules"`
+CaptivePortals           CaptivePortalsConfig `toml:"captive_portals"`
+StaticsConfig            map[string]StaticConfig `toml:"static"`
+SourcesConfig            map[string]SourceConfig `toml:"sources"`
 BrokenImplementations    BrokenImplementationsConfig `toml:"broken_implementations"`
-SourceRequireDNSSEC      bool                        `toml:"require_dnssec"`
-SourceRequireNoLog       bool                        `toml:"require_nolog"`
-SourceRequireNoFilter    bool                        `toml:"require_nofilter"`
-SourceDNSCrypt           bool                        `toml:"dnscrypt_servers"`
-SourceDoH                bool                        `toml:"doh_servers"`
-SourceODoH               bool                        `toml:"odoh_servers"`
-SourceIPv4               bool                        `toml:"ipv4_servers"`
-SourceIPv6               bool                        `toml:"ipv6_servers"`
-MaxClients               uint32                      `toml:"max_clients"`
-TimeoutLoadReduction     float64                     `toml:"timeout_load_reduction"`
-BootstrapResolversLegacy []string                    `toml:"fallback_resolvers"`
-BootstrapResolvers       []string                    `toml:"bootstrap_resolvers"`
-IgnoreSystemDNS          bool                        `toml:"ignore_system_dns"`
-AllWeeklyRanges          map[string]WeeklyRangesStr  `toml:"schedules"`
-LogMaxSize               int                         `toml:"log_files_max_size"`
-LogMaxAge                int                         `toml:"log_files_max_age"`
-LogMaxBackups            int                         `toml:"log_files_max_backups"`
-TLSDisableSessionTickets bool                        `toml:"tls_disable_session_tickets"`
-TLSCipherSuite           []uint16                    `toml:"tls_cipher_suite"`
-TLSPreferRSA             bool                        `toml:"tls_prefer_rsa"`
-TLSKeyLogFile            string                      `toml:"tls_key_log_file"`
-NetprobeAddress          string                      `toml:"netprobe_address"`
-NetprobeTimeout          int                         `toml:"netprobe_timeout"`
-OfflineMode              bool                        `toml:"offline_mode"`
-HTTPProxyURL             string                      `toml:"http_proxy"`
-RefusedCodeInResponses   bool                        `toml:"refused_code_in_responses"`
-BlockedQueryResponse     string                      `toml:"blocked_query_response"`
-QueryMeta                []string                    `toml:"query_meta"`
-CloakedPTR               bool                        `toml:"cloak_ptr"`
-AnonymizedDNS            AnonymizedDNSConfig         `toml:"anonymized_dns"`
-DoHClientX509Auth        DoHClientX509AuthConfig     `toml:"doh_client_x509_auth"`
-DoHClientX509AuthLegacy  DoHClientX509AuthConfig     `toml:"tls_client_auth"`
-DNS64                    DNS64Config                 `toml:"dns64"`
-EDNSClientSubnet         []string                    `toml:"edns_client_subnet"`
-IPEncryption             IPEncryptionConfig          `toml:"ip_encryption"`
+SourceRequireDNSSEC      bool               `toml:"require_dnssec"`
+SourceRequireNoLog       bool               `toml:"require_nolog"`
+SourceRequireNoFilter    bool               `toml:"require_nofilter"`
+SourceDNSCrypt           bool               `toml:"dnscrypt_servers"`
+SourceDoH                bool               `toml:"doh_servers"`
+SourceODoH               bool               `toml:"odoh_servers"`
+SourceIPv4               bool               `toml:"ipv4_servers"`
+SourceIPv6               bool               `toml:"ipv6_servers"`
+MaxClients               uint32             `toml:"max_clients"`
+TimeoutLoadReduction     float64            `toml:"timeout_load_reduction"`
+BootstrapResolversLegacy []string           `toml:"fallback_resolvers"`
+BootstrapResolvers       []string           `toml:"bootstrap_resolvers"`
+IgnoreSystemDNS          bool               `toml:"ignore_system_dns"`
+AllWeeklyRanges          map[string]WeeklyRangesStr `toml:"schedules"`
+LogMaxSize               int                `toml:"log_files_max_size"`
+LogMaxAge                int                `toml:"log_files_max_age"`
+LogMaxBackups            int                `toml:"log_files_max_backups"`
+TLSDisableSessionTickets bool               `toml:"tls_disable_session_tickets"`
+TLSCipherSuite           []uint16           `toml:"tls_cipher_suite"`
+TLSPreferRSA             bool               `toml:"tls_prefer_rsa"`
+TLSKeyLogFile            string             `toml:"tls_key_log_file"`
+NetprobeAddress          string             `toml:"netprobe_address"`
+NetprobeTimeout          int                `toml:"netprobe_timeout"`
+OfflineMode              bool               `toml:"offline_mode"`
+HTTPProxyURL             string             `toml:"http_proxy"`
+RefusedCodeInResponses   bool               `toml:"refused_code_in_responses"`
+BlockedQueryResponse     string             `toml:"blocked_query_response"`
+QueryMeta                []string           `toml:"query_meta"`
+CloakedPTR               bool               `toml:"cloak_ptr"`
+AnonymizedDNS            AnonymizedDNSConfig `toml:"anonymized_dns"`
+DoHClientX509Auth        DoHClientX509AuthConfig `toml:"doh_client_x509_auth"`
+DoHClientX509AuthLegacy  DoHClientX509AuthConfig `toml:"tls_client_auth"`
+DNS64                    DNS64Config        `toml:"dns64"`
+EDNSClientSubnet         []string           `toml:"edns_client_subnet"`
+IPEncryption             IPEncryptionConfig `toml:"ip_encryption"`
 }
 
 func newConfig() Config {
@@ -152,7 +144,7 @@ LocalDoH:        LocalDoHConfig{Path: "/dns-query"},
 MonitoringUI: MonitoringUIConfig{
 Enabled:        false,
 ListenAddress:  "127.0.0.1:8080",
-Username:       "admin", // Set to empty string to disable authentication
+Username:       "admin",
 Password:       "changeme",
 EnableQueryLog: false,
 PrivacyLevel:   2,
@@ -724,8 +716,9 @@ return nil
 if err := g.Wait(); err != nil {
 return err
 }
-for name, config := range config.StaticsConfig {
-if stamp, err := stamps.NewServerStampFromString(config.Stamp); err == nil {
+
+for name, cfg := range config.StaticsConfig {
+if stamp, err := stamps.NewServerStampFromString(cfg.Stamp); err == nil {
 if stamp.Proto == stamps.StampProtoTypeDNSCryptRelay || stamp.Proto == stamps.StampProtoTypeODoHRelay {
 dlog.Debugf("Adding [%s] to the set of available static relays", name)
 registeredServer := RegisteredServer{name: name, stamp: stamp, description: "static relay"}
@@ -755,15 +748,6 @@ proxy.registeredServers = append(proxy.registeredServers, RegisteredServer{name:
 if err := proxy.updateRegisteredServers(); err != nil {
 return err
 }
-return nil
-}
-
-func (config *Config) loadSource(proxy *Proxy, cfgSourceName string, cfgSource *SourceConfig) error {
-source, err := config.loadSourceOptimized(proxy, cfgSourceName, cfgSource)
-if err != nil {
-return err
-}
-proxy.sources = append(proxy.sources, source)
 return nil
 }
 
@@ -806,6 +790,15 @@ return nil, err
 dlog.Infof("Downloading [%s] failed: %v, using cache file to startup", source.name, err)
 }
 return source, nil
+}
+
+func (config *Config) loadSource(proxy *Proxy, cfgSourceName string, cfgSource *SourceConfig) error {
+source, err := config.loadSourceOptimized(proxy, cfgSourceName, cfgSource)
+if err != nil {
+return err
+}
+proxy.sources = append(proxy.sources, source)
+return nil
 }
 
 func includesName(names []string, name string) bool {
