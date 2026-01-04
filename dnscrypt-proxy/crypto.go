@@ -20,8 +20,11 @@ const (
     NonceSize     = chacha20poly1305.NonceSizeX
     HalfNonceSize = NonceSize / 2
 
-    // Poly1305 tag is 16 bytes (AEAD overhead).
+        // Poly1305 tag is 16 bytes (AEAD overhead).
     TagSize = 16
+
+    // ISO/IEC 7816-4 padding delimiter
+    ISO7816Delimiter = 0x80
 
     PublicKeySize    = 32
     QueryOverhead    = ClientMagicLen + PublicKeySize + HalfNonceSize + TagSize
@@ -80,14 +83,14 @@ func init() {
 func padTo(packet []byte, minSize int) []byte {
     out := make([]byte, minSize)
     copy(out, packet)
-    out[len(packet)] = 0x80
+    out[len(packet)] = ISO7816Delimiter
     // Remaining bytes are zero-initialized by make()
     return out
 }
 
 // unpadFast uses fast constant-time verification for common padding sizes.
 func unpadFast(packet []byte) ([]byte, error) {
-    idx := bytes.LastIndexByte(packet, 0x80)
+    idx := bytes.LastIndexByte(packet, ISO7816Delimiter)
     if idx == -1 {
         return nil, ErrInvalidPadding
     }
@@ -190,6 +193,9 @@ func ComputeSharedKey(
 // EncryptInto encrypts a DNS packet into dst (if provided) to reduce allocations.
 // If dst has insufficient capacity, a new buffer is allocated.
 // clientNonceDst (if non-nil and len>=HalfNonceSize) is reused for returning the nonce without allocating.
+// EncryptInto encrypts a DNS packet into dst (if provided) to reduce allocations.
+// If dst has insufficient capacity, a new buffer is allocated.
+// clientNonceDst (if non-nil and len>=HalfNonceSize) is reused for returning the nonce without allocating.
 func (proxy *Proxy) EncryptInto(
     dst []byte,
     clientNonceDst []byte,
@@ -202,15 +208,48 @@ func (proxy *Proxy) EncryptInto(
         return nil, nil, nil, err
     }
 
+    // Prepare nonces early
     var nonce [NonceSize]byte
     copy(nonce[:HalfNonceSize], randomBuf[:HalfNonceSize]) // Client random component
     clientNonceSlice := randomBuf[:HalfNonceSize]
 
+    // 1. DoS Hardening: Validate sizes *before* expensive crypto operations
+    packetLen := len(packet)
+    minQuestionSize := QueryOverhead + packetLen
+    xpad := randomBuf[HalfNonceSize]
+
+    if proto == "udp" {
+        minQuestionSize = max(proxy.questionSizeEstimator.MinQuestionSize(), minQuestionSize)
+    } else {
+        minQuestionSize += int(xpad)
+    }
+
+    paddedLength := min(MaxDNSUDPPacketSize, (max(minQuestionSize, QueryOverhead)+1+63)&^63)
+
+    knownBugsFragmentBlocked := serverInfo.knownBugs.fragmentsBlocked
+    relayIsNil := serverInfo.Relay == nil
+
+    if knownBugsFragmentBlocked && proto == "udp" {
+        paddedLength = MaxDNSUDPSafePacketSize
+    } else if !relayIsNil && proto == "tcp" {
+        paddedLength = MaxDNSPacketSize
+    }
+
+    if QueryOverhead+packetLen+1 > paddedLength {
+        // Return error immediately without burning CPU on key derivation
+        if clientNonceDst != nil && len(clientNonceDst) >= HalfNonceSize {
+            copy(clientNonceDst[:HalfNonceSize], clientNonceSlice)
+            return nil, nil, clientNonceDst[:HalfNonceSize], ErrQuestionTooLarge
+        }
+        retClientNonce := make([]byte, HalfNonceSize)
+        copy(retClientNonce, clientNonceSlice)
+        return nil, nil, retClientNonce, ErrQuestionTooLarge
+    }
+
+    // 2. Perform Crypto Operations (Expensive)
     cryptoAlgo := serverInfo.CryptoConstruction
     serverPk := serverInfo.ServerPk
     magicQuery := serverInfo.MagicQuery
-    knownBugsFragmentBlocked := serverInfo.knownBugs.fragmentsBlocked
-    relayIsNil := serverInfo.Relay == nil
 
     var publicKey *[32]byte
     var computedSharedKey [32]byte
@@ -219,7 +258,10 @@ func (proxy *Proxy) EncryptInto(
         var buf [HalfNonceSize + 32]byte
         copy(buf[:], clientNonceSlice)
         copy(buf[HalfNonceSize:], proxy.proxySecretKey[:])
-        ephSk := sha512.Sum512_256(buf[:]) // Hedged key derivation: hash(random || long-term-secret)
+
+        // Hedged key derivation: hash(random || long-term-secret)
+        ephSk := sha512.Sum512_256(buf[:])
+        defer clear(ephSk[:]) // Secure cleanup: Wipe ephemeral secret
 
         curve25519.ScalarBaseMult(&proxy.ephemeralPublicKeyScratch, &ephSk)
         publicKey = &proxy.ephemeralPublicKeyScratch
@@ -231,33 +273,7 @@ func (proxy *Proxy) EncryptInto(
 
     sharedKey = &computedSharedKey
 
-    packetLen := len(packet)
-
-    minQuestionSize := QueryOverhead + packetLen
-    xpad := randomBuf[HalfNonceSize]
-    if proto == "udp" {
-        minQuestionSize = max(proxy.questionSizeEstimator.MinQuestionSize(), minQuestionSize)
-    } else {
-        minQuestionSize += int(xpad)
-    }
-
-    paddedLength := min(MaxDNSUDPPacketSize, (max(minQuestionSize, QueryOverhead)+1+63)&^63)
-    if knownBugsFragmentBlocked && proto == "udp" {
-        paddedLength = MaxDNSUDPSafePacketSize
-    } else if !relayIsNil && proto == "tcp" {
-        paddedLength = MaxDNSPacketSize
-    }
-
-    if QueryOverhead+packetLen+1 > paddedLength {
-        if clientNonceDst != nil && len(clientNonceDst) >= HalfNonceSize {
-            copy(clientNonceDst[:HalfNonceSize], clientNonceSlice)
-            return sharedKey, nil, clientNonceDst[:HalfNonceSize], ErrQuestionTooLarge
-        }
-        retClientNonce := make([]byte, HalfNonceSize)
-        copy(retClientNonce, clientNonceSlice)
-        return sharedKey, nil, retClientNonce, ErrQuestionTooLarge
-    }
-
+    // 3. Encrypt and Pack
     headerLen := len(magicQuery) + PublicKeySize + HalfNonceSize
     plaintextLen := paddedLength - QueryOverhead
     totalSize := headerLen + plaintextLen + TagSize
@@ -286,7 +302,7 @@ func (proxy *Proxy) EncryptInto(
     }
 
     copy(paddedBuf, packet)
-    paddedBuf[packetLen] = 0x80
+    paddedBuf[packetLen] = ISO7816Delimiter
     if tailNeedsClearing {
         tail := paddedBuf[packetLen+1:]
         clear(tail)
@@ -296,6 +312,7 @@ func (proxy *Proxy) EncryptInto(
         aead, err := chacha20poly1305.NewX(computedSharedKey[:])
         if err != nil {
             *ptr = paddedBuf
+            // Prevent pool pollution with huge buffers
             if cap(paddedBuf) <= MaxDNSPacketSize {
                 bufferPool.Put(ptr)
             }
@@ -310,6 +327,7 @@ func (proxy *Proxy) EncryptInto(
     }
 
     *ptr = paddedBuf
+    // Prevent pool pollution with huge buffers
     if cap(paddedBuf) <= MaxDNSPacketSize {
         bufferPool.Put(ptr)
     }
