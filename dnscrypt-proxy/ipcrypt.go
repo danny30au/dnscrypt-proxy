@@ -8,9 +8,21 @@ import (
     "net"
     "net/netip"
     "strings"
+    "sync"
 
     "github.com/jedisct1/dlog"
     ipcrypt "github.com/jedisct1/go-ipcrypt"
+)
+
+// Algorithm type constants to avoid string comparisons in hot paths
+type Algorithm uint8
+
+const (
+    AlgNone Algorithm = iota
+    AlgDeterministic
+    AlgNonDeterministic
+    AlgNonDeterministicX
+    AlgPrefixPreserving
 )
 
 // Common errors pre-allocated to avoid runtime allocation
@@ -24,18 +36,38 @@ var (
 )
 
 // IPCryptConfig holds the configuration for IP address encryption.
-// Tweak is removed to ensure thread-safety.
+// Includes thread-safe object pool for zero-allocation tweak generation.
 type IPCryptConfig struct {
     Key       []byte
-    Algorithm string
+    Algorithm Algorithm
+    tweakPool sync.Pool
 }
 
-// NewIPCryptConfig creates a new IPCryptConfig.
-func NewIPCryptConfig(keyHex string, algorithm string) (*IPCryptConfig, error) {
-    if algorithm == "" {
-        algorithm = "none"
+// ParseAlgorithm converts string algorithm name to Algorithm enum.
+func ParseAlgorithm(s string) (Algorithm, error) {
+    switch strings.ToLower(s) {
+    case "", "none":
+        return AlgNone, nil
+    case "ipcrypt-deterministic":
+        return AlgDeterministic, nil
+    case "ipcrypt-nd":
+        return AlgNonDeterministic, nil
+    case "ipcrypt-ndx":
+        return AlgNonDeterministicX, nil
+    case "ipcrypt-pfx":
+        return AlgPrefixPreserving, nil
+    default:
+        return AlgNone, fmt.Errorf("%w: %s", ErrUnsupportedAlgo, s)
     }
-    if algorithm == "none" {
+}
+
+// NewIPCryptConfig creates a new IPCryptConfig with optimized structures.
+func NewIPCryptConfig(keyHex string, algorithm string) (*IPCryptConfig, error) {
+    algo, err := ParseAlgorithm(algorithm)
+    if err != nil {
+        return nil, err
+    }
+    if algo == AlgNone {
         return nil, nil
     }
     if keyHex == "" {
@@ -47,25 +79,39 @@ func NewIPCryptConfig(keyHex string, algorithm string) (*IPCryptConfig, error) {
         return nil, fmt.Errorf("%w: %v", ErrInvalidKeyHex, err)
     }
 
-    // Validate key length immediately
-    algoLower := strings.ToLower(algorithm)
-    switch algoLower {
-    case "ipcrypt-deterministic", "ipcrypt-nd":
-        if len(key) != 16 {
-            return nil, fmt.Errorf("%s requires 16-byte key, got %d", algoLower, len(key))
-        }
-    case "ipcrypt-ndx", "ipcrypt-pfx":
-        if len(key) != 32 {
-            return nil, fmt.Errorf("%s requires 32-byte key, got %d", algoLower, len(key))
-        }
-    default:
-        return nil, fmt.Errorf("%w: %s", ErrUnsupportedAlgo, algorithm)
+    // Validate key length immediately based on algorithm
+    expectedLen := 16
+    if algo == AlgNonDeterministicX || algo == AlgPrefixPreserving {
+        expectedLen = 32
+    }
+    if len(key) != expectedLen {
+        return nil, fmt.Errorf("%s requires %d-byte key, got %d", algorithm, expectedLen, len(key))
     }
 
-    return &IPCryptConfig{
+    config := &IPCryptConfig{
         Key:       key,
-        Algorithm: algoLower,
-    }, nil
+        Algorithm: algo,
+    }
+
+    // Initialize object pool for tweaks based on algorithm to reduce GC pressure
+    switch algo {
+    case AlgNonDeterministic:
+        config.tweakPool = sync.Pool{
+            New: func() interface{} {
+                t := new([8]byte)
+                return t
+            },
+        }
+    case AlgNonDeterministicX:
+        config.tweakPool = sync.Pool{
+            New: func() interface{} {
+                t := new([16]byte)
+                return t
+            },
+        }
+    }
+
+    return config, nil
 }
 
 // EncryptIP encrypts a net.IP using the configured encryption.
@@ -75,15 +121,18 @@ func (config *IPCryptConfig) EncryptIP(ip net.IP) (string, error) {
     }
 
     switch config.Algorithm {
-    case "ipcrypt-deterministic":
+    case AlgDeterministic:
         encrypted, err := ipcrypt.EncryptIP(config.Key, ip)
         if err != nil {
             return "", err
         }
         return encrypted.String(), nil
 
-    case "ipcrypt-nd":
-        var tweak [8]byte
+    case AlgNonDeterministic:
+        // Use pooled buffer for tweak to avoid allocation
+        tweak := config.tweakPool.Get().(*[8]byte)
+        defer config.tweakPool.Put(tweak)
+
         if _, err := rand.Read(tweak[:]); err != nil {
             return "", ErrTweakGen
         }
@@ -93,8 +142,10 @@ func (config *IPCryptConfig) EncryptIP(ip net.IP) (string, error) {
         }
         return hex.EncodeToString(encrypted), nil
 
-    case "ipcrypt-ndx":
-        var tweak [16]byte
+    case AlgNonDeterministicX:
+        tweak := config.tweakPool.Get().(*[16]byte)
+        defer config.tweakPool.Put(tweak)
+
         if _, err := rand.Read(tweak[:]); err != nil {
             return "", ErrTweakGen
         }
@@ -104,7 +155,7 @@ func (config *IPCryptConfig) EncryptIP(ip net.IP) (string, error) {
         }
         return hex.EncodeToString(encrypted), nil
 
-    case "ipcrypt-pfx":
+    case AlgPrefixPreserving:
         encrypted, err := ipcrypt.EncryptIPPfx(ip, config.Key)
         if err != nil {
             return "", err
@@ -124,8 +175,10 @@ func (config *IPCryptConfig) EncryptIPString(ipStr string) string {
     }
 
     switch config.Algorithm {
-    case "ipcrypt-nd":
-        var tweak [8]byte
+    case AlgNonDeterministic:
+        tweak := config.tweakPool.Get().(*[8]byte)
+        defer config.tweakPool.Put(tweak)
+
         if _, err := rand.Read(tweak[:]); err != nil {
             dlog.Warnf("Failed to generate tweak: %v", err)
             return ipStr
@@ -137,8 +190,10 @@ func (config *IPCryptConfig) EncryptIPString(ipStr string) string {
         }
         return hex.EncodeToString(encrypted)
 
-    case "ipcrypt-ndx":
-        var tweak [16]byte
+    case AlgNonDeterministicX:
+        tweak := config.tweakPool.Get().(*[16]byte)
+        defer config.tweakPool.Put(tweak)
+
         if _, err := rand.Read(tweak[:]); err != nil {
             dlog.Warnf("Failed to generate tweak: %v", err)
             return ipStr
@@ -150,7 +205,7 @@ func (config *IPCryptConfig) EncryptIPString(ipStr string) string {
         }
         return hex.EncodeToString(encrypted)
 
-    case "ipcrypt-deterministic", "ipcrypt-pfx":
+    case AlgDeterministic, AlgPrefixPreserving:
         addr, err := netip.ParseAddr(ipStr)
         if err != nil {
             return ipStr
@@ -159,11 +214,8 @@ func (config *IPCryptConfig) EncryptIPString(ipStr string) string {
         // Convert netip.Addr to net.IP (slice) as required by library
         ip16 := addr.As16()
         ipSlice := ip16[:]
-        
-        // Handle IPv4 mapped in IPv6 if necessary, but As16 covers generic cases 
-        // that the library should handle.
 
-        if config.Algorithm == "ipcrypt-deterministic" {
+        if config.Algorithm == AlgDeterministic {
             encrypted, err := ipcrypt.EncryptIP(config.Key, net.IP(ipSlice))
             if err != nil {
                 dlog.Warnf("Failed to encrypt IP: %v", err)
@@ -191,7 +243,7 @@ func (config *IPCryptConfig) DecryptIP(encryptedStr string) (string, error) {
     }
 
     switch config.Algorithm {
-    case "ipcrypt-deterministic":
+    case AlgDeterministic:
         addr, err := netip.ParseAddr(encryptedStr)
         if err != nil {
             return "", fmt.Errorf("%w: %s", ErrInvalidIP, encryptedStr)
@@ -203,7 +255,7 @@ func (config *IPCryptConfig) DecryptIP(encryptedStr string) (string, error) {
         }
         return decrypted.String(), nil
 
-    case "ipcrypt-nd":
+    case AlgNonDeterministic:
         encrypted, err := hex.DecodeString(encryptedStr)
         if err != nil {
             return "", err
@@ -212,10 +264,10 @@ func (config *IPCryptConfig) DecryptIP(encryptedStr string) (string, error) {
         if err != nil {
             return "", err
         }
-        // Assuming decrypted is string or converts to string cleanly
-        return fmt.Sprintf("%s", decrypted), nil
+        // Optimized conversion (avoid fmt.Sprintf reflection)
+        return string(decrypted), nil
 
-    case "ipcrypt-ndx":
+    case AlgNonDeterministicX:
         encrypted, err := hex.DecodeString(encryptedStr)
         if err != nil {
             return "", err
@@ -224,9 +276,10 @@ func (config *IPCryptConfig) DecryptIP(encryptedStr string) (string, error) {
         if err != nil {
             return "", err
         }
-        return fmt.Sprintf("%s", decrypted), nil
+        // Optimized conversion
+        return string(decrypted), nil
 
-    case "ipcrypt-pfx":
+    case AlgPrefixPreserving:
         addr, err := netip.ParseAddr(encryptedStr)
         if err != nil {
             return "", fmt.Errorf("%w: %s", ErrInvalidIP, encryptedStr)
