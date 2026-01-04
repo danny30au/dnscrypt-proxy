@@ -11,7 +11,7 @@ import (
     "encoding/hex"
     "errors"
     "io"
-    "math/rand"
+    "math/rand/v2"
     "net"
     "net/http"
     "net/url"
@@ -119,7 +119,7 @@ func NewXTransport() *XTransport {
         panic("DefaultBootstrapResolver does not parse")
     }
     xTransport := &XTransport{
-        cachedIPs:                CachedIPs{cache: make(map[string]*CachedIPItem)},
+        cachedIPs:                CachedIPs{},
         altSupport:               AltSupport{cache: make(map[string]uint16)},
         keepAlive:                DefaultKeepAlive,
         timeout:                  DefaultTimeout,
@@ -178,7 +178,7 @@ func (xTransport *XTransport) saveCachedIPs(host string, ips []net.IP, ttl time.
         if ttl < MinResolverIPTTL {
             ttl = MinResolverIPTTL
         }
-        ttl += time.Duration(rand.Int63n(int64(ResolverIPTTLMaxJitter)))
+        ttl += time.Duration(rand.Int64N(int64(ResolverIPTTLMaxJitter)))
         expiration := time.Now().Add(ttl)
         item.expiration = &expiration
     }
@@ -924,9 +924,9 @@ func (xTransport *XTransport) Fetch(
                             break
                         }
                         v = strings.TrimSpace(v)
-                        if strings.HasPrefix(v, `h3=":`) {
-                            v = strings.TrimPrefix(v, `h3=":`)
-                            v = strings.TrimSuffix(v, `"`)
+                        if strings.HasPrefix(v, "h3=\":\"") {
+                            v = strings.TrimPrefix(v, "h3=\":\"")
+                            v = strings.TrimSuffix(v, "\"")
                             if xAltPort, err := strconv.ParseUint(v, 10, 16); err == nil && xAltPort <= 65535 {
                                 altPort = uint16(xAltPort)
                                 dlog.Debugf("Using HTTP/3 for [%s]", url.Host)
