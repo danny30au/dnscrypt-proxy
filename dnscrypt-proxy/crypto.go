@@ -29,7 +29,7 @@ const (
 )
 
 var (
-    // Pre-allocated errors to avoid runtime allocation
+    // Sentinel errors pre-allocated to avoid runtime allocation on hot paths
     ErrInvalidPadding   = errors.New("invalid padding: delimiter not found")
     ErrInvalidPadBytes  = errors.New("invalid padding: non-zero bytes after delimiter")
     ErrInvalidMsgSize   = errors.New("invalid message size")
@@ -127,7 +127,7 @@ func unpadFast(packet []byte) ([]byte, error) {
 }
 
 // readRandom reads n bytes from crypto/rand.
-// Go 1.25+ improves crypto/rand on Linux (vDSO getrandom), so extra buffering is often unnecessary.
+// Go 1.25+ uses Linux getrandom vDSO, eliminating syscall overhead. No user-space buffering needed.
 func readRandom(p []byte) error {
     _, err := crypto_rand.Read(p)
     return err
@@ -155,6 +155,7 @@ func ComputeSharedKey(
         copy(sharedKey[:], ss)
 
         // Detect low-order points (all-zero shared secret)
+        // Detect low-order points (all-zero shared secret) to prevent subgroup confinement attacks
         if subtle.ConstantTimeCompare(sharedKey[:], zeroKey[:]) == 1 {
             logMsg := "Weak X25519 public key (all-zero shared secret)"
             if providerName != nil {
@@ -170,6 +171,7 @@ func ComputeSharedKey(
         // XSalsa20/Poly1305 path: keep NaCl box precomputation (HSalsa20-based key derivation)
         box.Precompute(&sharedKey, serverPk, secretKey)
 
+        // Detect low-order points (all-zero shared secret) to prevent subgroup confinement attacks
         if subtle.ConstantTimeCompare(sharedKey[:], zeroKey[:]) == 1 {
             logMsg := "Weak XSalsa20 public key"
             if providerName != nil {
@@ -201,7 +203,7 @@ func (proxy *Proxy) EncryptInto(
     }
 
     var nonce [NonceSize]byte
-    copy(nonce[:HalfNonceSize], randomBuf[:HalfNonceSize])
+    copy(nonce[:HalfNonceSize], randomBuf[:HalfNonceSize]) // Client random component
     clientNonceSlice := randomBuf[:HalfNonceSize]
 
     cryptoAlgo := serverInfo.CryptoConstruction
@@ -217,7 +219,7 @@ func (proxy *Proxy) EncryptInto(
         var buf [HalfNonceSize + 32]byte
         copy(buf[:], clientNonceSlice)
         copy(buf[HalfNonceSize:], proxy.proxySecretKey[:])
-        ephSk := sha512.Sum512_256(buf[:])
+        ephSk := sha512.Sum512_256(buf[:]) // Hedged key derivation: hash(random || long-term-secret)
 
         curve25519.ScalarBaseMult(&proxy.ephemeralPublicKeyScratch, &ephSk)
         publicKey = &proxy.ephemeralPublicKeyScratch
