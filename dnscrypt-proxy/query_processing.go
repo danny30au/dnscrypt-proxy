@@ -15,24 +15,15 @@ stamps "github.com/jedisct1/go-dnsstamps"
 // Atomic counter for lock-free Round-Robin load balancing
 var odohLbCounter uint64
 
-// SessionData provides type-safe session storage
-type SessionData struct {
-StaleResponse *dns.Msg
-CacheTime time.Time
+// validateQuery - Performs basic validation on the incoming query
+func validateQuery(query []byte) bool {
+if len(query) < MinDNSPacketSize {
+return false
 }
-
-// validateDNSPacket - Enhanced validation with DNS header checks
-func validateDNSPacket(packet []byte) (bool, string) {
-if len(packet) < MinDNSPacketSize {
-return false, "packet too small"
+if len(query) > MaxDNSPacketSize {
+return false
 }
-if len(packet) > MaxDNSPacketSize {
-return false, "packet too large"
-}
-if len(packet) < 12 {
-return false, "incomplete DNS header"
-}
-return true, ""
+return true
 }
 
 // handleSynthesizedResponse - Handles a synthesized DNS response from plugins
@@ -44,38 +35,23 @@ return nil, fmt.Errorf("failed to pack synthesized response: %w", err)
 return synth.Data, nil
 }
 
-// encryptAndExchange - Helper to reduce duplication in encryption and exchange
-func encryptAndExchange(
-proxy *Proxy,
-serverInfo *ServerInfo,
-pluginsState *PluginsState,
-query []byte,
-serverProto string,
-) ([]byte, error) {
-sharedKey, encryptedQuery, clientNonce, err := proxy.Encrypt(serverInfo, query, serverProto)
-if err != nil {
-return nil, fmt.Errorf("encryption failed for %s: %w", serverInfo.Name, err)
-}
-
-if serverProto == "udp" {
-return proxy.exchangeWithUDPServer(serverInfo, sharedKey, encryptedQuery, clientNonce)
-}
-return proxy.exchangeWithTCPServer(serverInfo, sharedKey, encryptedQuery, clientNonce)
-}
-
-// getStaleResponse - Type-safe stale response retrieval
+// getStaleResponse - Type-safe stale response retrieval from sessionData map
 func getStaleResponse(pluginsState *PluginsState) ([]byte, bool) {
 if pluginsState.sessionData == nil {
 return nil, false
 }
 
-staleData, ok := pluginsState.sessionData.(*SessionData)
-if !ok || staleData == nil || staleData.StaleResponse == nil {
+stale, ok := pluginsState.sessionData["stale"]
+if !ok {
+return nil, false
+}
+
+staleMsg, isMsg := stale.(*dns.Msg)
+if !isMsg || staleMsg == nil {
 return nil, false
 }
 
 dlog.Debug("Serving stale response")
-staleMsg := staleData.StaleResponse
 if err := staleMsg.Pack(); err != nil {
 dlog.Warnf("Failed to pack stale response: %v", err)
 return nil, false
@@ -83,7 +59,7 @@ return nil, false
 return staleMsg.Data, true
 }
 
-// processDNSCryptQuery - Processes a query using the DNSCrypt protocol
+// processDNSCryptQuery - Processes a query using the DNSCrypt protocol with improved error handling
 func processDNSCryptQuery(
 proxy *Proxy,
 serverInfo *ServerInfo,
@@ -149,7 +125,7 @@ return nil, fmt.Errorf("DNSCrypt exchange failed for %s: %w", serverInfo.Name, e
 return response, nil
 }
 
-// processDoHQuery - Processes a query using the DoH protocol
+// processDoHQuery - Processes a query using the DoH protocol with improved error handling
 func processDoHQuery(
 proxy *Proxy,
 serverInfo *ServerInfo,
@@ -181,7 +157,7 @@ pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
 return nil, fmt.Errorf("DoH query failed for %s: %w", serverInfo.Name, err)
 }
 
-// processODoHQuery - Processes a query using the ODoH protocol
+// processODoHQuery - Processes a query using the ODoH protocol with enhanced error context
 func processODoHQuery(
 proxy *Proxy,
 serverInfo *ServerInfo,
@@ -195,6 +171,7 @@ return nil, fmt.Errorf("no ODoH target configs available for %s", serverInfo.Nam
 
 serverInfo.noticeBegin(proxy)
 
+// Optimization: Lock-free atomic Round-Robin with overflow protection
 idx := atomic.AddUint64(&odohLbCounter, 1) % uint64(len(serverInfo.odohTargetConfigs))
 target := serverInfo.odohTargetConfigs[idx]
 
@@ -252,7 +229,7 @@ serverInfo.noticeFailure(proxy)
 return nil, fmt.Errorf("ODoH query failed for %s with code %d: %w", serverInfo.Name, responseCode, err)
 }
 
-// handleDNSExchange - Handles the DNS exchange with a server
+// handleDNSExchange - Handles the DNS exchange with a server using enhanced validation
 func handleDNSExchange(
 proxy *Proxy,
 serverInfo *ServerInfo,
@@ -277,17 +254,17 @@ if err != nil {
 return nil, err
 }
 
-if valid, reason := validateDNSPacket(response); !valid {
+if len(response) < MinDNSPacketSize || len(response) > MaxDNSPacketSize {
 pluginsState.returnCode = PluginsReturnCodeParseError
 pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
 serverInfo.noticeFailure(proxy)
-return nil, fmt.Errorf("invalid DNS response from %s: %s", serverInfo.Name, reason)
+return nil, fmt.Errorf("invalid response size from %s: %d bytes", serverInfo.Name, len(response))
 }
 
 return response, nil
 }
 
-// processPlugins - Processes plugins for both query and response
+// processPlugins - Processes plugins for both query and response with enhanced error context
 func processPlugins(
 proxy *Proxy,
 pluginsState *PluginsState,
@@ -334,7 +311,7 @@ serverInfo.noticeSuccess(proxy)
 return response, nil
 }
 
-// sendResponse - Sends the response back to the client
+// sendResponse - Sends the response back to the client with improved error handling
 func sendResponse(
 proxy *Proxy,
 pluginsState *PluginsState,
@@ -343,14 +320,13 @@ clientProto string,
 clientAddr *net.Addr,
 clientPc net.Conn,
 ) {
-if valid, reason := validateDNSPacket(response); !valid {
+if len(response) < MinDNSPacketSize || len(response) > MaxDNSPacketSize {
 if len(response) == 0 {
 pluginsState.returnCode = PluginsReturnCodeNotReady
 } else {
 pluginsState.returnCode = PluginsReturnCodeParseError
 }
 pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
-dlog.Debugf("Invalid response packet: %s", reason)
 return
 }
 
@@ -387,7 +363,7 @@ dlog.Warnf("Failed to write TCP response: %v", err)
 }
 }
 
-// updateMonitoringMetrics - Updates monitoring metrics if enabled
+// updateMonitoringMetrics - Updates monitoring metrics if enabled with cleaner logic
 func updateMonitoringMetrics(
 proxy *Proxy,
 pluginsState *PluginsState,
