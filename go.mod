@@ -5,10 +5,10 @@ go 1.25.0
 exclude google.golang.org/genproto v0.0.0-20230410155749-daa745c078e1
 
 require (
-	codeberg.org/miekg/dns v0.6.18
+	codeberg.org/miekg/dns v0.6.20
 	github.com/BurntSushi/toml v1.6.0
 	github.com/VividCortex/ewma v1.2.0
-	github.com/coreos/go-systemd/v22 v22.6.0
+	github.com/coreos/go-systemd v0.0.0-20191104093116-d3cd4ed1dbcf
 	github.com/dchest/safefile v0.0.0-20151022103144-855e8d98f185
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/gorilla/websocket v1.5.3
@@ -21,7 +21,6 @@ require (
 	github.com/jedisct1/go-ipcrypt v0.1.1
 	github.com/jedisct1/go-minisign v0.0.0-20241212093149-d2f9f49435c7
 	github.com/jedisct1/go-sieve-cache v0.1.8
-	github.com/jedisct1/xsecretbox v0.0.0-20241212092125-3afc4917ac41
 	github.com/k-sone/critbitgo v1.4.0
 	github.com/kardianos/service v1.2.4
 	github.com/lifenjoiner/dhcpdns v0.0.7
@@ -29,6 +28,7 @@ require (
 	github.com/quic-go/quic-go v0.58.0
 	golang.org/x/crypto v0.46.0
 	golang.org/x/net v0.48.0
+	golang.org/x/sync v0.19.0
 	golang.org/x/sys v0.39.0
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 )
