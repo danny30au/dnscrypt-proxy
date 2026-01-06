@@ -119,7 +119,7 @@ LocalDoH:        LocalDoHConfig{Path: "/dns-query"},
 MonitoringUI: MonitoringUIConfig{
 Enabled:        false,
 ListenAddress:  "127.0.0.1:8080",
-Username:       "admin", // Set to empty string to disable authentication
+Username:       "admin",
 Password:       "changeme",
 EnableQueryLog: false,
 PrivacyLevel:   2,
@@ -567,13 +567,13 @@ return nil
 }
 
 func (config *Config) printRegisteredServers(proxy *Proxy, jsonOutput bool, includeRelays bool) error {
-var summary []ServerSummary
+summary := make([]ServerSummary, 0, len(proxy.registeredRelays)+len(proxy.registeredServers))
 if includeRelays {
 for _, registeredRelay := range proxy.registeredRelays {
 addrStr, port := registeredRelay.stamp.ServerAddrStr, stamps.DefaultPort
 var hostAddr string
 hostAddr, port = ExtractHostAndPort(addrStr, port)
-addrs := make([]string, 0)
+addrs := make([]string, 0, 2)
 if (registeredRelay.stamp.Proto == stamps.StampProtoTypeDoH || registeredRelay.stamp.Proto == stamps.StampProtoTypeODoHTarget) &&
 len(registeredRelay.stamp.ProviderName) > 0 {
 providerName := registeredRelay.stamp.ProviderName
@@ -611,7 +611,7 @@ for _, registeredServer := range proxy.registeredServers {
 addrStr, port := registeredServer.stamp.ServerAddrStr, stamps.DefaultPort
 var hostAddr string
 hostAddr, port = ExtractHostAndPort(addrStr, port)
-addrs := make([]string, 0)
+addrs := make([]string, 0, 2)
 if (registeredServer.stamp.Proto == stamps.StampProtoTypeDoH || registeredServer.stamp.Proto == stamps.StampProtoTypeODoHTarget) &&
 len(registeredServer.stamp.ProviderName) > 0 {
 providerName := registeredServer.stamp.ProviderName
@@ -652,6 +652,7 @@ return nil
 }
 
 func (config *Config) loadSources(proxy *Proxy) error {
+servers := make([]RegisteredServer, 0, len(config.SourcesConfig)*10)
 for cfgSourceName, cfgSource_ := range config.SourcesConfig {
 cfgSource := cfgSource_
 rand.Shuffle(len(cfgSource.URLs), func(i, j int) {
@@ -661,15 +662,17 @@ if err := config.loadSource(proxy, cfgSourceName, &cfgSource); err != nil {
 return err
 }
 }
+relays := make([]RegisteredServer, 0, len(config.StaticsConfig))
 for name, config := range config.StaticsConfig {
 if stamp, err := stamps.NewServerStampFromString(config.Stamp); err == nil {
 if stamp.Proto == stamps.StampProtoTypeDNSCryptRelay || stamp.Proto == stamps.StampProtoTypeODoHRelay {
 dlog.Debugf("Adding [%s] to the set of available static relays", name)
 registeredServer := RegisteredServer{name: name, stamp: stamp, description: "static relay"}
-proxy.registeredRelays = append(proxy.registeredRelays, registeredServer)
+relays = append(relays, registeredServer)
 }
 }
 }
+proxy.registeredRelays = relays
 if len(config.ServerNames) == 0 {
 for serverName := range config.StaticsConfig {
 config.ServerNames = append(config.ServerNames, serverName)
@@ -687,8 +690,9 @@ stamp, err := stamps.NewServerStampFromString(staticConfig.Stamp)
 if err != nil {
 return fmt.Errorf("Stamp error for the static [%s] definition: [%v]", serverName, err)
 }
-proxy.registeredServers = append(proxy.registeredServers, RegisteredServer{name: serverName, stamp: stamp})
+servers = append(servers, RegisteredServer{name: serverName, stamp: stamp})
 }
+proxy.registeredServers = servers
 if err := proxy.updateRegisteredServers(); err != nil {
 return err
 }
