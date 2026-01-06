@@ -29,21 +29,28 @@ func GetMsg() *dns.Msg {
     return msgPool.Get().(*dns.Msg)
 }
 
-// PutMsg resets and returns a message to the pool (optimized)
+// PutMsg resets and returns a message to the pool
 func PutMsg(m *dns.Msg) {
     if m == nil {
         return
     }
+    m.ID = 0
+    m.Response = false
+    m.Opcode = 0
+    m.Authoritative = false
+    m.Truncated = false
+    m.RecursionDesired = false
+    m.RecursionAvailable = false
+    m.Zero = false
+    m.AuthenticatedData = false
+    m.CheckingDisabled = false
+    m.Rcode = 0
 
-    // Efficiently zero header and reuse slices
-    *m = dns.Msg{
-        Question: m.Question[:0],
-        Answer:   m.Answer[:0],
-        Ns:       m.Ns[:0],
-        Extra:    m.Extra[:0],
-        Pseudo:   m.Pseudo[:0],
-    }
-
+    m.Question = m.Question[:0]
+    m.Answer = m.Answer[:0]
+    m.Ns = m.Ns[:0]
+    m.Extra = m.Extra[:0]
+    m.Pseudo = m.Pseudo[:0]
     msgPool.Put(m)
 }
 
@@ -63,15 +70,13 @@ var (
 
 // --- Functions ---
 
-// EmptyResponseFromMessage with slice preallocation
 func EmptyResponseFromMessage(srcMsg *dns.Msg) *dns.Msg {
     dstMsg := GetMsg()
     dstMsg.ID = srcMsg.ID
     dstMsg.Opcode = srcMsg.Opcode
 
     if len(srcMsg.Question) > 0 {
-        dstMsg.Question = make([]dns.Question, len(srcMsg.Question))
-        copy(dstMsg.Question, srcMsg.Question)
+        dstMsg.Question = append(dstMsg.Question[:0], srcMsg.Question...)
     }
 
     dstMsg.Response = true
@@ -86,7 +91,7 @@ func EmptyResponseFromMessage(srcMsg *dns.Msg) *dns.Msg {
     return dstMsg
 }
 
-// TruncatedResponse - optimized to avoid double copy
+// TruncatedResponse - Optimized
 func TruncatedResponse(packet []byte) ([]byte, error) {
     if len(packet) < 12 {
         return nil, errors.New("packet too short")
@@ -104,7 +109,7 @@ func TruncatedResponse(packet []byte) ([]byte, error) {
                 offset += 2
                 break
             }
-            offset++
+            offset += 1
             if labelLen == 0 {
                 break
             }
@@ -117,83 +122,91 @@ func TruncatedResponse(packet []byte) ([]byte, error) {
         return nil, errors.New("packet malformed")
     }
 
-    // Single allocation and copy
-    newPacket := make([]byte, offset)
-    copy(newPacket, packet[:offset])
-    newPacket[2] |= 0x82
-    for i := 6; i < 12; i++ {
-        newPacket[i] = 0
+    bufPtr := bufPool.Get().(*[]byte)
+    buf := *bufPtr
+    if cap(buf) < offset {
+        buf = make([]byte, offset)
+    } else {
+        buf = buf[:offset]
     }
+
+    copy(buf, packet[:offset])
+    buf[2] |= 0x82
+    for i := 6; i < 12; i++ {
+        buf[i] = 0
+    }
+
+    newPacket := make([]byte, offset)
+    copy(newPacket, buf)
+
+    *bufPtr = buf[:0]
+    bufPool.Put(bufPtr)
 
     return newPacket, nil
 }
 
-// RefusedResponseFromMessage with small preallocations
 func RefusedResponseFromMessage(srcMsg *dns.Msg, refusedCode bool, ipv4 net.IP, ipv6 net.IP, ttl uint32) *dns.Msg {
     dstMsg := EmptyResponseFromMessage(srcMsg)
 
     var ede *dns.EDE
     if dstMsg.UDPSize > 0 {
-        dstMsg.Pseudo = make([]dns.RR, 0, 1)
         ede = &dns.EDE{InfoCode: dns.ExtendedErrorFiltered}
         dstMsg.Pseudo = append(dstMsg.Pseudo, ede)
     }
 
     if refusedCode {
         dstMsg.Rcode = dns.RcodeRefused
-        return dstMsg
-    }
+    } else {
+        dstMsg.Rcode = dns.RcodeSuccess
+        questions := srcMsg.Question
+        if len(questions) == 0 {
+            return dstMsg
+        }
+        question := questions[0]
+        qtype := dns.RRToType(question)
+        qname := question.Header().Name
+        sendHInfoResponse := true
 
-    dstMsg.Rcode = dns.RcodeSuccess
-    questions := srcMsg.Question
-    if len(questions) == 0 {
-        return dstMsg
-    }
+        if ipv4 != nil && qtype == dns.TypeA {
+            if ip4 := ipv4.To4(); ip4 != nil {
+                rr := &dns.A{
+                    Hdr: dns.Header{Name: qname, Class: dns.ClassINET, TTL: ttl},
+                    A:   rdata.A{Addr: netip.AddrFrom4([4]byte(ip4))},
+                }
+                dstMsg.Answer = append(dstMsg.Answer, rr)
+                sendHInfoResponse = false
+                if ede != nil {
+                    ede.InfoCode = dns.ExtendedErrorForgedAnswer
+                }
+            }
+        } else if ipv6 != nil && qtype == dns.TypeAAAA {
+            if ip6 := ipv6.To16(); ip6 != nil {
+                rr := &dns.AAAA{
+                    Hdr:  dns.Header{Name: qname, Class: dns.ClassINET, TTL: ttl},
+                    AAAA: rdata.AAAA{Addr: netip.AddrFrom16([16]byte(ip6))},
+                }
+                dstMsg.Answer = append(dstMsg.Answer, rr)
+                sendHInfoResponse = false
+                if ede != nil {
+                    ede.InfoCode = dns.ExtendedErrorForgedAnswer
+                }
+            }
+        }
 
-    question := questions[0]
-    qtype := dns.RRToType(question)
-    qname := question.Header().Name
-    sendHInfoResponse := true
-
-    dstMsg.Answer = make([]dns.RR, 0, 1)
-
-    if ipv4 != nil && qtype == dns.TypeA {
-        if ip4 := ipv4.To4(); ip4 != nil {
-            rr := &dns.A{
+        if sendHInfoResponse {
+            hinfo := &dns.HINFO{
                 Hdr: dns.Header{Name: qname, Class: dns.ClassINET, TTL: ttl},
-                A:   rdata.A{Addr: netip.AddrFrom4([4]byte(ip4))},
+                HINFO: rdata.HINFO{
+                    Cpu: blockedHinfoCPU,
+                    Os:  blockedHinfoOS,
+                },
             }
-            dstMsg.Answer = append(dstMsg.Answer, rr)
-            sendHInfoResponse = false
+            dstMsg.Answer = append(dstMsg.Answer, hinfo)
+        } else {
             if ede != nil {
-                ede.InfoCode = dns.ExtendedErrorForgedAnswer
+                ede.ExtraText = "This query has been locally blocked by dnscrypt-proxy"
             }
         }
-    } else if ipv6 != nil && qtype == dns.TypeAAAA {
-        if ip6 := ipv6.To16(); ip6 != nil {
-            rr := &dns.AAAA{
-                Hdr:  dns.Header{Name: qname, Class: dns.ClassINET, TTL: ttl},
-                AAAA: rdata.AAAA{Addr: netip.AddrFrom16([16]byte(ip6))},
-            }
-            dstMsg.Answer = append(dstMsg.Answer, rr)
-            sendHInfoResponse = false
-            if ede != nil {
-                ede.InfoCode = dns.ExtendedErrorForgedAnswer
-            }
-        }
-    }
-
-    if sendHInfoResponse {
-        hinfo := &dns.HINFO{
-            Hdr: dns.Header{Name: qname, Class: dns.ClassINET, TTL: ttl},
-            HINFO: rdata.HINFO{
-                Cpu: blockedHinfoCPU,
-                Os:  blockedHinfoOS,
-            },
-        }
-        dstMsg.Answer = append(dstMsg.Answer, hinfo)
-    } else if ede != nil {
-        ede.ExtraText = "This query has been locally blocked by dnscrypt-proxy"
     }
 
     return dstMsg
@@ -259,41 +272,37 @@ func NormalizeQName(str string) (string, error) {
 
 func getMinTTL(msg *dns.Msg, minTTL uint32, maxTTL uint32, cacheNegMinTTL uint32, cacheNegMaxTTL uint32) time.Duration {
     if (msg.Rcode != dns.RcodeSuccess && msg.Rcode != dns.RcodeNameError) ||
-        (len(msg.Answer) == 0 && len(msg.Ns) == 0) {
+        (len(msg.Answer) <= 0 && len(msg.Ns) <= 0) {
         return time.Duration(cacheNegMinTTL) * time.Second
     }
-
     var ttl uint32
-    checkMin := minTTL
     if msg.Rcode == dns.RcodeSuccess {
-        ttl = maxTTL
+        ttl = uint32(maxTTL)
     } else {
-        ttl = cacheNegMaxTTL
-        checkMin = cacheNegMinTTL
+        ttl = uint32(cacheNegMaxTTL)
     }
-
     if len(msg.Answer) > 0 {
         for _, rr := range msg.Answer {
-            rrTTL := rr.Header().TTL
-            if rrTTL <= checkMin {
-                return time.Duration(checkMin) * time.Second
-            }
-            if rrTTL < ttl {
-                ttl = rrTTL
+            if rr.Header().TTL < ttl {
+                ttl = rr.Header().TTL
             }
         }
     } else {
         for _, rr := range msg.Ns {
-            rrTTL := rr.Header().TTL
-            if rrTTL <= checkMin {
-                return time.Duration(checkMin) * time.Second
-            }
-            if rrTTL < ttl {
-                ttl = rrTTL
+            if rr.Header().TTL < ttl {
+                ttl = rr.Header().TTL
             }
         }
     }
-
+    if msg.Rcode == dns.RcodeSuccess {
+        if ttl < minTTL {
+            ttl = minTTL
+        }
+    } else {
+        if ttl < cacheNegMinTTL {
+            ttl = cacheNegMinTTL
+        }
+    }
     return time.Duration(ttl) * time.Second
 }
 
@@ -303,7 +312,7 @@ func updateTTL(msg *dns.Msg, expiration time.Time) {
     if until > 0 {
         ttl = uint32(until / time.Second)
         if until-time.Duration(ttl)*time.Second >= time.Second/2 {
-            ttl++
+            ttl += 1
         }
     }
     for _, rr := range msg.Answer {
@@ -324,6 +333,7 @@ func hasEDNS0Padding(packet []byte) (bool, error) {
     if err := msg.Unpack(); err != nil {
         return false, err
     }
+    // In v2, options are in Pseudo
     for _, rr := range msg.Pseudo {
         if _, ok := rr.(*dns.PADDING); ok {
             return true, nil
@@ -381,11 +391,11 @@ func PackTXTRR(s string) []byte {
                 msg = append(msg, dddToByte(bs[i:]))
                 i += 2
             } else if bs[i] == 't' {
-                msg = append(msg, 9)
+                msg = append(msg, 9) // Tab
             } else if bs[i] == 'r' {
-                msg = append(msg, 13)
+                msg = append(msg, 13) // CR
             } else if bs[i] == 'n' {
-                msg = append(msg, 10)
+                msg = append(msg, 10) // LF
             } else {
                 msg = append(msg, bs[i])
             }
@@ -503,7 +513,6 @@ func _dnsExchange(
 ) DNSExchangeResponse {
     var packet []byte
     var rtt time.Duration
-
     if proto == "udp" {
         qNameLen, padding := len(query.Question[0].Header().Name), 0
         if qNameLen < paddedLen {
