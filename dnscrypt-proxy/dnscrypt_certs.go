@@ -169,7 +169,11 @@ func FetchCurrentDNSCryptCert(
 		}
 		var serverPk [32]byte
 		copy(serverPk[:], binCert[72:104])
-		sharedKey := ComputeSharedKey(cryptoConstruction, &proxy.proxySecretKey, &serverPk, &providerName)
+		sharedKey, err := ComputeSharedKey(cryptoConstruction, &proxy.proxySecretKey, &serverPk, &providerName)
+		if err != nil {
+			dlog.Warnf("[%v] Failed to compute shared key: %v", *serverName, err)
+			continue
+		}
 		certInfo.SharedKey = sharedKey
 		highestSerial = serial
 		certInfo.CryptoConstruction = cryptoConstruction
