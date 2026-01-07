@@ -19,7 +19,6 @@ import (
     "strconv"
     "strings"
     "sync"
-    "sync/atomic"
     "time"
 
     "codeberg.org/miekg/dns"
@@ -159,10 +158,8 @@ func NewXTransport() *XTransport {
         DualStack: true,
     }
     xTransport.dnsClient = &dns.Client{
-        Net: "udp",
-        Transport: &dns.Transport{
-            ReadTimeout: ResolverReadTimeout,
-        },
+        Net:         "udp",
+        ReadTimeout: ResolverReadTimeout,
     }
 
     return xTransport
@@ -400,7 +397,7 @@ func (xTransport *XTransport) rebuildTransport() {
             }
 
             cachedIPs, _, _ := xTransport.loadCachedIPs(host)
-            
+
             dial := func(address string) (net.Conn, error) {
                 if xTransport.proxyDialer == nil {
                     return xTransport.baseDialer.DialContext(ctx, network, address)
@@ -512,9 +509,9 @@ MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAwTzELMAkGA1UEBhMC
         dial := func(ctx context.Context, addrStr string, tlsCfg *tls.Config, cfg *quic.Config) (quic.EarlyConnection, error) {
             dlog.Debugf("Dialing for H3: [%v]", addrStr)
             host, port := ExtractHostAndPort(addrStr, stamps.DefaultPort)
-            
+
             cachedIPs, _, _ := xTransport.loadCachedIPs(host)
-            
+
             // Allow 0-RTT
             if cfg == nil {
                 cfg = &quic.Config{}
@@ -529,14 +526,14 @@ MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAwTzELMAkGA1UEBhMC
 
             // Zero-copy, zero-allocation dial loop
             var lastErr error
-            
+
             // Try cached IPs first
             for _, ip := range cachedIPs {
                 network := "udp6"
                 if ip4 := ip.To4(); ip4 != nil {
                     network = "udp4"
                 }
-                
+
                 tr, err := xTransport.getQUICTransport(network)
                 if err != nil {
                     lastErr = err
@@ -545,7 +542,7 @@ MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAwTzELMAkGA1UEBhMC
 
                 udpAddr := &net.UDPAddr{IP: ip, Port: port}
                 tlsCfg.ServerName = host
-                
+
                 conn, err := tr.DialEarly(ctx, udpAddr, tlsCfg, cfg)
                 if err != nil {
                     lastErr = err
@@ -554,13 +551,12 @@ MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAwTzELMAkGA1UEBhMC
                 }
                 return conn, nil
             }
-            
+
             // Fallback if no cache or cache failed
             if len(cachedIPs) == 0 {
-                // ... original fallback logic if needed, or simplified:
                 dlog.Debugf("[%s] IP address was not cached in H3 context", host)
             }
-            
+
             if lastErr == nil {
                 lastErr = errors.New("no cached IPs available for H3 dial")
             }
@@ -597,7 +593,7 @@ func (xTransport *XTransport) resolveUsingResolver(
 ) (ips []net.IP, ttl time.Duration, err error) {
     // Reuse global client with context awareness
     dnsClient := xTransport.dnsClient
-    
+
     queryType := make([]uint16, 0, 2)
     if returnIPv4 {
         queryType = append(queryType, dns.TypeA)
@@ -609,7 +605,7 @@ func (xTransport *XTransport) resolveUsingResolver(
     var mu sync.Mutex
     var wg sync.WaitGroup
     var rrTTL uint32
-    
+
     ctx, cancel := context.WithTimeout(context.Background(), ResolverReadTimeout)
     defer cancel()
 
@@ -617,7 +613,7 @@ func (xTransport *XTransport) resolveUsingResolver(
         wg.Add(1)
         go func(rrType uint16) {
             defer wg.Done()
-            
+
             msg := dnsMsgPool.Get().(*dns.Msg)
             defer func() {
                 msg.Question = msg.Question[:0]
@@ -626,18 +622,16 @@ func (xTransport *XTransport) resolveUsingResolver(
                 msg.Extra = msg.Extra[:0]
                 dnsMsgPool.Put(msg)
             }()
-            
-            msg.SetQuestion(fqdn(host), rrType)
+
+            msg.Question = []dns.Question{{Name: fqdn(host), Qtype: rrType, Qclass: dns.ClassINET}}
             msg.RecursionDesired = true
             msg.UDPSize = uint16(MaxDNSPacketSize)
-            msg.Security = true // set AD bit
 
-            if in, _, err := dnsClient.ExchangeContext(ctx, msg, resolver); err == nil {
+            if in, _, err := dnsClient.Exchange(msg, resolver); err == nil {
                 if in.Truncated && proto == "udp" {
-                    // Fallback to TCP handled by caller or retry here
-                    return 
+                    return
                 }
-                
+
                 mu.Lock()
                 for _, answer := range in.Answer {
                     if dns.RRToType(answer) == rrType {
@@ -648,7 +642,7 @@ func (xTransport *XTransport) resolveUsingResolver(
                             ips = append(ips, answer.(*dns.AAAA).AAAA)
                         }
                         if answer.Header().TTL > rrTTL {
-                             rrTTL = answer.Header().TTL
+                            rrTTL = answer.Header().TTL
                         }
                     }
                 }
@@ -676,30 +670,23 @@ func (xTransport *XTransport) resolveUsingServers(
     // Happy Eyeballs: Race all resolvers
     ctx, cancel := context.WithCancel(context.Background())
     defer cancel()
-    
+
     type result struct {
         ips []net.IP
         ttl time.Duration
         err error
     }
-    
-    resultCh := make(chan result, len(resolvers))
-    
-    // Select starting index to avoid stampeding the first resolver
-    startIdx := 0
-    if len(resolvers) > 1 {
-        // Use either internal or bootstrap index based on the slice passed
-        // For simplicity, we just start at 0 but we could use atomic counters here
-        // The race below mitigates the need for strict rotation
-    }
 
+    resultCh := make(chan result, len(resolvers))
+
+    // Start index logic removed since we race all of them anyway
     for _, resolver := range resolvers {
         go func(r string) {
             // Apply jitter to start time to avoid synchronized spikes
             time.Sleep(time.Duration(rand.Intn(10)) * time.Millisecond)
-            
+
             ips, ttl, err := xTransport.resolveUsingResolver(proto, host, r, returnIPv4, returnIPv6)
-            
+
             select {
             case <-ctx.Done():
                 return
@@ -730,7 +717,7 @@ func (xTransport *XTransport) resolveUsingServers(
             return nil, 0, errors.New("timeout waiting for resolvers")
         }
     }
-    
+
     return nil, 0, errors.New("no IP addresses returned")
 }
 
@@ -797,7 +784,7 @@ func (xTransport *XTransport) resolveAndUpdateCache(host string) error {
             go func(stale []net.IP) {
                 // Use refreshGroup to deduplicate background refreshes for same host
                 _, _, _ = xTransport.refreshGroup.Do(host, func() (any, error) {
-                     return nil, xTransport.resolveAndUpdateCacheBlocking(host, stale)
+                    return nil, xTransport.resolveAndUpdateCacheBlocking(host, stale)
                 })
             }(cachedIPs)
         }
@@ -904,7 +891,7 @@ func (xTransport *XTransport) Fetch(
         h := fnv.New128a()
         h.Write(*body)
         hash := hex.EncodeToString(h.Sum(nil))
-        
+
         url2 := *url
         if url2.RawQuery == "" {
             url2.RawQuery = "body_hash=" + hash
@@ -1011,7 +998,7 @@ func (xTransport *XTransport) Fetch(
             if alt, found := resp.Header["Alt-Svc"]; found {
                 dlog.Debugf("Alt-Svc [%s]: [%s]", url.Host, alt)
                 altPort := uint16(port & 0xffff)
-                
+
                 // Optimized single-pass Alt-Svc parsing
                 for _, xalt := range alt {
                     if idx := strings.Index(xalt, `h3=":`); idx >= 0 {
@@ -1059,14 +1046,14 @@ func (xTransport *XTransport) Fetch(
     if capacity > MaxHTTPBodyLength {
         capacity = MaxHTTPBodyLength
     }
-    
+
     buf := bytes.NewBuffer(make([]byte, 0, capacity))
     _, err = buf.ReadFrom(io.LimitReader(bodyReader, MaxHTTPBodyLength))
     if err != nil {
         return nil, statusCode, tlsState, rtt, err
     }
     bin := buf.Bytes()
-    
+
     return bin, statusCode, tlsState, rtt, nil
 }
 
