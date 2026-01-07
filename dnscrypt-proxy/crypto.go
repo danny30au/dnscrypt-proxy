@@ -109,7 +109,7 @@ func init() {
     // Read pool size from environment for runtime tuning
     if val := os.Getenv("DNSCRYPT_POOL_SIZE"); val != "" {
         if size, err := strconv.Atoi(val); err == nil && size > 0 {
-            poolWarmupSize = min(size, 1000) // Cap at 1000
+            poolWarmupSize = min(size, 1000) // Cap at 1000 (uses common.go min)
         }
     }
 
@@ -124,22 +124,6 @@ func init() {
         arr := [24]byte{}
         xsalsaNoncePool.Put(arr)
     }
-}
-
-// min returns the minimum of two integers
-func min(a, b int) int {
-    if a < b {
-        return a
-    }
-    return b
-}
-
-// max returns the maximum of two integers
-func max(a, b int) int {
-    if a > b {
-        return a
-    }
-    return b
 }
 
 // getOrCreateAEAD caches AEAD instances per shared key (30-40% performance improvement)
