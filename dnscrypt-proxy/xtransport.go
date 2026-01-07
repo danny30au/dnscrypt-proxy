@@ -504,7 +504,8 @@ MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAwTzELMAkGA1UEBhMC
     xTransport.transport = transport
     xTransport.httpClient = &http.Client{Transport: xTransport.transport}
     if xTransport.http3 {
-        dial := func(ctx context.Context, addrStr string, tlsCfg *tls.Config, cfg *quic.Config) (quic.EarlyConnection, error) {
+        // Updated to return quic.Connection which satisfies modern quic-go DialEarly
+        dial := func(ctx context.Context, addrStr string, tlsCfg *tls.Config, cfg *quic.Config) (quic.Connection, error) {
             dlog.Debugf("Dialing for H3: [%v]", addrStr)
             host, port := ExtractHostAndPort(addrStr, stamps.DefaultPort)
 
@@ -638,11 +639,13 @@ func (xTransport *XTransport) resolveUsingResolver(
                         switch rrType {
                         case dns.TypeA:
                             if aRecord, ok := answer.(*dns.A); ok {
-                                ips = append(ips, aRecord.A)
+                                // Fix: Use AsSlice() if using codeberg.org/miekg/dns v2 which likely uses netip.Addr
+                                ips = append(ips, aRecord.A.AsSlice())
                             }
                         case dns.TypeAAAA:
                             if aaaaRecord, ok := answer.(*dns.AAAA); ok {
-                                ips = append(ips, aaaaRecord.AAAA)
+                                // Fix: Use AsSlice() if using codeberg.org/miekg/dns v2
+                                ips = append(ips, aaaaRecord.AAAA.AsSlice())
                             }
                         }
                         if answer.Header().TTL > rrTTL {
