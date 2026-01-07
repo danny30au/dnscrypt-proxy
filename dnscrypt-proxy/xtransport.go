@@ -157,10 +157,8 @@ func NewXTransport() *XTransport {
         KeepAlive: DefaultKeepAlive,
         DualStack: true,
     }
-    xTransport.dnsClient = &dns.Client{
-        Net:         "udp",
-        ReadTimeout: ResolverReadTimeout,
-    }
+    // dns.Client no longer has Net/ReadTimeout fields in v2 struct literal
+    xTransport.dnsClient = &dns.Client{}
 
     return xTransport
 }
@@ -606,6 +604,7 @@ func (xTransport *XTransport) resolveUsingResolver(
     var wg sync.WaitGroup
     var rrTTL uint32
 
+    // Use a fresh context for the exchange
     ctx, cancel := context.WithTimeout(context.Background(), ResolverReadTimeout)
     defer cancel()
 
@@ -627,7 +626,8 @@ func (xTransport *XTransport) resolveUsingResolver(
             msg.RecursionDesired = true
             msg.UDPSize = uint16(MaxDNSPacketSize)
 
-            if in, _, err := dnsClient.Exchange(msg, resolver); err == nil {
+            // Corrected Exchange signature: (ctx, msg, network, address)
+            if in, _, err := dnsClient.Exchange(ctx, msg, proto, resolver); err == nil {
                 if in.Truncated && proto == "udp" {
                     return
                 }
@@ -637,9 +637,13 @@ func (xTransport *XTransport) resolveUsingResolver(
                     if dns.RRToType(answer) == rrType {
                         switch rrType {
                         case dns.TypeA:
-                            ips = append(ips, answer.(*dns.A).A.To4())
+                            if aRecord, ok := answer.(*dns.A); ok {
+                                ips = append(ips, aRecord.A)
+                            }
                         case dns.TypeAAAA:
-                            ips = append(ips, answer.(*dns.AAAA).AAAA)
+                            if aaaaRecord, ok := answer.(*dns.AAAA); ok {
+                                ips = append(ips, aaaaRecord.AAAA)
+                            }
                         }
                         if answer.Header().TTL > rrTTL {
                             rrTTL = answer.Header().TTL
@@ -679,7 +683,6 @@ func (xTransport *XTransport) resolveUsingServers(
 
     resultCh := make(chan result, len(resolvers))
 
-    // Start index logic removed since we race all of them anyway
     for _, resolver := range resolvers {
         go func(r string) {
             // Apply jitter to start time to avoid synchronized spikes
@@ -968,7 +971,7 @@ func (xTransport *XTransport) Fetch(
     } else {
         dlog.Debugf("HTTP client error: [%v] - closing idle connections", err)
         if xTransport.transport != nil {
-            xTransport.transport.CloseIdleConnections()
+            xTransport.transport.CloseIdle connections()
         }
     }
 
