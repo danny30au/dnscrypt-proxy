@@ -43,27 +43,27 @@ func (h *CaptivePortalHandler) Stop() {
 }
 
 // Fixed: Reverted to original signature to satisfy interface/external calls
-func (ipsMap *CaptivePortalMap) GetEntry(msg *dns.Msg) (dns.RR, *CaptivePortalEntryIPs) {
+func (ipsMap *CaptivePortalMap) GetEntry(msg *dns.Msg) (dns.RR, CaptivePortalEntryIPs, bool) {
     if len(msg.Question) != 1 {
-        return nil, nil
+        return nil, nil, false
     }
     question := msg.Question[0]
     hdr := question.Header()
     name, err := NormalizeQName(hdr.Name)
     if err != nil {
-        return nil, nil
+        return nil, nil, false
     }
     ips, ok := (*ipsMap)[name]
     if !ok {
-        return nil, nil
+        return nil, nil, false
     }
     if hdr.Class != dns.ClassINET {
-        return nil, nil
+        return nil, nil, false
     }
-    return question, &ips
+    return question, ips, true
 }
 
-func HandleCaptivePortalQuery(msg *dns.Msg, question dns.RR, ips *CaptivePortalEntryIPs) *dns.Msg {
+func HandleCaptivePortalQuery(msg *dns.Msg, question dns.RR, ips CaptivePortalEntryIPs) *dns.Msg {
     respMsg := EmptyResponseFromMessage(msg)
     ttl := uint32(1)
     hdr := question.Header()
@@ -72,10 +72,13 @@ func HandleCaptivePortalQuery(msg *dns.Msg, question dns.RR, ips *CaptivePortalE
     isA := qtype == dns.TypeA
     isAAAA := qtype == dns.TypeAAAA
 
-    if isA || isAAAA {
-        // Optimization: Calculate required capacity first to avoid slice growth
+    if !isA && !isAAAA {
+        return nil
+    }
+
+    // Optimization: Calculate required capacity first to avoid slice growth
         count := 0
-        for _, ip := range *ips {
+        for _, ip := range ips {
             if (isA && ip.Is4()) || (isAAAA && ip.Is6()) {
                 count++
             }
@@ -83,7 +86,7 @@ func HandleCaptivePortalQuery(msg *dns.Msg, question dns.RR, ips *CaptivePortalE
 
         if count > 0 {
             respMsg.Answer = make([]dns.RR, 0, count)
-            for _, ip := range *ips {
+            for _, ip := range ips {
                 shouldInclude := (isA && ip.Is4()) || (isAAAA && ip.Is6())
                 if !shouldInclude {
                     continue
@@ -104,7 +107,6 @@ func HandleCaptivePortalQuery(msg *dns.Msg, question dns.RR, ips *CaptivePortalE
                 respMsg.Answer = append(respMsg.Answer, rr)
             }
         }
-    }
 
     qTypeStr, ok := dns.TypeToString[qtype]
     if !ok {
@@ -144,7 +146,7 @@ func addColdStartListener(
         buffer := make([]byte, MaxDNSPacketSize)
 
         for {
-            length, clientAddr, err := clientPc.ReadFrom(buffer)
+            length, clientAddr, err := clientPc.ReadFromUDP(buffer)
             if err != nil {
                 if errors.Is(err, net.ErrClosed) {
                     return
@@ -162,8 +164,8 @@ func addColdStartListener(
             }
 
             // Fixed: Use original calling convention
-            question, ips := ipsMap.GetEntry(msg)
-            if ips == nil {
+            question, ips, ok := ipsMap.GetEntry(msg)
+            if !ok {
                 continue
             }
 
@@ -175,7 +177,7 @@ func addColdStartListener(
             // Optimization: Use existing Pack() API which returns error only
             // and writes to respMsg.Data
             if err := respMsg.Pack(); err == nil {
-                clientPc.WriteTo(respMsg.Data, clientAddr)
+                clientPc.WriteToUDP(respMsg.Data, clientAddr)
             }
         }
     }()
@@ -196,6 +198,7 @@ func ColdStart(proxy *Proxy) (*CaptivePortalHandler, error) {
 
     ipsMap := make(CaptivePortalMap)
     scanner := bufio.NewScanner(file)
+    scanner.Buffer(make([]byte, 64*1024), 1024*1024)
     lineNo := 0
 
     for scanner.Scan() {
@@ -229,6 +232,12 @@ func ColdStart(proxy *Proxy) (*CaptivePortalHandler, error) {
         
         for _, ipStr := range ipParts {
             ipStr = strings.TrimSpace(ipStr)
+            if ipStr == "" {
+                return nil, fmt.Errorf(
+                    "Syntax error for a captive portal rule at line %d",
+                    lineNo,
+                )
+            }
             if ip, err := netip.ParseAddr(ipStr); err == nil {
                 ips = append(ips, ip)
             } else {
@@ -248,9 +257,13 @@ func ColdStart(proxy *Proxy) (*CaptivePortalHandler, error) {
     handler := &CaptivePortalHandler{}
 
     ok := false
+    var lastErr error
     for _, listenAddrStr := range proxy.listenAddresses {
         if err := addColdStartListener(&ipsMap, listenAddrStr, handler); err == nil {
             ok = true
+        } else {
+            lastErr = err
+            dlog.Warnf("ColdStart listener bind failed on %v: %v", listenAddrStr, err)
         }
     }
 
@@ -260,5 +273,5 @@ func ColdStart(proxy *Proxy) (*CaptivePortalHandler, error) {
     }
 
     handler.Stop()
-    return handler, err
+    return handler, lastErr
 }
