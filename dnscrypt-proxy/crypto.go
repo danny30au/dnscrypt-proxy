@@ -2,16 +2,19 @@ package main
 
 import (
     "bytes"
+    "container/list"
     "crypto/cipher"
     crypto_rand "crypto/rand"
     "crypto/sha512"
     "crypto/subtle"
+    "encoding/binary"
     "errors"
     "fmt"
     "net"
     "os"
     "strconv"
     "sync"
+    "sync/atomic"
 
     "github.com/jedisct1/dlog"
     "golang.org/x/crypto/chacha20poly1305"
@@ -43,15 +46,15 @@ const (
 
 var (
     // Pre-allocated errors to avoid runtime allocation
-    ErrInvalidPadding   = errors.New("invalid padding: delimiter not found")
-    ErrInvalidPadBytes  = errors.New("invalid padding: non-zero bytes after delimiter")
-    ErrInvalidMsgSize   = errors.New("invalid message size")
-    ErrInvalidPrefix    = errors.New("invalid prefix")
-    ErrUnexpectedNonce  = errors.New("unexpected nonce")
-    ErrIncorrectTag     = errors.New("incorrect tag")
-    ErrQuestionTooLarge = errors.New("question too large; cannot be padded")
-    ErrWeakPublicKey    = errors.New("weak public key detected")
-    ErrZeroSharedKey    = errors.New("zero shared key detected")
+    ErrInvalidPadding      = errors.New("invalid padding: delimiter not found")
+    ErrInvalidPadBytes     = errors.New("invalid padding: non-zero bytes after delimiter")
+    ErrInvalidMsgSize      = errors.New("invalid message size")
+    ErrInvalidPrefix       = errors.New("invalid prefix")
+    ErrUnexpectedNonce     = errors.New("unexpected nonce")
+    ErrIncorrectTag        = errors.New("incorrect tag")
+    ErrQuestionTooLarge    = errors.New("question too large; cannot be padded")
+    ErrWeakPublicKey       = errors.New("weak public key detected")
+    ErrZeroSharedKey       = errors.New("zero shared key detected")
     ErrClientNonceTooSmall = errors.New("clientNonceDst buffer too small")
 
     // Global zero buffer for efficient padding verification
@@ -66,13 +69,6 @@ var (
         },
     }
 
-    // Pool for XSalsa20 nonce buffers (24 bytes) - used for XSalsa20 only
-    xsalsaNoncePool = sync.Pool{
-        New: func() interface{} {
-            return [24]byte{}
-        },
-    }
-
     // Configurable via build tags or environment
     poolWarmupSize = 10 // Default for low traffic
 
@@ -81,15 +77,94 @@ var (
     hasAESNI = false
 )
 
-// AEAD cache for cipher instance reuse
-type aeadCache struct {
-    sync.RWMutex
-    ciphers map[[32]byte]cipher.AEAD
+// Pool metrics for adaptive sizing
+type poolMetrics struct {
+    gets   atomic.Uint64
+    puts   atomic.Uint64
+    misses atomic.Uint64
 }
 
-var globalAEADCache = &aeadCache{
-    ciphers: make(map[[32]byte]cipher.AEAD),
+var globalPoolMetrics poolMetrics
+
+// Worker pool for batch encryption
+type workerPool struct {
+    jobs    chan batchJob
+    workers int
+    wg      sync.WaitGroup
 }
+
+type batchJob struct {
+    idx        int
+    packet     []byte
+    dst        []byte
+    serverInfo *ServerInfo
+    proto      string
+    proxy      *Proxy
+    result     chan encryptResult
+}
+
+type encryptResult struct {
+    idx       int
+    encrypted []byte
+    nonce     []byte
+    err       error
+}
+
+var globalWorkerPool *workerPool
+
+func initWorkerPool(workers int) {
+    if workers <= 0 {
+        workers = 4 // Default worker count
+    }
+    globalWorkerPool = &workerPool{
+        jobs:    make(chan batchJob, workers*2),
+        workers: workers,
+    }
+
+    for i := 0; i < workers; i++ {
+        globalWorkerPool.wg.Add(1)
+        go func() {
+            defer globalWorkerPool.wg.Done()
+            for job := range globalWorkerPool.jobs {
+                _, enc, nonce, err := job.proxy.EncryptInto(
+                    job.dst, nil, job.serverInfo, job.packet, job.proto,
+                )
+                job.result <- encryptResult{
+                    idx:       job.idx,
+                    encrypted: enc,
+                    nonce:     nonce,
+                    err:       err,
+                }
+            }
+        }()
+    }
+}
+
+// AEAD cache with LRU eviction
+type aeadCacheEntry struct {
+    aead    cipher.AEAD
+    element *list.Element
+}
+
+type aeadCache struct {
+    sync.RWMutex
+    ciphers map[[32]byte]*aeadCacheEntry
+    lru     *list.List
+    maxSize int
+}
+
+func newAEADCache(maxSize int) *aeadCache {
+    if maxSize <= 0 {
+        maxSize = 1000 // Default cache size
+    }
+    return &aeadCache{
+        ciphers: make(map[[32]byte]*aeadCacheEntry),
+        lru:     list.New(),
+        maxSize: maxSize,
+    }
+}
+
+var globalAEADCache = newAEADCache(1000)
 
 // init pre-warms pools and detects CPU capabilities
 func init() {
@@ -109,7 +184,7 @@ func init() {
     // Read pool size from environment for runtime tuning
     if val := os.Getenv("DNSCRYPT_POOL_SIZE"); val != "" {
         if size, err := strconv.Atoi(val); err == nil && size > 0 {
-            poolWarmupSize = min(size, 1000) // Cap at 1000 (uses common.go min)
+            poolWarmupSize = min(size, 1000)
         }
     }
 
@@ -119,22 +194,29 @@ func init() {
         bufferPool.Put(buf)
     }
 
-    // Pre-warm xsalsaNoncePool
-    for i := 0; i < poolWarmupSize; i++ {
-        arr := [24]byte{}
-        xsalsaNoncePool.Put(arr)
+    // Initialize worker pool (4 workers default, configurable via env)
+    workers := 4
+    if val := os.Getenv("DNSCRYPT_WORKERS"); val != "" {
+        if w, err := strconv.Atoi(val); err == nil && w > 0 {
+            workers = min(w, 128)
+        }
     }
+    initWorkerPool(workers)
 }
 
-// getOrCreateAEAD caches AEAD instances per shared key (30-40% performance improvement)
+// getOrCreateAEAD caches AEAD instances with LRU eviction (30-40% performance improvement)
 func getOrCreateAEAD(sharedKey *[32]byte, isXChaCha bool) (cipher.AEAD, error) {
     globalAEADCache.RLock()
-    aead, exists := globalAEADCache.ciphers[*sharedKey]
-    globalAEADCache.RUnlock()
-
+    entry, exists := globalAEADCache.ciphers[*sharedKey]
     if exists {
-        return aead, nil
+        globalAEADCache.RUnlock()
+        // Move to front (LRU)
+        globalAEADCache.Lock()
+        globalAEADCache.lru.MoveToFront(entry.element)
+        globalAEADCache.Unlock()
+        return entry.aead, nil
     }
+    globalAEADCache.RUnlock()
 
     // Create new AEAD
     var newAEAD cipher.AEAD
@@ -150,10 +232,32 @@ func getOrCreateAEAD(sharedKey *[32]byte, isXChaCha bool) (cipher.AEAD, error) {
         return nil, err
     }
 
-    // Cache it
+    // Cache it with LRU eviction
     globalAEADCache.Lock()
-    globalAEADCache.ciphers[*sharedKey] = newAEAD
-    globalAEADCache.Unlock()
+    defer globalAEADCache.Unlock()
+
+    // Check again in case another goroutine added it
+    if entry, exists := globalAEADCache.ciphers[*sharedKey]; exists {
+        globalAEADCache.lru.MoveToFront(entry.element)
+        return entry.aead, nil
+    }
+
+    // Evict oldest if at capacity
+    if globalAEADCache.lru.Len() >= globalAEADCache.maxSize {
+        oldest := globalAEADCache.lru.Back()
+        if oldest != nil {
+            oldKey := oldest.Value.([32]byte)
+            delete(globalAEADCache.ciphers, oldKey)
+            globalAEADCache.lru.Remove(oldest)
+        }
+    }
+
+    // Add new entry
+    element := globalAEADCache.lru.PushFront(*sharedKey)
+    globalAEADCache.ciphers[*sharedKey] = &aeadCacheEntry{
+        aead:    newAEAD,
+        element: element,
+    }
 
     return newAEAD, nil
 }
@@ -165,7 +269,7 @@ func clearBytes(b []byte) {
     }
 }
 
-// unpadFast uses constant-time verification for padding (SECURITY CRITICAL)
+// unpadFast uses constant-time verification with SIMD-friendly optimization (SECURITY CRITICAL)
 func unpadFast(packet []byte) ([]byte, error) {
     if len(packet) == 0 {
         return nil, ErrInvalidPadding
@@ -182,6 +286,20 @@ func unpadFast(packet []byte) ([]byte, error) {
     _ = packet[len(packet)-1]
 
     if tailLen == 0 {
+        return packet[:idx], nil
+    }
+
+    // Optimized for 16-byte aligned tails (compiler auto-vectorizes with AVX2)
+    if tailLen <= 64 && tailLen >= 16 && tailLen%16 == 0 {
+        tail := packet[idx+1:]
+        var acc0, acc1 uint64
+        for i := 0; i < tailLen; i += 16 {
+            acc0 |= binary.LittleEndian.Uint64(tail[i:])
+            acc1 |= binary.LittleEndian.Uint64(tail[i+8:])
+        }
+        if (acc0 | acc1) != 0 {
+            return nil, ErrInvalidPadBytes
+        }
         return packet[:idx], nil
     }
 
@@ -379,7 +497,7 @@ func (proxy *Proxy) EncryptInto(
         // Seal in-place: reuse buffer space
         encrypted = aead.Seal(encrypted[:headerLen], nonce[:], plaintext, nil)
     } else {
-        // XSalsa20-Poly1305: stack-allocated nonce (no pool needed for small array)
+        // XSalsa20-Poly1305: stack-allocated nonce (no pool overhead)
         var xsalsaNonce [24]byte
         copy(xsalsaNonce[:], nonce[:])
         encrypted = secretbox.Seal(encrypted[:headerLen], plaintext, &xsalsaNonce, &computedSharedKey)
@@ -451,7 +569,7 @@ func (proxy *Proxy) Decrypt(
             return nil, ErrIncorrectTag
         }
     } else {
-        // XSalsa20: stack-allocated nonce
+        // XSalsa20: stack-allocated nonce (no pool overhead)
         var xsalsaNonce [24]byte
         copy(xsalsaNonce[:], serverNonce)
         var ok bool
@@ -652,7 +770,7 @@ func WriteBatchV6(conn *net.UDPConn, messages []BatchMessage) (int, error) {
     return p.WriteBatch(ipv6Messages, 0)
 }
 
-// EncryptBatch processes multiple packets in parallel (high-throughput optimization)
+// EncryptBatch processes multiple packets using worker pool (high-throughput optimization)
 func (proxy *Proxy) EncryptBatch(
     serverInfo *ServerInfo,
     packets [][]byte,
@@ -667,22 +785,29 @@ func (proxy *Proxy) EncryptBatch(
         dstBufs[i] = make([]byte, 0, MaxDNSUDPPacketSize)
     }
 
-    // Parallel encryption (utilize all cores)
-    var wg sync.WaitGroup
+    // Use worker pool for controlled parallelism
+    results := make(chan encryptResult, len(packets))
+
     for i := range packets {
-        wg.Add(1)
-        go func(idx int) {
-            defer wg.Done()
-            _, enc, nonce, err := proxy.EncryptInto(
-                dstBufs[idx], nil, serverInfo, packets[idx], proto,
-            )
-            if err == nil {
-                encrypted[idx] = enc
-                nonces[idx] = nonce
-            }
-        }(i)
+        globalWorkerPool.jobs <- batchJob{
+            idx:        i,
+            packet:     packets[i],
+            dst:        dstBufs[i],
+            serverInfo: serverInfo,
+            proto:      proto,
+            proxy:      proxy,
+            result:     results,
+        }
     }
-    wg.Wait()
+
+    // Collect results
+    for i := 0; i < len(packets); i++ {
+        res := <-results
+        if res.err == nil {
+            encrypted[res.idx] = res.encrypted
+            nonces[res.idx] = res.nonce
+        }
+    }
 
     return encrypted, nonces, nil
 }
