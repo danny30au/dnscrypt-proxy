@@ -1,44 +1,47 @@
 package main
 
 import (
-"codeberg.org/miekg/dns"
-"github.com/jedisct1/dlog"
+    "codeberg.org/miekg/dns"
+    "github.com/jedisct1/dlog"
 )
 
 type PluginCaptivePortal struct {
-captivePortalMap *CaptivePortalMap
+    captivePortalMap *CaptivePortalMap
 }
 
 func (plugin *PluginCaptivePortal) Name() string {
-return "captive portal handlers"
+    return "captive portal handlers"
 }
 
 func (plugin *PluginCaptivePortal) Description() string {
-return "Handle test queries operating systems make to detect Wi-Fi captive portal"
+    return "Handle test queries operating systems make to detect Wi-Fi captive portal"
 }
 
 func (plugin *PluginCaptivePortal) Init(proxy *Proxy) error {
-plugin.captivePortalMap = proxy.captivePortalMap
-dlog.Notice("Captive portals handler enabled")
-return nil
+    plugin.captivePortalMap = proxy.captivePortalMap
+    dlog.Notice("Captive portals handler enabled")
+    return nil
 }
 
 func (plugin *PluginCaptivePortal) Drop() error {
-return nil
+    return nil
 }
 
 func (plugin *PluginCaptivePortal) Reload() error {
-return nil
+    return nil
 }
 
 func (plugin *PluginCaptivePortal) Eval(pluginsState *PluginsState, msg *dns.Msg) error {
-question, ips := plugin.captivePortalMap.GetEntry(msg)
-if ips == nil {
-return nil
-}
-if synth := HandleCaptivePortalQuery(msg, question, ips); synth != nil {
-pluginsState.synthResponse = synth
-pluginsState.action = PluginsActionSynth
-}
-return nil
+    if plugin.captivePortalMap == nil {
+        return nil
+    }
+    question, ips, ok := plugin.captivePortalMap.GetEntry(msg)
+    if !ok {
+        return nil
+    }
+    if synth := HandleCaptivePortalQuery(msg, question, ips); synth != nil {
+        pluginsState.synthResponse = synth
+        pluginsState.action = PluginsActionSynth
+    }
+    return nil
 }
