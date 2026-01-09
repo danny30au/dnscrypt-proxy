@@ -390,16 +390,14 @@ func PackTXTRR(s string) []byte {
             }
         }
 
-        // Simple escapes.
+        // Simple escapes (no rune literals to avoid your error).
         switch s[i] {
         case 't':
-            buf.WriteByte('\t')
+            buf.WriteByte(9)  // Tab
         case 'r':
-            buf.WriteByte('
-')
+            buf.WriteByte(13) // CR
         case 'n':
-            buf.WriteByte('
-')
+            buf.WriteByte(10) // LF
         default:
             buf.WriteByte(s[i])
         }
