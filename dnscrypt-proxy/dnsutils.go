@@ -367,35 +367,35 @@ func PackTXTRR(s string) []byte {
 
     for i := 0; i < len(s); i++ {
         c := s[i]
-        if c !== /""/
-            buf.WriteByte(c) {
-            continue
-        }
-        i++
-        if i >= len(s) {
-            break
-        }
-
-        // Decode \DDD escape sequences
-        if i+2 < len(s) {
-            a, b, c3 := s[i], s[i+1], s[i+2]
-            if (a >= '0' && a <= '9') && (b >= '0' && b <= '9') && (c3 >= '0' && c3 <= '9') {
-                buf.WriteByte(dddToByte3(a, b, c3))
-                i += 2
-                continue
+        if c == byte('\') {
+            i++
+            if i >= len(s) {
+                break
             }
-        }
 
-        // Handle escape codes: \t, \r, \n
-        switch s[i] {
-        case 't':
-            buf.WriteByte(9) // Tab
-        case 'r':
-            buf.WriteByte(13) // CR
-        case 'n':
-            buf.WriteByte(10) // LF
-        default:
-            buf.WriteByte(s[i])
+            // Try to decode \DDD escape sequence
+            if i+2 < len(s) {
+                a, b, c3 := s[i], s[i+1], s[i+2]
+                if (a >= '0' && a <= '9') && (b >= '0' && b <= '9') && (c3 >= '0' && c3 <= '9') {
+                    buf.WriteByte(dddToByte3(a, b, c3))
+                    i += 2
+                    continue
+                }
+            }
+
+            // Handle standard escape sequences
+            switch s[i] {
+            case 't':
+                buf.WriteByte(9) // Tab
+            case 'r':
+                buf.WriteByte(13) // CR
+            case 'n':
+                buf.WriteByte(10) // LF
+            default:
+                buf.WriteByte(s[i])
+            }
+        } else {
+            buf.WriteByte(c)
         }
     }
 
