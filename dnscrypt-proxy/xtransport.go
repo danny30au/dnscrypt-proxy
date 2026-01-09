@@ -473,11 +473,9 @@ MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAwTzELMAkGA1UEBhMC
             dlog.Debugf("Dialing for H3: [%v]", addrStr)
             host, port := ExtractHostAndPort(addrStr, stamps.DefaultPort)
 
-            // Clone TLS config to avoid concurrent mutations
             tc := tlsCfg.Clone()
             tc.ServerName = host
 
-            // Clone or create QUIC config safely
             qc := &quic.Config{}
             if cfg != nil {
                 *qc = *cfg
@@ -545,7 +543,6 @@ MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAwTzELMAkGA1UEBhMC
                     continue
                 }
 
-                // Use cloned configs
                 conn, err := tr.DialEarly(ctx, udpAddr, tc, qc)
                 if err != nil {
                     lastErr = err
@@ -677,7 +674,14 @@ func (xTransport *XTransport) resolveUsingServers(
     return nil, 0, lastErr
 }
 
-func (xTransport *XTransport) resolve(ctx context.Context, host string, returnIPv4, returnIPv6 bool) (ips []net.IP, ttl time.Duration, err error) {
+// Backward-compatible wrapper for existing call sites (config_loader.go, plugin_cloak.go)
+func (xTransport *XTransport) resolve(host string, returnIPv4, returnIPv6 bool) (ips []net.IP, ttl time.Duration, err error) {
+    ctx, cancel := context.WithTimeout(context.Background(), xTransport.timeout)
+    defer cancel()
+    return xTransport.resolveWithContext(ctx, host, returnIPv4, returnIPv6)
+}
+
+func (xTransport *XTransport) resolveWithContext(ctx context.Context, host string, returnIPv4, returnIPv6 bool) (ips []net.IP, ttl time.Duration, err error) {
     protos := protoUDPFirst
     if xTransport.mainProto == "tcp" {
         protos = protoTCPFirst
@@ -752,7 +756,7 @@ func (xTransport *XTransport) resolveAndUpdateCacheBlocking(host string, cachedI
     ctx, cancel := context.WithTimeout(context.Background(), xTransport.timeout)
     defer cancel()
 
-    ips, ttl, err := xTransport.resolve(ctx, host, xTransport.useIPv4, xTransport.useIPv6)
+    ips, ttl, err := xTransport.resolveWithContext(ctx, host, xTransport.useIPv4, xTransport.useIPv6)
     if ttl < MinResolverIPTTL {
         ttl = MinResolverIPTTL
     }
