@@ -268,13 +268,12 @@ func (plugin *PluginCloak) Eval(pluginsState *PluginsState, msg *dns.Msg) error 
 		plugin.RUnlock()
 		returnIPv4 := qtype == dns.TypeA
 		returnIPv6 := qtype == dns.TypeAAAA
-		foundIPs, _, err := pluginsState.xTransport.resolveUsingServers(
-			pluginsState.xTransport.mainProto,
-			target,
-			pluginsState.xTransport.internalResolvers,
-			returnIPv4,
-			returnIPv6,
-		)
+        foundIPs, _, err := pluginsState.xTransport.resolveUsingServersCompat(
+        pluginsState.xTransport.mainProto,
+        target,
+        pluginsState.xTransport.internalResolvers,
+        returnIPv4,
+        returnIPv6,
 		if err != nil {
 			synth.Rcode = dns.RcodeServerFailure
 			pluginsState.synthResponse = synth
