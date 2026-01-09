@@ -32,6 +32,7 @@ import (
     "golang.org/x/sys/cpu"
 )
 
+
 var (
     protoTCPFirst = []string{"tcp", "udp"}
     protoUDPFirst = []string{"udp", "tcp"}
@@ -50,7 +51,6 @@ const (
     MinResolverIPTTL            = 4 * time.Hour
     ResolverIPTTLMaxJitter      = 15 * time.Minute
     ExpiredCachedIPGraceTTL     = 15 * time.Minute
-    AltSvcCacheTTL              = 6 * time.Hour
     resolverRetryCount          = 3
     resolverRetryInitialBackoff = 150 * time.Millisecond
     resolverRetryMaxBackoff     = 1 * time.Second
@@ -67,20 +67,16 @@ type CachedIPs struct {
     cache map[string]*CachedIPItem
 }
 
-type AltSvcEntry struct {
-    port      uint16
-    timestamp time.Time
-}
-
 type AltSupport struct {
     sync.RWMutex
-    cache map[string]*AltSvcEntry
+    cache map[string]uint16
 }
 
 type XTransport struct {
     transport   *http.Transport
     h3Transport *http3.Transport
 
+    // Reused clients (avoid per-request allocations)
     httpClient *http.Client
     h3Client   *http.Client
 
@@ -105,9 +101,11 @@ type XTransport struct {
     tlsClientCreds           DOHClientCreds
     keyLogWriter             io.Writer
 
+    // Hot-path pools / coalescing
     gzipPool     sync.Pool
     resolveGroup singleflight.Group
 
+    // QUIC UDP socket reuse (min churn, lower tail latency)
     quicMu   sync.Mutex
     quicUDP4 *net.UDPConn
     quicUDP6 *net.UDPConn
@@ -121,7 +119,7 @@ func NewXTransport() *XTransport {
     }
     xTransport := &XTransport{
         cachedIPs:                CachedIPs{cache: make(map[string]*CachedIPItem)},
-        altSupport:               AltSupport{cache: make(map[string]*AltSvcEntry)},
+        altSupport:               AltSupport{cache: make(map[string]uint16)},
         keepAlive:                DefaultKeepAlive,
         timeout:                  DefaultTimeout,
         bootstrapResolvers:       []string{DefaultBootstrapResolver},
@@ -134,20 +132,18 @@ func NewXTransport() *XTransport {
         tlsPreferRSA:             false,
         keyLogWriter:             nil,
     }
-
+    
     xTransport.gzipPool.New = func() any { return new(gzip.Reader) }
 
     return xTransport
 }
 
 func ParseIP(ipStr string) net.IP {
-    ipStr = strings.TrimRight(strings.TrimLeft(ipStr, "["), "]")
-    if idx := strings.IndexByte(ipStr, '%'); idx != -1 {
-        ipStr = ipStr[:idx]
-    }
-    return net.ParseIP(ipStr)
+    return net.ParseIP(strings.TrimRight(strings.TrimLeft(ipStr, "["), "]"))
 }
 
+// If ttl < 0, never expire
+// Otherwise, ttl is set to max(ttl, MinResolverIPTTL)
 func uniqueNormalizedIPs(ips []net.IP) []net.IP {
     if len(ips) == 0 {
         return nil
@@ -203,6 +199,7 @@ func (xTransport *XTransport) saveCachedIP(host string, ip net.IP, ttl time.Dura
     xTransport.saveCachedIPs(host, []net.IP{ip}, ttl)
 }
 
+// Mark an entry as being updated
 func (xTransport *XTransport) markUpdatingCachedIP(host string) {
     xTransport.cachedIPs.Lock()
     item, ok := xTransport.cachedIPs.cache[host]
@@ -225,6 +222,7 @@ func (xTransport *XTransport) loadCachedIPs(host string) (ips []net.IP, expired 
         dlog.Debugf("[%s] IP address not found in the cache", host)
         return nil, false, false
     }
+    // Return cached slices directly (treated as immutable) to avoid allocations on the dial hot-path.
     ips = item.ips
     expiration := item.expiration
     updatingUntil := item.updatingUntil
@@ -259,7 +257,7 @@ func (xTransport *XTransport) getQUICTransport(network string) (*quic.Transport,
     xTransport.quicMu.Lock()
     defer xTransport.quicMu.Unlock()
 
-    const sockBuf = 4 << 20
+    const sockBuf = 4 << 20 // 4 MiB
     switch network {
     case "udp4":
         if xTransport.quicTr4 != nil {
@@ -269,12 +267,8 @@ func (xTransport *XTransport) getQUICTransport(network string) (*quic.Transport,
         if err != nil {
             return nil, err
         }
-        if err := c.SetReadBuffer(sockBuf); err != nil {
-            dlog.Warnf("Failed to set read buffer on udp4 socket: %v", err)
-        }
-        if err := c.SetWriteBuffer(sockBuf); err != nil {
-            dlog.Warnf("Failed to set write buffer on udp4 socket: %v", err)
-        }
+        _ = c.SetReadBuffer(sockBuf)
+        _ = c.SetWriteBuffer(sockBuf)
         xTransport.quicUDP4 = c
         xTransport.quicTr4 = &quic.Transport{Conn: c}
         return xTransport.quicTr4, nil
@@ -286,12 +280,8 @@ func (xTransport *XTransport) getQUICTransport(network string) (*quic.Transport,
         if err != nil {
             return nil, err
         }
-        if err := c.SetReadBuffer(sockBuf); err != nil {
-            dlog.Warnf("Failed to set read buffer on udp6 socket: %v", err)
-        }
-        if err := c.SetWriteBuffer(sockBuf); err != nil {
-            dlog.Warnf("Failed to set write buffer on udp6 socket: %v", err)
-        }
+        _ = c.SetReadBuffer(sockBuf)
+        _ = c.SetWriteBuffer(sockBuf)
         xTransport.quicUDP6 = c
         xTransport.quicTr6 = &quic.Transport{Conn: c}
         return xTransport.quicTr6, nil
@@ -328,7 +318,6 @@ func (xTransport *XTransport) rebuildTransport() {
         xTransport.quicUDP6 = nil
     }
     xTransport.quicMu.Unlock()
-
     timeout := xTransport.timeout
     transport := &http.Transport{
         DisableKeepAlives:      false,
@@ -412,9 +401,10 @@ func (xTransport *XTransport) rebuildTransport() {
     }
 
     if certPool != nil {
+        // Some operating systems don't include Let's Encrypt ISRG Root X1 certificate yet
         letsEncryptX1Cert := []byte(`-----BEGIN CERTIFICATE-----
-MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAwTzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2VhcmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4WhcNMzUwNjA0MTEwNDM4WjBPMQswCQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJuZXQgU2VjdXJpdHkgUmVzZWFyY2ggR3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBYMTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAK3oJHP0FDfzm54rVygch77ct984kIxuPOZXoHj3dcKi/vVqbvYATyjb3miGbESTtrFj/RQSa78f0uoxmyF+0TM8ukj13Xnfs7j/EvEhmkvBioZxaUpmZmyPfjxwv60pIgbz5MDmgK7iS4+3mX6UA5/TR5d8mUgjU+g4rk8Kb4Mu0UlXjIB0ttov0DiNewNwIRt18jA8+o+u3dpjq+sWT8KOEUt+zwvo/7V3LvSye0rgTBIlDHCNAymg4VMk7BPZ7hm/ELNKjD+Jo2FR3qyHB5T0Y3HsLuJvW5iB4YlcNHlsdu87kGJ55tukmi8mxdAQ4Q7e2RCOFvu396j3x+UCB5iPNgiV5+I3lg02dZ77DnKxHZu8A/lJBdiB3QW0KtZB6awBdpUKD9jf1b0SHzUvKBds0pjBqAlkd25HN7rOrFleaJ1/ctaJxQZBKT5ZPt0m9STJEadao0xAH0ahmbWnOlFuhjuefXKnEgV4We0+UXgVCwOPjdAvBbI+e0ocS3MFEvzG6uBQE3xDk3SzynTnjh8BCNAw1FtxNrQHusEwMFxIt4I7mKZ9YIqioymCzLq9gwQbooMDQaHWBfEbwrbwqHyGO0aoSCqI3Haadr8faqU9GY/rOPNk3sgrDQoo//fb4hVC1CLQJ13hef4Y53CIrU7m2Ys6xt0nUW7/vGT1M0NPAgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQWBBR5tFnme7bl5AFzgAiIyBpY9umbbjANBgkqhkiG9w0BAQsFAAOCAgEAVR9YqbyyqFDQDLHYGmkgJykIrGF1XIpu+ILlaS/V9lZLubhzEFnTIZd+50xx+7LSYK05qAvqFyFWhfFQDlnrzuBZ6brJFe+GnY+EgPbk6ZGQ3BebYhtF8GaV0nxvwuo77x/Py9auJ/GpsMiu/X1+mvoiBOv/2X/qkSsisRcOj/KKNFtY2PwByVS5uCbMiogziUwthDyC3+6WVwW6LLv3xLfHTjuCvjHIInNzktHCgKQ5ORAzI4JMPJ+GslWYHb4phowim57iaztXOoJwTdwJx4nLCgdNbOhdjsnvzqvHu7UrTkXWStAmzOVyyghqpZXjFaH3pO3JLF+l+/+sKAIuvtd7u+Nxe5AW0wdeRlN8NwdCjNPElpzVmbUq4JUagEiuTDkHzsxHpFKVK7q4+63SM1N95R1NbdWhscdCb+ZAJzVcoyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPAmRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57demyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
------END CERTIFICATE-----`)
+ MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAwTzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2VhcmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4WhcNMzUwNjA0MTEwNDM4WjBPMQswCQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJuZXQgU2VjdXJpdHkgUmVzZWFyY2ggR3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBYMTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAK3oJHP0FDfzm54rVygch77ct984kIxuPOZXoHj3dcKi/vVqbvYATyjb3miGbESTtrFj/RQSa78f0uoxmyF+0TM8ukj13Xnfs7j/EvEhmkvBioZxaUpmZmyPfjxwv60pIgbz5MDmgK7iS4+3mX6UA5/TR5d8mUgjU+g4rk8Kb4Mu0UlXjIB0ttov0DiNewNwIRt18jA8+o+u3dpjq+sWT8KOEUt+zwvo/7V3LvSye0rgTBIlDHCNAymg4VMk7BPZ7hm/ELNKjD+Jo2FR3qyHB5T0Y3HsLuJvW5iB4YlcNHlsdu87kGJ55tukmi8mxdAQ4Q7e2RCOFvu396j3x+UCB5iPNgiV5+I3lg02dZ77DnKxHZu8A/lJBdiB3QW0KtZB6awBdpUKD9jf1b0SHzUvKBds0pjBqAlkd25HN7rOrFleaJ1/ctaJxQZBKT5ZPt0m9STJEadao0xAH0ahmbWnOlFuhjuefXKnEgV4We0+UXgVCwOPjdAvBbI+e0ocS3MFEvzG6uBQE3xDk3SzynTnjh8BCNAw1FtxNrQHusEwMFxIt4I7mKZ9YIqioymCzLq9gwQbooMDQaHWBfEbwrbwqHyGO0aoSCqI3Haadr8faqU9GY/rOPNk3sgrDQoo//fb4hVC1CLQJ13hef4Y53CIrU7m2Ys6xt0nUW7/vGT1M0NPAgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQWBBR5tFnme7bl5AFzgAiIyBpY9umbbjANBgkqhkiG9w0BAQsFAAOCAgEAVR9YqbyyqFDQDLHYGmkgJykIrGF1XIpu+ILlaS/V9lZLubhzEFnTIZd+50xx+7LSYK05qAvqFyFWhfFQDlnrzuBZ6brJFe+GnY+EgPbk6ZGQ3BebYhtF8GaV0nxvwuo77x/Py9auJ/GpsMiu/X1+mvoiBOv/2X/qkSsisRcOj/KKNFtY2PwByVS5uCbMiogziUwthDyC3+6WVwW6LLv3xLfHTjuCvjHIInNzktHCgKQ5ORAzI4JMPJ+GslWYHb4phowim57iaztXOoJwTdwJx4nLCgdNbOhdjsnvzqvHu7UrTkXWStAmzOVyyghqpZXjFaH3pO3JLF+l+/+sKAIuvtd7u+Nxe5AW0wdeRlN8NwdCjNPElpzVmbUq4JUagEiuTDkHzsxHpFKVK7q4+63SM1N95R1NbdWhscdCb+ZAJzVcoyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPAmRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57demyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
+ -----END CERTIFICATE-----`)
         certPool.AppendCertsFromPEM(letsEncryptX1Cert)
         tlsClientConfig.RootCAs = certPool
     }
@@ -472,18 +462,6 @@ MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAwTzELMAkGA1UEBhMC
         dial := func(ctx context.Context, addrStr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
             dlog.Debugf("Dialing for H3: [%v]", addrStr)
             host, port := ExtractHostAndPort(addrStr, stamps.DefaultPort)
-
-            tc := tlsCfg.Clone()
-            tc.ServerName = host
-
-            qc := &quic.Config{}
-            if cfg != nil {
-                *qc = *cfg
-            }
-            if qc.KeepAlivePeriod == 0 {
-                qc.KeepAlivePeriod = 15 * time.Second
-            }
-
             type udpTarget struct {
                 addr    string
                 network string
@@ -542,9 +520,13 @@ MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAwTzELMAkGA1UEBhMC
                     }
                     continue
                 }
-
-                conn, err := tr.DialEarly(ctx, udpAddr, tc, qc)
+                tlsCfg.ServerName = host
+                if cfg != nil && cfg.KeepAlivePeriod == 0 {
+                    cfg.KeepAlivePeriod = 15 * time.Second
+                }
+                conn, err := tr.DialEarly(ctx, udpAddr, tlsCfg, cfg)
                 if err != nil {
+                    /* transport-owned socket */
                     lastErr = err
                     if idx < len(targets)-1 {
                         dlog.Debugf("H3: dialing [%s] via %s failed: %v", target.addr, target.network, err)
@@ -580,7 +562,6 @@ func (xTransport *XTransport) resolveUsingSystem(host string, returnIPv4, return
 }
 
 func (xTransport *XTransport) resolveUsingResolver(
-    ctx context.Context,
     proto, host string,
     resolver string,
     returnIPv4, returnIPv6 bool,
@@ -596,7 +577,8 @@ func (xTransport *XTransport) resolveUsingResolver(
         queryType = append(queryType, dns.TypeAAAA)
     }
     var rrTTL uint32
-
+    ctx, cancel := context.WithTimeout(context.Background(), ResolverReadTimeout)
+    defer cancel()
     for _, rrType := range queryType {
         msg := dns.NewMsg(fqdn(host), rrType)
         if msg == nil {
@@ -626,8 +608,7 @@ func (xTransport *XTransport) resolveUsingResolver(
     return ips, ttl, err
 }
 
-func (xTransport *XTransport) resolveUsingServersCompat(
-    ctx context.Context,
+func (xTransport *XTransport) resolveUsingServers(
     proto, host string,
     resolvers []string,
     returnIPv4, returnIPv6 bool,
@@ -639,7 +620,7 @@ func (xTransport *XTransport) resolveUsingServersCompat(
     for i, resolver := range resolvers {
         delay := resolverRetryInitialBackoff
         for attempt := 1; attempt <= resolverRetryCount; attempt++ {
-            ips, ttl, err = xTransport.resolveUsingResolver(ctx, proto, host, resolver, returnIPv4, returnIPv6)
+            ips, ttl, err = xTransport.resolveUsingResolver(proto, host, resolver, returnIPv4, returnIPv6)
             if err == nil && len(ips) > 0 {
                 if i > 0 {
                     dlog.Infof("Resolution succeeded with resolver %s[%s]", proto, resolver)
@@ -653,11 +634,7 @@ func (xTransport *XTransport) resolveUsingServersCompat(
             lastErr = err
             dlog.Debugf("Resolver attempt %d failed for [%s] using [%s] (%s): %v", attempt, host, resolver, proto, err)
             if attempt < resolverRetryCount {
-                select {
-                case <-time.After(delay):
-                case <-ctx.Done():
-                    return nil, 0, ctx.Err()
-                }
+                time.Sleep(delay)
                 if delay < resolverRetryMaxBackoff {
                     delay *= 2
                     if delay > resolverRetryMaxBackoff {
@@ -674,14 +651,7 @@ func (xTransport *XTransport) resolveUsingServersCompat(
     return nil, 0, lastErr
 }
 
-// Backward-compatible wrapper for existing call sites (config_loader.go, plugin_cloak.go)
 func (xTransport *XTransport) resolve(host string, returnIPv4, returnIPv6 bool) (ips []net.IP, ttl time.Duration, err error) {
-    ctx, cancel := context.WithTimeout(context.Background(), xTransport.timeout)
-    defer cancel()
-    return xTransport.resolveWithContext(ctx, host, returnIPv4, returnIPv6)
-}
-
-func (xTransport *XTransport) resolveWithContext(ctx context.Context, host string, returnIPv4, returnIPv6 bool) (ips []net.IP, ttl time.Duration, err error) {
     protos := protoUDPFirst
     if xTransport.mainProto == "tcp" {
         protos = protoTCPFirst
@@ -689,7 +659,7 @@ func (xTransport *XTransport) resolveWithContext(ctx context.Context, host strin
     if xTransport.ignoreSystemDNS {
         if xTransport.internalResolverReady {
             for _, proto := range protos {
-                ips, ttl, err = xTransport.resolveUsingServers(ctx, proto, host, xTransport.internalResolvers, returnIPv4, returnIPv6)
+                ips, ttl, err = xTransport.resolveUsingServers(proto, host, xTransport.internalResolvers, returnIPv4, returnIPv6)
                 if err == nil {
                     break
                 }
@@ -714,7 +684,7 @@ func (xTransport *XTransport) resolveWithContext(ctx context.Context, host strin
                     proto,
                 )
             }
-            ips, ttl, err = xTransport.resolveUsingServers(ctx, proto, host, xTransport.bootstrapResolvers, returnIPv4, returnIPv6)
+            ips, ttl, err = xTransport.resolveUsingServers(proto, host, xTransport.bootstrapResolvers, returnIPv4, returnIPv6)
             if err == nil {
                 break
             }
@@ -727,6 +697,7 @@ func (xTransport *XTransport) resolveWithContext(ctx context.Context, host strin
     return ips, ttl, err
 }
 
+// If a name is not present in the cache, resolve the name and update the cache
 func (xTransport *XTransport) resolveAndUpdateCache(host string) error {
     if xTransport.proxyDialer != nil || xTransport.httpProxyFunction != nil {
         return nil
@@ -737,6 +708,7 @@ func (xTransport *XTransport) resolveAndUpdateCache(host string) error {
 
     cachedIPs, expired, updating := xTransport.loadCachedIPs(host)
     if len(cachedIPs) > 0 {
+        // Never block the request path when stale data exists; refresh in background.
         if expired && !updating {
             xTransport.markUpdatingCachedIP(host)
             go func(stale []net.IP) {
@@ -753,16 +725,13 @@ func (xTransport *XTransport) resolveAndUpdateCache(host string) error {
 }
 
 func (xTransport *XTransport) resolveAndUpdateCacheBlocking(host string, cachedIPs []net.IP) error {
-    ctx, cancel := context.WithTimeout(context.Background(), xTransport.timeout)
-    defer cancel()
-
-    ips, ttl, err := xTransport.resolveWithContext(ctx, host, xTransport.useIPv4, xTransport.useIPv6)
+    ips, ttl, err := xTransport.resolve(host, xTransport.useIPv4, xTransport.useIPv6)
     if ttl < MinResolverIPTTL {
         ttl = MinResolverIPTTL
     }
 
     selectedIPs := ips
-    if err != nil && len(cachedIPs) > 0 {
+    if (err != nil || len(selectedIPs) == 0) && len(cachedIPs) > 0 {
         dlog.Noticef("Using stale [%v] cached address for a grace period", host)
         selectedIPs = cachedIPs
         ttl = ExpiredCachedIPGraceTTL
@@ -785,13 +754,6 @@ func (xTransport *XTransport) resolveAndUpdateCacheBlocking(host string, cachedI
 
     xTransport.saveCachedIPs(host, selectedIPs, ttl)
     return nil
-}
-
-func (xTransport *XTransport) isAltSvcEntryExpired(entry *AltSvcEntry) bool {
-    if entry == nil {
-        return true
-    }
-    return time.Since(entry.timestamp) > AltSvcCacheTTL
 }
 
 func (xTransport *XTransport) Fetch(
@@ -825,21 +787,21 @@ func (xTransport *XTransport) Fetch(
             dlog.Debugf("Probing HTTP/3 transport for [%s]", url.Host)
         } else {
             xTransport.altSupport.RLock()
-            entry, hasEntry := xTransport.altSupport.cache[url.Host]
+            var altPort uint16
+            altPort, hasAltSupport = xTransport.altSupport.cache[url.Host]
             xTransport.altSupport.RUnlock()
-            if hasEntry && !xTransport.isAltSvcEntryExpired(entry) && entry.port > 0 {
-                if int(entry.port) == port {
+            if hasAltSupport && altPort > 0 {
+                if int(altPort) == port {
                     if xTransport.h3Client != nil {
                         client = xTransport.h3Client
                     }
                     dlog.Debugf("Using HTTP/3 transport for [%s]", url.Host)
-                    hasAltSupport = true
                 }
             }
         }
     }
 
-    header := make(http.Header, 6)
+    header := make(http.Header, 10)
     header.Set("User-Agent", "dnscrypt-proxy")
     if len(accept) > 0 {
         header["Accept"] = []string{accept}
@@ -850,8 +812,7 @@ func (xTransport *XTransport) Fetch(
     header["Cache-Control"] = []string{"max-stale"}
 
     if body != nil {
-        h := fnv.New128a()
-        h.Write(*body)
+        h := fnv.New128a(); h.Write(*body)
         qs := url.Query()
         qs.Add("body_hash", hex.EncodeToString(h.Sum(nil)))
         url2 := *url
@@ -892,6 +853,7 @@ func (xTransport *XTransport) Fetch(
     resp, err := client.Do(req)
     rtt := time.Since(start)
 
+    // Handle HTTP/3 error case - fallback to HTTP/2 when HTTP/3 fails
     if err != nil && xTransport.h3Client != nil && client == xTransport.h3Client {
         if xTransport.http3Probe {
             dlog.Debugf("HTTP/3 probe failed for [%s]: [%s] - falling back to HTTP/2", url.Host, err)
@@ -899,10 +861,12 @@ func (xTransport *XTransport) Fetch(
             dlog.Debugf("HTTP/3 connection failed for [%s]: [%s] - falling back to HTTP/2", url.Host, err)
         }
 
+        // Add server to negative cache when HTTP/3 fails
         xTransport.altSupport.Lock()
-        xTransport.altSupport.cache[url.Host] = &AltSvcEntry{port: 0, timestamp: time.Now()}
+        xTransport.altSupport.cache[url.Host] = 0
         xTransport.altSupport.Unlock()
 
+        // Retry with HTTP/2
         client = xTransport.httpClient
         if client == nil {
             client = &http.Client{Transport: xTransport.transport}
@@ -940,9 +904,9 @@ func (xTransport *XTransport) Fetch(
         skipAltSvcParsing := false
         if xTransport.http3Probe {
             xTransport.altSupport.RLock()
-            entry, inCache := xTransport.altSupport.cache[url.Host]
+            altPort, inCache := xTransport.altSupport.cache[url.Host]
             xTransport.altSupport.RUnlock()
-            if inCache && entry.port == 0 {
+            if inCache && altPort == 0 {
                 dlog.Debugf("Skipping Alt-Svc parsing for [%s] - previously failed HTTP/3 probe", url.Host)
                 skipAltSvcParsing = true
             }
@@ -951,13 +915,9 @@ func (xTransport *XTransport) Fetch(
             if alt, found := resp.Header["Alt-Svc"]; found {
                 dlog.Debugf("Alt-Svc [%s]: [%s]", url.Host, alt)
                 altPort := uint16(port & 0xffff)
-                found := false
                 for i, xalt := range alt {
-                    if found || i >= 8 {
-                        break
-                    }
                     for j, v := range strings.Split(xalt, ";") {
-                        if j >= 16 {
+                        if i >= 8 || j >= 16 {
                             break
                         }
                         v = strings.TrimSpace(v)
@@ -967,14 +927,13 @@ func (xTransport *XTransport) Fetch(
                             if xAltPort, err := strconv.ParseUint(v, 10, 16); err == nil && xAltPort <= 65535 {
                                 altPort = uint16(xAltPort)
                                 dlog.Debugf("Using HTTP/3 for [%s]", url.Host)
-                                found = true
                                 break
                             }
                         }
                     }
                 }
                 xTransport.altSupport.Lock()
-                xTransport.altSupport.cache[url.Host] = &AltSvcEntry{port: altPort, timestamp: time.Now()}
+                xTransport.altSupport.cache[url.Host] = altPort
                 dlog.Debugf("Caching altPort for [%v]", url.Host)
                 xTransport.altSupport.Unlock()
             }
