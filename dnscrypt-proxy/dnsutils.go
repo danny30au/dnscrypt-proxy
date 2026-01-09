@@ -367,8 +367,7 @@ func PackTXTRR(s string) []byte {
 
     for i := 0; i < len(s); i++ {
         c := s[i]
-        // Check if this is a backslash character (escape prefix)
-        if c != byte('\') {
+        if c != '\' {
             buf.WriteByte(c)
             continue
         }
@@ -377,7 +376,7 @@ func PackTXTRR(s string) []byte {
             break
         }
 
-        // Try to decode \DDD escape sequence
+        // Decode \DDD escape sequences
         if i+2 < len(s) {
             a, b, c3 := s[i], s[i+1], s[i+2]
             if (a >= '0' && a <= '9') && (b >= '0' && b <= '9') && (c3 >= '0' && c3 <= '9') {
@@ -387,7 +386,7 @@ func PackTXTRR(s string) []byte {
             }
         }
 
-        // Handle standard escape sequences
+        // Handle escape codes: \t, \r, \n
         switch s[i] {
         case 't':
             buf.WriteByte(9) // Tab
@@ -403,31 +402,6 @@ func PackTXTRR(s string) []byte {
     return buf.Bytes()
 }
 
-
-        // Decode escape sequences like \\DDD, \\t, \\r, \\n
-        if i+2 < len(s) {
-            a, b, c3 := s[i], s[i+1], s[i+2]
-            if (a >= '0' && a <= '9') && (b >= '0' && b <= '9') && (c3 >= '0' && c3 <= '9') {
-                buf.WriteByte(dddToByte3(a, b, c3))
-                i += 2
-                continue
-            }
-        }
-
-        switch s[i] {
-        case 't':
-            buf.WriteByte(9) // Tab
-        case 'r':
-            buf.WriteByte(13) // CR
-        case 'n':
-            buf.WriteByte(10) // LF
-        default:
-            buf.WriteByte(s[i])
-        }
-    }
-
-    return buf.Bytes()
-}
 type DNSExchangeResponse struct {
     response         *dns.Msg
     rtt              time.Duration
