@@ -1,7 +1,6 @@
 package main
 
 import (
-    "bytes"
     "encoding/binary"
     "errors"
     "net"
@@ -35,25 +34,32 @@ func PutMsg(m *dns.Msg) {
     if m == nil {
         return
     }
+    m.ID = 0
+    m.Response = false
+    m.Opcode = 0
+    m.Authoritative = false
+    m.Truncated = false
+    m.RecursionDesired = false
+    m.RecursionAvailable = false
+    m.Zero = false
+    m.AuthenticatedData = false
+    m.CheckingDisabled = false
+    m.Rcode = 0
 
-    // Preserve slice capacities to reduce allocations on reuse.
-    q := m.Question[:0]
-    a := m.Answer[:0]
-    ns := m.Ns[:0]
-    ex := m.Extra[:0]
-    ps := m.Pseudo[:0]
-    data := m.Data[:0]
-
-    // Reset the struct in one assignment, then restore reusable buffers.
-    *m = dns.Msg{}
-    m.Question = q
-    m.Answer = a
-    m.Ns = ns
-    m.Extra = ex
-    m.Pseudo = ps
-    m.Data = data
-
+    m.Question = m.Question[:0]
+    m.Answer = m.Answer[:0]
+    m.Ns = m.Ns[:0]
+    m.Extra = m.Extra[:0]
+    m.Pseudo = m.Pseudo[:0]
     msgPool.Put(m)
+}
+
+// Buffer pool for truncated packets
+var bufPool = sync.Pool{
+    New: func() interface{} {
+        b := make([]byte, 0, 1500)
+        return &b
+    },
 }
 
 // --- Static Data ---
@@ -69,7 +75,9 @@ func EmptyResponseFromMessage(srcMsg *dns.Msg) *dns.Msg {
     dstMsg.ID = srcMsg.ID
     dstMsg.Opcode = srcMsg.Opcode
 
-    dstMsg.Question = append(dstMsg.Question[:0], srcMsg.Question...)
+    if len(srcMsg.Question) > 0 {
+        dstMsg.Question = append(dstMsg.Question[:0], srcMsg.Question...)
+    }
 
     dstMsg.Response = true
     dstMsg.RecursionAvailable = true
@@ -114,19 +122,27 @@ func TruncatedResponse(packet []byte) ([]byte, error) {
         return nil, errors.New("packet malformed")
     }
 
-    // Allocate exactly what is returned (avoids pool lifetime issues and double-copy).
-    truncated := make([]byte, offset)
-    copy(truncated, packet[:offset])
-
-    // Set QR=1 and TC=1 (0x80 | 0x02) while preserving other bits.
-    truncated[2] |= 0x82
-
-    // Clear ANCOUNT/NSCOUNT/ARCOUNT.
-    for i := 6; i < 12; i++ {
-        truncated[i] = 0
+    bufPtr := bufPool.Get().(*[]byte)
+    buf := *bufPtr
+    if cap(buf) < offset {
+        buf = make([]byte, offset)
+    } else {
+        buf = buf[:offset]
     }
 
-    return truncated, nil
+    copy(buf, packet[:offset])
+    buf[2] |= 0x82
+    for i := 6; i < 12; i++ {
+        buf[i] = 0
+    }
+
+    newPacket := make([]byte, offset)
+    copy(newPacket, buf)
+
+    *bufPtr = buf[:0]
+    bufPool.Put(bufPtr)
+
+    return newPacket, nil
 }
 
 func RefusedResponseFromMessage(srcMsg *dns.Msg, refusedCode bool, ipv4 net.IP, ipv6 net.IP, ttl uint32) *dns.Msg {
@@ -213,11 +229,9 @@ func Rcode(packet []byte) uint8 {
 }
 
 func NormalizeRawQName(name *[]byte) {
-    b := *name
-    for i := 0; i < len(b); i++ {
-        c := b[i]
+    for i, c := range *name {
         if c >= 65 && c <= 90 {
-            b[i] = c + 32
+            (*name)[i] = c + 32
         }
     }
 }
@@ -228,23 +242,25 @@ func NormalizeQName(str string) (string, error) {
     }
     str = strings.TrimSuffix(str, ".")
 
-    // Single scan: validate ASCII and detect first uppercase.
-    upperAt := -1
-    for i := 0; i < len(str); i++ {
+    strLen := len(str)
+    needsConversion := false
+
+    for i := 0; i < strLen; i++ {
         c := str[i]
         if c >= utf8.RuneSelf {
             return str, errors.New("Query name is not an ASCII string")
         }
-        if upperAt < 0 && 'A' <= c && c <= 'Z' {
-            upperAt = i
+        if 'A' <= c && c <= 'Z' {
+            needsConversion = true
         }
     }
-    if upperAt < 0 {
+
+    if !needsConversion {
         return str, nil
     }
 
     b := []byte(str)
-    for i := upperAt; i < len(b); i++ {
+    for i := 0; i < len(b); i++ {
         c := b[i]
         if 'A' <= c && c <= 'Z' {
             b[i] = c + 32
@@ -259,27 +275,25 @@ func getMinTTL(msg *dns.Msg, minTTL uint32, maxTTL uint32, cacheNegMinTTL uint32
         (len(msg.Answer) <= 0 && len(msg.Ns) <= 0) {
         return time.Duration(cacheNegMinTTL) * time.Second
     }
-
-    ttl := uint32(maxTTL)
-    if msg.Rcode != dns.RcodeSuccess {
+    var ttl uint32
+    if msg.Rcode == dns.RcodeSuccess {
+        ttl = uint32(maxTTL)
+    } else {
         ttl = uint32(cacheNegMaxTTL)
     }
-
-    minFrom := func(rrs []dns.RR, cur uint32) uint32 {
-        for _, rr := range rrs {
-            if t := rr.Header().TTL; t < cur {
-                cur = t
+    if len(msg.Answer) > 0 {
+        for _, rr := range msg.Answer {
+            if rr.Header().TTL < ttl {
+                ttl = rr.Header().TTL
             }
         }
-        return cur
-    }
-
-    if len(msg.Answer) > 0 {
-        ttl = minFrom(msg.Answer, ttl)
     } else {
-        ttl = minFrom(msg.Ns, ttl)
+        for _, rr := range msg.Ns {
+            if rr.Header().TTL < ttl {
+                ttl = rr.Header().TTL
+            }
+        }
     }
-
     if msg.Rcode == dns.RcodeSuccess {
         if ttl < minTTL {
             ttl = minTTL
@@ -289,7 +303,6 @@ func getMinTTL(msg *dns.Msg, minTTL uint32, maxTTL uint32, cacheNegMinTTL uint32
             ttl = cacheNegMinTTL
         }
     }
-
     return time.Duration(ttl) * time.Second
 }
 
@@ -357,49 +370,40 @@ func removeEDNS0Options(msg *dns.Msg) bool {
     return true
 }
 
-func dddToByte3(a, b, c byte) byte {
-    return byte((a-'0')*100 + (b-'0')*10 + (c - '0'))
+func dddToByte(s []byte) byte {
+    return byte((s[0]-'0')*100 + (s[1]-'0')*10 + (s[2] - '0'))
 }
 
 func PackTXTRR(s string) []byte {
-    var buf bytes.Buffer
-    buf.Grow(len(s))
-
-    for i := 0; i < len(s); i++ {
-        c := s[i]
-        if c == byte('\') {
+    bs := make([]byte, len(s))
+    msg := make([]byte, 0)
+    copy(bs, s)
+    for i := 0; i < len(bs); i++ {
+        if bs[i] == '\\' {
             i++
-            if i >= len(s) {
+            if i == len(bs) {
                 break
             }
-
-            // Try to decode \DDD escape sequence
-            if i+2 < len(s) {
-                a, b, c3 := s[i], s[i+1], s[i+2]
-                if (a >= '0' && a <= '9') && (b >= '0' && b <= '9') && (c3 >= '0' && c3 <= '9') {
-                    buf.WriteByte(dddToByte3(a, b, c3))
-                    i += 2
-                    continue
-                }
-            }
-
-            // Handle standard escape sequences
-            switch s[i] {
-            case 't':
-                buf.WriteByte(9) // Tab
-            case 'r':
-                buf.WriteByte(13) // CR
-            case 'n':
-                buf.WriteByte(10) // LF
-            default:
-                buf.WriteByte(s[i])
+            if i+2 < len(bs) &&
+                (bs[i] >= '0' && bs[i] <= '9') &&
+                (bs[i+1] >= '0' && bs[i+1] <= '9') &&
+                (bs[i+2] >= '0' && bs[i+2] <= '9') {
+                msg = append(msg, dddToByte(bs[i:]))
+                i += 2
+            } else if bs[i] == 't' {
+                msg = append(msg, 9) // Tab
+            } else if bs[i] == 'r' {
+                msg = append(msg, 13) // CR
+            } else if bs[i] == 'n' {
+                msg = append(msg, 10) // LF
+            } else {
+                msg = append(msg, bs[i])
             }
         } else {
-            buf.WriteByte(c)
+            msg = append(msg, bs[i])
         }
     }
-
-    return buf.Bytes()
+    return msg
 }
 
 type DNSExchangeResponse struct {
