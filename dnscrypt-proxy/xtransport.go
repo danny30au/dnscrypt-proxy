@@ -626,7 +626,7 @@ func (xTransport *XTransport) resolveUsingResolver(
     return ips, ttl, err
 }
 
-func (xTransport *XTransport) resolveUsingServers(
+func (xTransport *XTransport) resolveUsingServersCompat(
     ctx context.Context,
     proto, host string,
     resolvers []string,
