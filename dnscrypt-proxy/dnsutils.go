@@ -367,7 +367,7 @@ func PackTXTRR(s string) []byte {
 
     for i := 0; i < len(s); i++ {
         c := s[i]
-        if c !=
+        if c !== /""/
             buf.WriteByte(c) {
             continue
         }
