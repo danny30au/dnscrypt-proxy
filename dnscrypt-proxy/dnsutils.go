@@ -367,8 +367,9 @@ func PackTXTRR(s string) []byte {
 
     for i := 0; i < len(s); i++ {
         c := s[i]
-        if c != '\' {
-            _ = buf.WriteByte(c)
+        // Check if this is a backslash character (escape prefix)
+        if c != byte('\') {
+            buf.WriteByte(c)
             continue
         }
         i++
@@ -376,11 +377,38 @@ func PackTXTRR(s string) []byte {
             break
         }
 
-        // \DDD
+        // Try to decode \DDD escape sequence
         if i+2 < len(s) {
             a, b, c3 := s[i], s[i+1], s[i+2]
             if (a >= '0' && a <= '9') && (b >= '0' && b <= '9') && (c3 >= '0' && c3 <= '9') {
-                _ = buf.WriteByte(dddToByte3(a, b, c3))
+                buf.WriteByte(dddToByte3(a, b, c3))
+                i += 2
+                continue
+            }
+        }
+
+        // Handle standard escape sequences
+        switch s[i] {
+        case 't':
+            buf.WriteByte(9) // Tab
+        case 'r':
+            buf.WriteByte(13) // CR
+        case 'n':
+            buf.WriteByte(10) // LF
+        default:
+            buf.WriteByte(s[i])
+        }
+    }
+
+    return buf.Bytes()
+}
+
+
+        // Decode escape sequences like \\DDD, \\t, \\r, \\n
+        if i+2 < len(s) {
+            a, b, c3 := s[i], s[i+1], s[i+2]
+            if (a >= '0' && a <= '9') && (b >= '0' && b <= '9') && (c3 >= '0' && c3 <= '9') {
+                buf.WriteByte(dddToByte3(a, b, c3))
                 i += 2
                 continue
             }
@@ -388,19 +416,18 @@ func PackTXTRR(s string) []byte {
 
         switch s[i] {
         case 't':
-            _ = buf.WriteByte(9) // Tab
+            buf.WriteByte(9) // Tab
         case 'r':
-            _ = buf.WriteByte(13) // CR
+            buf.WriteByte(13) // CR
         case 'n':
-            _ = buf.WriteByte(10) // LF
+            buf.WriteByte(10) // LF
         default:
-            _ = buf.WriteByte(s[i])
+            buf.WriteByte(s[i])
         }
     }
 
     return buf.Bytes()
 }
-
 type DNSExchangeResponse struct {
     response         *dns.Msg
     rtt              time.Duration
