@@ -49,9 +49,6 @@ ResponseOverhead = len(ServerMagic) + NonceSize + TagSize
 // Sharded AEAD cache configuration
 AEADCacheShardCount = 16
 AEADCacheMaxSize    = 1000
-
-// UDP GSO/GRO segment size (kernel 4.18+)
-UDPGSOSegmentSize = MaxDNSUDPPacketSize
 )
 
 var (
@@ -71,6 +68,9 @@ ErrClientNonceTooSmall = errors.New("clientNonceDst buffer too small")
 // Increased from 4096 to 8192 for better coverage
 zeroPage [8192]byte
 zeroKey  [32]byte
+
+// UDP GSO/GRO segment size (kernel 4.18+) - set at runtime
+UDPGSOSegmentSize = 512
 
 // Size-class buffer pools for adaptive memory allocation
 bufferPoolSmall = sync.Pool{
@@ -605,6 +605,11 @@ if os.Getenv("DNSCRYPT_TRACK_NONCES") == "1" {
 globalNonceTracker = &NonceTracker{
 seen: make(map[[HalfNonceSize]byte]time.Time),
 }
+}
+
+// Initialize UDP GSO segment size based on MaxDNSUDPPacketSize
+if MaxDNSUDPPacketSize > 0 {
+UDPGSOSegmentSize = MaxDNSUDPPacketSize
 }
 }
 
