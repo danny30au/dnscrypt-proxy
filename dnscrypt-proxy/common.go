@@ -68,15 +68,24 @@ return newPacket, nil
 }
 
 // ReadPrefixed - OPTIMIZED: Start with smaller buffer, grow only if needed
+
+// ReadPrefixed - OPTIMIZED: Header-first read to avoid resizing loops
 func ReadPrefixed(conn *net.Conn) ([]byte, error) {
-buf := make([]byte, 512) // Start small instead of 4KB
-packetLength, pos := -1, 0
-for {
-if pos >= len(buf) {
-// Only resize if we hit the limit
-if len(buf) >= 2+MaxDNSPacketSize {
-return buf, errors.New("Packet too large")
+var header [2]byte
+if _, err := io.ReadFull(*conn, header[:]); err != nil {
+return nil, err
 }
+l := int(binary.BigEndian.Uint16(header[:]))
+if l < MinDNSPacketSize || l > MaxDNSPacketSize {
+return nil, errors.New("invalid packet size")
+}
+buf := make([]byte, l)
+if _, err := io.ReadFull(*conn, buf); err != nil {
+return nil, err
+}
+return buf, nil
+}
+
 newBuf := make([]byte, min(len(buf)*2, 2+MaxDNSPacketSize))
 copy(newBuf, buf)
 buf = newBuf
@@ -286,10 +295,21 @@ return string(bin), nil
 func isDigit(b byte) bool { return b >= '0' && b <= '9' }
 
 // ExtractClientIPStr extracts client IP string from pluginsState based on protocol
+
+// ExtractClientIPStr - OPTIMIZED: Type switch for speed
 func ExtractClientIPStr(pluginsState *PluginsState) (string, bool) {
-if pluginsState.clientAddr == nil {
+if pluginsState == nil || pluginsState.clientAddr == nil {
 return "", false
 }
+switch addr := pluginsState.clientAddr.(type) {
+case *net.UDPAddr:
+return addr.IP.String(), true
+case *net.TCPAddr:
+return addr.IP.String(), true
+}
+return "", false
+}
+
 switch pluginsState.clientProto {
 case "udp":
 return (*pluginsState.clientAddr).(*net.UDPAddr).IP.String(), true
@@ -310,28 +330,54 @@ return ipCryptConfig.EncryptIPString(ipStr), ok
 }
 
 // FormatLogLine - OPTIMIZED: Use strings.Builder, reduce format operations
+
+// FormatLogLine - OPTIMIZED: Efficient time formatting and building
 func FormatLogLine(format, clientIP, qName, reason string, additionalFields ...string) (string, error) {
-if format == "tsv" {
 var buf strings.Builder
-buf.Grow(len(clientIP) + len(qName) + len(reason) + len(additionalFields)*20 + 100)
-
-now := time.Now()
-year, month, day := now.Date()
-hour, minute, second := now.Clock()
-
+buf.Grow(len(clientIP) + len(qName) + len(reason) + len(additionalFields)*20 + 80)
+if format == "tsv" {
 buf.WriteString("[")
-buf.WriteString(fmt.Sprintf("%d-%02d-%02d %02d:%02d:%02d", year, int(month), day, hour, minute, second))
-buf.WriteString("]\t")
+time.Now().AppendFormat(&buf, "2006-01-02 15:04:05")
+buf.WriteString("]	")
 buf.WriteString(clientIP)
-buf.WriteString("\t")
+buf.WriteString("	")
 buf.WriteString(StringQuote(qName))
-buf.WriteString("\t")
+buf.WriteString("	")
 buf.WriteString(StringQuote(reason))
-
 for _, field := range additionalFields {
-buf.WriteString("\t")
+buf.WriteString("	")
 buf.WriteString(StringQuote(field))
 }
+buf.WriteString("
+")
+return buf.String(), nil
+} else if format == "ltsv" {
+buf.WriteString("time:")
+buf.WriteString(strconv.FormatInt(time.Now().Unix(), 10))
+buf.WriteString("	host:")
+buf.WriteString(clientIP)
+buf.WriteString("	qname:")
+buf.WriteString(StringQuote(qName))
+buf.WriteString("	message:")
+buf.WriteString(StringQuote(reason))
+for i, field := range additionalFields {
+if i == 0 {
+buf.WriteString("	ip:")
+buf.WriteString(StringQuote(field))
+} else {
+buf.WriteString("	field")
+buf.WriteString(strconv.Itoa(i))
+buf.WriteString(":")
+buf.WriteString(StringQuote(field))
+}
+}
+buf.WriteString("
+")
+return buf.String(), nil
+}
+return "", fmt.Errorf("unexpected log format: [%s]", format)
+}
+
 buf.WriteString("\n")
 return buf.String(), nil
 } else if format == "ltsv" {
@@ -435,12 +481,34 @@ return strings.ToLower(cleanLine), trailingStar, nil
 }
 
 // ProcessConfigLines processes configuration file lines, calling the processor function for each non-empty line
+
+// ProcessConfigLines - OPTIMIZED: Zero-allocation line iteration
 func ProcessConfigLines(lines string, processor func(line string, lineNo int) error) error {
-for lineNo, line := range strings.Split(lines, "\n") {
-line = TrimAndStripInlineComments(line)
-if len(line) == 0 {
-continue
+lineNo := 0
+start := 0
+for start < len(lines) {
+end := start
+for end < len(lines) && lines[end] != '
+' {
+end++
 }
+line := lines[start:end]
+if len(line) > 0 && line[len(line)-1] == '
+' {
+line = line[:len(line)-1]
+}
+line = TrimAndStripInlineComments(line)
+if len(line) > 0 {
+if err := processor(line, lineNo); err != nil {
+return err
+}
+}
+start = end + 1
+lineNo++
+}
+return nil
+}
+
 if err := processor(line, lineNo); err != nil {
 return err
 }
@@ -449,13 +517,30 @@ return nil
 }
 
 // LoadIPRules loads IP rules from text lines into radix tree and map structures
-func LoadIPRules(lines string, prefixes *iradix.Tree, ips map[string]interface{}) (*iradix.Tree, error) {
+
+// LoadIPRules - OPTIMIZED: Batch insertion + Memory efficient map
+func LoadIPRules(lines string, prefixes *iradix.Tree, ips map[string]struct{}) (*iradix.Tree, error) {
+var prefixRules []string
 err := ProcessConfigLines(lines, func(line string, lineNo int) error {
 cleanLine, trailingStar, lineErr := ParseIPRule(line, lineNo)
 if lineErr != nil {
 dlog.Error(lineErr)
-return nil // Continue processing (matching existing behavior)
+return nil
 }
+if trailingStar {
+prefixRules = append(prefixRules, cleanLine)
+} else {
+ips[cleanLine] = struct{}{}
+}
+return nil
+})
+sort.Strings(prefixRules)
+for _, rule := range prefixRules {
+prefixes, _, _ = prefixes.Insert([]byte(rule), 0)
+}
+return prefixes, err
+}
+
 
 if trailingStar {
 prefixes, _, _ = prefixes.Insert([]byte(cleanLine), 0)
