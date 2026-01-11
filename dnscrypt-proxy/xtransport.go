@@ -44,7 +44,7 @@ var hasAESGCMHardwareSupport = cpu.X86.HasAES && cpu.X86.HasPCLMULQDQ ||
 
 const (
     DefaultBootstrapResolver    = "9.9.9.9:53"
-    DefaultKeepAlive            = 30 * time.Second
+    DefaultKeepAlive            = 360 * time.Second
     DefaultTimeout              = 30 * time.Second
     ResolverReadTimeout         = 5 * time.Second
     SystemResolverIPTTL         = 12 * time.Hour
@@ -322,8 +322,8 @@ func (xTransport *XTransport) rebuildTransport() {
     transport := &http.Transport{
         DisableKeepAlives:      false,
         DisableCompression:     true,
-        MaxIdleConns:           1000,
-        MaxIdleConnsPerHost:    100,
+        MaxIdleConns:           2000,
+        MaxIdleConnsPerHost:    200,
         MaxConnsPerHost:        0,
         IdleConnTimeout:        xTransport.keepAlive,
         ResponseHeaderTimeout:  timeout,
