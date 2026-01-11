@@ -68,8 +68,6 @@ return newPacket, nil
 }
 
 // ReadPrefixed - OPTIMIZED: Start with smaller buffer, grow only if needed
-
-// ReadPrefixed - OPTIMIZED: Header-first read to avoid resizing loops
 func ReadPrefixed(conn *net.Conn) ([]byte, error) {
 var header [2]byte
 if _, err := io.ReadFull(*conn, header[:]); err != nil {
@@ -85,7 +83,6 @@ return nil, err
 }
 return buf, nil
 }
-
 newBuf := make([]byte, min(len(buf)*2, 2+MaxDNSPacketSize))
 copy(newBuf, buf)
 buf = newBuf
@@ -139,12 +136,29 @@ return b
 
 // StringReverse - OPTIMIZED: Fast path for ASCII strings
 func StringReverse(s string) string {
-// Quick check for ASCII
 isASCII := true
 for i := 0; i < len(s); i++ {
 if s[i] >= 0x80 {
 isASCII = false
 break
+}
+}
+if isASCII {
+b := make([]byte, len(s))
+copy(b, s)
+for i, j := 0, len(b)-1; i < j; i, j = i+1, j-1 {
+b[i], b[j] = b[j], b[i]
+}
+return *(*string)(unsafe.Pointer(&b))
+}
+r := make([]rune, 0, utf8.RuneCountInString(s))
+for _, ru := range s {
+r = append(r, ru)
+}
+for i, j := 0, len(r)-1; i < len(r)/2; i, j = i+1, j-1 {
+r[i], r[j] = r[j], r[i]
+}
+return string(r)
 }
 }
 
@@ -167,6 +181,41 @@ return string(r)
 func StringTwoFields(str string) (string, string, bool) {
 if len(str) < 3 {
 return "", "", false
+}
+start := 0
+for start < len(str) && (str[start] == ' ' || str[start] == '	' || str[start] == '
+' || str[start] == '
+') {
+start++
+}
+if start == len(str) {
+return "", "", false
+}
+end1 := start
+for end1 < len(str) && str[end1] != ' ' && str[end1] != '	' && str[end1] != '
+' && str[end1] != '
+' {
+end1++
+}
+if end1 == len(str) {
+return "", "", false
+}
+start2 := end1
+for start2 < len(str) && (str[start2] == ' ' || str[start2] == '	' || str[start2] == '
+' || str[start2] == '
+') {
+start2++
+}
+if start2 == len(str) {
+return "", "", false
+}
+end2 := len(str)
+for end2 > start2 && (str[end2-1] == ' ' || str[end2-1] == '	' || str[end2-1] == '
+' || str[end2-1] == '
+') {
+end2--
+}
+return str[start:end1], str[start2:end2], true
 }
 
 // Find first whitespace
@@ -295,8 +344,6 @@ return string(bin), nil
 func isDigit(b byte) bool { return b >= '0' && b <= '9' }
 
 // ExtractClientIPStr extracts client IP string from pluginsState based on protocol
-
-// ExtractClientIPStr - OPTIMIZED: Type switch for speed
 func ExtractClientIPStr(pluginsState *PluginsState) (string, bool) {
 if pluginsState == nil || pluginsState.clientAddr == nil {
 return "", false
@@ -309,7 +356,6 @@ return addr.IP.String(), true
 }
 return "", false
 }
-
 switch pluginsState.clientProto {
 case "udp":
 return (*pluginsState.clientAddr).(*net.UDPAddr).IP.String(), true
@@ -330,11 +376,9 @@ return ipCryptConfig.EncryptIPString(ipStr), ok
 }
 
 // FormatLogLine - OPTIMIZED: Use strings.Builder, reduce format operations
-
-// FormatLogLine - OPTIMIZED: Efficient time formatting and building
 func FormatLogLine(format, clientIP, qName, reason string, additionalFields ...string) (string, error) {
 var buf strings.Builder
-buf.Grow(len(clientIP) + len(qName) + len(reason) + len(additionalFields)*20 + 80)
+buf.Grow(len(clientIP) + len(qName) + len(reason) + len(additionalFields)*20 + 100)
 if format == "tsv" {
 buf.WriteString("[")
 time.Now().AppendFormat(&buf, "2006-01-02 15:04:05")
@@ -377,7 +421,6 @@ return buf.String(), nil
 }
 return "", fmt.Errorf("unexpected log format: [%s]", format)
 }
-
 buf.WriteString("\n")
 return buf.String(), nil
 } else if format == "ltsv" {
@@ -481,8 +524,6 @@ return strings.ToLower(cleanLine), trailingStar, nil
 }
 
 // ProcessConfigLines processes configuration file lines, calling the processor function for each non-empty line
-
-// ProcessConfigLines - OPTIMIZED: Zero-allocation line iteration
 func ProcessConfigLines(lines string, processor func(line string, lineNo int) error) error {
 lineNo := 0
 start := 0
@@ -508,7 +549,6 @@ lineNo++
 }
 return nil
 }
-
 if err := processor(line, lineNo); err != nil {
 return err
 }
@@ -517,9 +557,7 @@ return nil
 }
 
 // LoadIPRules loads IP rules from text lines into radix tree and map structures
-
-// LoadIPRules - OPTIMIZED: Batch insertion + Memory efficient map
-func LoadIPRules(lines string, prefixes *iradix.Tree, ips map[string]struct{}) (*iradix.Tree, error) {
+func LoadIPRules(lines string, prefixes *iradix.Tree, ips map[string]interface{}) (*iradix.Tree, error) {
 var prefixRules []string
 err := ProcessConfigLines(lines, func(line string, lineNo int) error {
 cleanLine, trailingStar, lineErr := ParseIPRule(line, lineNo)
@@ -530,7 +568,7 @@ return nil
 if trailingStar {
 prefixRules = append(prefixRules, cleanLine)
 } else {
-ips[cleanLine] = struct{}{}
+ips[cleanLine] = true
 }
 return nil
 })
@@ -540,7 +578,6 @@ prefixes, _, _ = prefixes.Insert([]byte(rule), 0)
 }
 return prefixes, err
 }
-
 
 if trailingStar {
 prefixes, _, _ = prefixes.Insert([]byte(cleanLine), 0)
