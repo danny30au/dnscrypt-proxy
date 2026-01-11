@@ -69,19 +69,13 @@ return newPacket, nil
 
 // ReadPrefixed - OPTIMIZED: Start with smaller buffer, grow only if needed
 func ReadPrefixed(conn *net.Conn) ([]byte, error) {
-var header [2]byte
-if _, err := io.ReadFull(*conn, header[:]); err != nil {
-return nil, err
-}
-l := int(binary.BigEndian.Uint16(header[:]))
-if l < MinDNSPacketSize || l > MaxDNSPacketSize {
-return nil, errors.New("invalid packet size")
-}
-buf := make([]byte, l)
-if _, err := io.ReadFull(*conn, buf); err != nil {
-return nil, err
-}
-return buf, nil
+buf := make([]byte, 512) // Start small instead of 4KB
+packetLength, pos := -1, 0
+for {
+if pos >= len(buf) {
+// Only resize if we hit the limit
+if len(buf) >= 2+MaxDNSPacketSize {
+return buf, errors.New("Packet too large")
 }
 newBuf := make([]byte, min(len(buf)*2, 2+MaxDNSPacketSize))
 copy(newBuf, buf)
@@ -136,29 +130,12 @@ return b
 
 // StringReverse - OPTIMIZED: Fast path for ASCII strings
 func StringReverse(s string) string {
+// Quick check for ASCII
 isASCII := true
 for i := 0; i < len(s); i++ {
 if s[i] >= 0x80 {
 isASCII = false
 break
-}
-}
-if isASCII {
-b := make([]byte, len(s))
-copy(b, s)
-for i, j := 0, len(b)-1; i < j; i, j = i+1, j-1 {
-b[i], b[j] = b[j], b[i]
-}
-return *(*string)(unsafe.Pointer(&b))
-}
-r := make([]rune, 0, utf8.RuneCountInString(s))
-for _, ru := range s {
-r = append(r, ru)
-}
-for i, j := 0, len(r)-1; i < len(r)/2; i, j = i+1, j-1 {
-r[i], r[j] = r[j], r[i]
-}
-return string(r)
 }
 }
 
@@ -181,41 +158,6 @@ return string(r)
 func StringTwoFields(str string) (string, string, bool) {
 if len(str) < 3 {
 return "", "", false
-}
-start := 0
-for start < len(str) && (str[start] == ' ' || str[start] == '	' || str[start] == '
-' || str[start] == '
-') {
-start++
-}
-if start == len(str) {
-return "", "", false
-}
-end1 := start
-for end1 < len(str) && str[end1] != ' ' && str[end1] != '	' && str[end1] != '
-' && str[end1] != '
-' {
-end1++
-}
-if end1 == len(str) {
-return "", "", false
-}
-start2 := end1
-for start2 < len(str) && (str[start2] == ' ' || str[start2] == '	' || str[start2] == '
-' || str[start2] == '
-') {
-start2++
-}
-if start2 == len(str) {
-return "", "", false
-}
-end2 := len(str)
-for end2 > start2 && (str[end2-1] == ' ' || str[end2-1] == '	' || str[end2-1] == '
-' || str[end2-1] == '
-') {
-end2--
-}
-return str[start:end1], str[start2:end2], true
 }
 
 // Find first whitespace
@@ -345,15 +287,7 @@ func isDigit(b byte) bool { return b >= '0' && b <= '9' }
 
 // ExtractClientIPStr extracts client IP string from pluginsState based on protocol
 func ExtractClientIPStr(pluginsState *PluginsState) (string, bool) {
-if pluginsState == nil || pluginsState.clientAddr == nil {
-return "", false
-}
-switch addr := pluginsState.clientAddr.(type) {
-case *net.UDPAddr:
-return addr.IP.String(), true
-case *net.TCPAddr:
-return addr.IP.String(), true
-}
+if pluginsState.clientAddr == nil {
 return "", false
 }
 switch pluginsState.clientProto {
@@ -377,49 +311,26 @@ return ipCryptConfig.EncryptIPString(ipStr), ok
 
 // FormatLogLine - OPTIMIZED: Use strings.Builder, reduce format operations
 func FormatLogLine(format, clientIP, qName, reason string, additionalFields ...string) (string, error) {
+if format == "tsv" {
 var buf strings.Builder
 buf.Grow(len(clientIP) + len(qName) + len(reason) + len(additionalFields)*20 + 100)
-if format == "tsv" {
+
+now := time.Now()
+year, month, day := now.Date()
+hour, minute, second := now.Clock()
+
 buf.WriteString("[")
-time.Now().AppendFormat(&buf, "2006-01-02 15:04:05")
-buf.WriteString("]	")
+buf.WriteString(fmt.Sprintf("%d-%02d-%02d %02d:%02d:%02d", year, int(month), day, hour, minute, second))
+buf.WriteString("]\t")
 buf.WriteString(clientIP)
-buf.WriteString("	")
+buf.WriteString("\t")
 buf.WriteString(StringQuote(qName))
-buf.WriteString("	")
+buf.WriteString("\t")
 buf.WriteString(StringQuote(reason))
+
 for _, field := range additionalFields {
-buf.WriteString("	")
+buf.WriteString("\t")
 buf.WriteString(StringQuote(field))
-}
-buf.WriteString("
-")
-return buf.String(), nil
-} else if format == "ltsv" {
-buf.WriteString("time:")
-buf.WriteString(strconv.FormatInt(time.Now().Unix(), 10))
-buf.WriteString("	host:")
-buf.WriteString(clientIP)
-buf.WriteString("	qname:")
-buf.WriteString(StringQuote(qName))
-buf.WriteString("	message:")
-buf.WriteString(StringQuote(reason))
-for i, field := range additionalFields {
-if i == 0 {
-buf.WriteString("	ip:")
-buf.WriteString(StringQuote(field))
-} else {
-buf.WriteString("	field")
-buf.WriteString(strconv.Itoa(i))
-buf.WriteString(":")
-buf.WriteString(StringQuote(field))
-}
-}
-buf.WriteString("
-")
-return buf.String(), nil
-}
-return "", fmt.Errorf("unexpected log format: [%s]", format)
 }
 buf.WriteString("\n")
 return buf.String(), nil
@@ -525,29 +436,10 @@ return strings.ToLower(cleanLine), trailingStar, nil
 
 // ProcessConfigLines processes configuration file lines, calling the processor function for each non-empty line
 func ProcessConfigLines(lines string, processor func(line string, lineNo int) error) error {
-lineNo := 0
-start := 0
-for start < len(lines) {
-end := start
-for end < len(lines) && lines[end] != '
-' {
-end++
-}
-line := lines[start:end]
-if len(line) > 0 && line[len(line)-1] == '
-' {
-line = line[:len(line)-1]
-}
+for lineNo, line := range strings.Split(lines, "\n") {
 line = TrimAndStripInlineComments(line)
-if len(line) > 0 {
-if err := processor(line, lineNo); err != nil {
-return err
-}
-}
-start = end + 1
-lineNo++
-}
-return nil
+if len(line) == 0 {
+continue
 }
 if err := processor(line, lineNo); err != nil {
 return err
@@ -558,25 +450,11 @@ return nil
 
 // LoadIPRules loads IP rules from text lines into radix tree and map structures
 func LoadIPRules(lines string, prefixes *iradix.Tree, ips map[string]interface{}) (*iradix.Tree, error) {
-var prefixRules []string
 err := ProcessConfigLines(lines, func(line string, lineNo int) error {
 cleanLine, trailingStar, lineErr := ParseIPRule(line, lineNo)
 if lineErr != nil {
 dlog.Error(lineErr)
-return nil
-}
-if trailingStar {
-prefixRules = append(prefixRules, cleanLine)
-} else {
-ips[cleanLine] = true
-}
-return nil
-})
-sort.Strings(prefixRules)
-for _, rule := range prefixRules {
-prefixes, _, _ = prefixes.Insert([]byte(rule), 0)
-}
-return prefixes, err
+return nil // Continue processing (matching existing behavior)
 }
 
 if trailingStar {
