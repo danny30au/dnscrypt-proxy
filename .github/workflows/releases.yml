@@ -35,6 +35,7 @@ jobs:
           go get google.golang.org/grpc
           go get github.com/gorilla/websocket@main
           go get github.com/hashicorp/go-immutable-radix
+          go get github.com/hashicorp/go-immutable-radix/blob/master/iradix.go
           go get github.com/davecgh/go-spew
           go mod tidy
           go build \
