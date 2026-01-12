@@ -1,6 +1,7 @@
 package main
 
 import (
+"context"
 "encoding/json"
 "errors"
 "fmt"
@@ -10,16 +11,19 @@ import (
 "path/filepath"
 "strconv"
 "strings"
+"sync"
 "time"
 
 "github.com/BurntSushi/toml"
 "github.com/jedisct1/dlog"
 stamps "github.com/jedisct1/go-dnsstamps"
+"golang.org/x/sync/errgroup"
 )
 
 const (
 MaxTimeout             = 3600
 DefaultNetprobeAddress = "9.9.9.9:53"
+MaxSourceLoadConcurrency = 8
 )
 
 type Config struct {
@@ -318,21 +322,50 @@ NetprobeTimeoutOverride *int
 ShowCerts               *bool
 }
 
+type nameSet map[string]struct{}
+
+func newNameSet(names []string) nameSet {
+s := make(nameSet, len(names))
+for _, n := range names {
+s[strings.ToLower(n)] = struct{}{}
+}
+return s
+}
+
+func (s nameSet) Has(name string) bool {
+_, ok := s[strings.ToLower(name)]
+return ok
+}
+
+func resolveRelativeToConfig(configPath, maybeRelative string) string {
+if filepath.IsAbs(maybeRelative) || maybeRelative == "" {
+return maybeRelative
+}
+return filepath.Join(filepath.Dir(configPath), maybeRelative)
+}
+
 func findConfigFile(configFile *string) (string, error) {
 if _, err := os.Stat(*configFile); os.IsNotExist(err) {
-cdLocal()
+exeFileName, exeErr := os.Executable()
+if exeErr == nil {
+exeDir := filepath.Dir(exeFileName)
+altPath := filepath.Join(exeDir, *configFile)
+if _, altErr := os.Stat(altPath); altErr == nil {
+*configFile = altPath
+}
+}
 if _, err := os.Stat(*configFile); err != nil {
 return "", err
 }
+}
+if filepath.IsAbs(*configFile) {
+return *configFile, nil
 }
 pwd, err := os.Getwd()
 if err != nil {
 return "", err
 }
-if filepath.IsAbs(*configFile) {
-return *configFile, nil
-}
-return path.Join(pwd, *configFile), nil
+return filepath.Join(pwd, *configFile), nil
 }
 
 func ConfigLoad(proxy *Proxy, flags *ConfigFlags) error {
@@ -359,17 +392,16 @@ Resolve(addr, *flags.Resolve, len(config.ServerNames) == 1)
 os.Exit(0)
 }
 
-if err := cdFileDir(foundConfigFile); err != nil {
-return err
-}
-
-// Check for unsupported keys in configuration
 undecoded := md.Undecoded()
 if len(undecoded) > 0 {
 return fmt.Errorf("Unsupported key in configuration file: [%s]", undecoded[0])
 }
 
-// Set up basic proxy properties
+if *flags.Check {
+dlog.Notice("Configuration successfully checked")
+os.Exit(0)
+}
+
 proxy.showCerts = *flags.ShowCerts || len(os.Getenv("SHOW_CERTS")) > 0
 proxy.logMaxSize = config.LogMaxSize
 proxy.logMaxAge = config.LogMaxAge
@@ -379,94 +411,68 @@ proxy.child = *flags.Child
 proxy.enableHotReload = config.EnableHotReload
 proxy.xTransport = NewXTransport()
 
-// Configure logging
 configureLogging(proxy, flags, &config)
-
-// Configure server parameters
 configureServerParams(proxy, &config)
 
-// Configure XTransport (may override mainProto if proxy is configured)
 if err := configureXTransport(proxy, &config); err != nil {
 return err
 }
 
-// Configure DoH client authentication
 if err := configureDoHClientAuth(proxy, &config); err != nil {
 return err
 }
 
-// Configure load balancing
 configureLoadBalancing(proxy, &config)
-
-// Configure plugins
 configurePlugins(proxy, &config)
 
-// Configure EDNS client subnet
 if err := configureEDNSClientSubnet(proxy, &config); err != nil {
 return err
 }
 
-// Configure query logging
 if err := configureQueryLog(proxy, &config); err != nil {
 return err
 }
 
-// Configure NX domain logging
 if err := configureNXLog(proxy, &config); err != nil {
 return err
 }
 
-// Configure blocked names
 if err := configureBlockedNames(proxy, &config); err != nil {
 return err
 }
 
-// Configure allowed names
 if err := configureAllowedNames(proxy, &config); err != nil {
 return err
 }
 
-// Configure blocked IPs
 if err := configureBlockedIPs(proxy, &config); err != nil {
 return err
 }
 
-// Configure allowed IPs
 if err := configureAllowedIPs(proxy, &config); err != nil {
 return err
 }
 
-// Configure additional files
 configureAdditionalFiles(proxy, &config)
 
-// Configure weekly ranges
 if err := configureWeeklyRanges(proxy, &config); err != nil {
 return err
 }
 
-// Configure anonymized DNS
 configureAnonymizedDNS(proxy, &config)
-
-// Configure broken implementations
 configureBrokenImplementations(proxy, &config)
-
-// Configure DNS64
 configureDNS64(proxy, &config)
 
-// Configure IP encryption
 if err := configureIPEncryption(proxy, &config); err != nil {
 return err
 }
 
-// Configure source restrictions
 configureSourceRestrictions(proxy, flags, &config)
 
-// Initialize networking
 if err := initializeNetworking(proxy, flags, &config); err != nil {
 return err
 }
 
-// if 'userName' is set and we are the parent process drop privilege and exit
 if len(proxy.userName) > 0 && !proxy.child {
 proxy.dropPrivilege(proxy.userName, FileDescriptors)
 return errors.New(
@@ -474,9 +480,8 @@ return errors.New(
 )
 }
 
-// Load sources and verify servers
 if !config.OfflineMode {
-if err := config.loadSources(proxy); err != nil {
+if err := config.loadSources(proxy, foundConfigFile); err != nil {
 return err
 }
 if len(proxy.registeredServers) == 0 {
@@ -484,7 +489,6 @@ return errors.New("None of the servers listed in the server_names list were foun
 }
 }
 
-// Handle listing servers if requested
 if *flags.List || *flags.ListAll {
 if err := config.printRegisteredServers(proxy, *flags.JSONOutput, *flags.IncludeRelays); err != nil {
 return err
@@ -492,7 +496,6 @@ return err
 os.Exit(0)
 }
 
-// Log anonymized DNS routes
 if proxy.routes != nil && len(*proxy.routes) > 0 {
 hasSpecificRoutes := false
 for _, server := range proxy.registeredServers {
@@ -518,28 +521,23 @@ dlog.Noticef("Anonymized DNS: routing everything via %v", via)
 }
 }
 
-// Exit if just checking configuration
-if *flags.Check {
-dlog.Notice("Configuration successfully checked")
-os.Exit(0)
-}
-
 return nil
 }
 
-// GetRefusedFlag - Returns whether the config has defined refused_code_in_responses
+type refusedCodeConfig struct {
+RefusedCodeInResponses bool `toml:"refused_code_in_responses"`
+}
+
 func (config *Config) GetRefusedFlag(configFile string) (bool, bool) {
-var refused bool
-md, err := toml.DecodeFile(configFile, &refused)
+var subset refusedCodeConfig
+md, err := toml.DecodeFile(configFile, &subset)
 if err != nil {
 return false, false
 }
-return refused, md.IsDefined("refused_code_in_responses")
+return subset.RefusedCodeInResponses, md.IsDefined("refused_code_in_responses")
 }
 
-// configureBrokenImplementations - Helper function for IsDefined check
 func configureBrokenImplementations(proxy *Proxy, config *Config) {
-// Backwards compatibility
 config.BrokenImplementations.FragmentsBlocked = append(
 config.BrokenImplementations.FragmentsBlocked,
 config.BrokenImplementations.BrokenQueryPadding...)
@@ -547,13 +545,11 @@ config.BrokenImplementations.BrokenQueryPadding...)
 proxy.serversBlockingFragments = config.BrokenImplementations.FragmentsBlocked
 }
 
-// configureDNS64 - Helper function for DNS64
 func configureDNS64(proxy *Proxy, config *Config) {
 proxy.dns64Prefixes = config.DNS64.Prefixes
 proxy.dns64Resolvers = config.DNS64.Resolvers
 }
 
-// configureIPEncryption - Helper function for IP encryption
 func configureIPEncryption(proxy *Proxy, config *Config) error {
 ipCryptConfig, err := NewIPCryptConfig(
 config.IPEncryption.Key,
@@ -566,10 +562,7 @@ proxy.ipCryptConfig = ipCryptConfig
 return nil
 }
 
-func (config *Config) printRegisteredServers(proxy *Proxy, jsonOutput bool, includeRelays bool) error {
-summary := make([]ServerSummary, 0, len(proxy.registeredRelays)+len(proxy.registeredServers))
-if includeRelays {
-for _, registeredRelay := range proxy.registeredRelays {
+func buildRelaySummary(registeredRelay RegisteredServer) ServerSummary {
 addrStr, port := registeredRelay.stamp.ServerAddrStr, stamps.DefaultPort
 var hostAddr string
 hostAddr, port = ExtractHostAndPort(addrStr, port)
@@ -589,7 +582,7 @@ nofilter := true
 if registeredRelay.stamp.Proto == stamps.StampProtoTypeODoHRelay {
 nolog = registeredRelay.stamp.Props&stamps.ServerInformalPropertyNoLog != 0
 }
-serverSummary := ServerSummary{
+return ServerSummary{
 Name:        registeredRelay.name,
 Proto:       registeredRelay.stamp.Proto.String(),
 IPv6:        strings.HasPrefix(addrStr, "["),
@@ -600,14 +593,9 @@ NoFilter:    nofilter,
 Description: registeredRelay.description,
 Stamp:       registeredRelay.stamp.String(),
 }
-if jsonOutput {
-summary = append(summary, serverSummary)
-} else {
-fmt.Println(serverSummary.Name)
 }
-}
-}
-for _, registeredServer := range proxy.registeredServers {
+
+func buildServerSummary(registeredServer RegisteredServer) ServerSummary {
 addrStr, port := registeredServer.stamp.ServerAddrStr, stamps.DefaultPort
 var hostAddr string
 hostAddr, port = ExtractHostAndPort(addrStr, port)
@@ -623,7 +611,7 @@ if len(addrStr) > 0 {
 addrs = append(addrs, hostAddr)
 }
 dnssec := registeredServer.stamp.Props&stamps.ServerInformalPropertyDNSSEC != 0
-serverSummary := ServerSummary{
+return ServerSummary{
 Name:        registeredServer.name,
 Proto:       registeredServer.stamp.Proto.String(),
 IPv6:        strings.HasPrefix(addrStr, "["),
@@ -635,12 +623,34 @@ NoFilter:    registeredServer.stamp.Props&stamps.ServerInformalPropertyNoFilter 
 Description: registeredServer.description,
 Stamp:       registeredServer.stamp.String(),
 }
+}
+
+func (config *Config) printRegisteredServers(proxy *Proxy, jsonOutput bool, includeRelays bool) error {
+var summary []ServerSummary
+if jsonOutput {
+summary = make([]ServerSummary, 0, len(proxy.registeredRelays)+len(proxy.registeredServers))
+}
+
+if includeRelays {
+for _, registeredRelay := range proxy.registeredRelays {
+serverSummary := buildRelaySummary(registeredRelay)
 if jsonOutput {
 summary = append(summary, serverSummary)
 } else {
 fmt.Println(serverSummary.Name)
 }
 }
+}
+
+for _, registeredServer := range proxy.registeredServers {
+serverSummary := buildServerSummary(registeredServer)
+if jsonOutput {
+summary = append(summary, serverSummary)
+} else {
+fmt.Println(serverSummary.Name)
+}
+}
+
 if jsonOutput {
 jsonStr, err := json.MarshalIndent(summary, "", " ")
 if err != nil {
@@ -651,20 +661,51 @@ fmt.Print(string(jsonStr))
 return nil
 }
 
-func (config *Config) loadSources(proxy *Proxy) error {
-servers := make([]RegisteredServer, 0, len(config.SourcesConfig)*10)
-for cfgSourceName, cfgSource_ := range config.SourcesConfig {
-cfgSource := cfgSource_
-rand.Shuffle(len(cfgSource.URLs), func(i, j int) {
+func (config *Config) loadSources(proxy *Proxy, configPath string) error {
+g, _ := errgroup.WithContext(context.Background())
+g.SetLimit(MaxSourceLoadConcurrency)
+
+sourcesMu := &sync.Mutex{}
+
+for cfgSourceName, src := range config.SourcesConfig {
+cfgSourceName := cfgSourceName
+cfgSource := src
+
+g.Go(func() error {
+if len(cfgSource.URLs) == 0 {
+if len(cfgSource.URL) == 0 {
+dlog.Debugf("Missing URLs for source [%s]", cfgSourceName)
+return nil
+} else {
+cfgSource.URLs = []string{cfgSource.URL}
+}
+}
+if len(cfgSource.URLs) > 1 {
+r := rand.New(rand.NewSource(time.Now().UnixNano()))
+r.Shuffle(len(cfgSource.URLs), func(i, j int) {
 cfgSource.URLs[i], cfgSource.URLs[j] = cfgSource.URLs[j], cfgSource.URLs[i]
 })
-if err := config.loadSource(proxy, cfgSourceName, &cfgSource); err != nil {
+}
+
+source, err := config.newSourceFromConfig(proxy, cfgSourceName, &cfgSource)
+if err != nil {
 return err
 }
+
+sourcesMu.Lock()
+proxy.sources = append(proxy.sources, source)
+sourcesMu.Unlock()
+return nil
+})
 }
+
+if err := g.Wait(); err != nil {
+return err
+}
+
 relays := make([]RegisteredServer, 0, len(config.StaticsConfig))
-for name, config := range config.StaticsConfig {
-if stamp, err := stamps.NewServerStampFromString(config.Stamp); err == nil {
+for name, staticCfg := range config.StaticsConfig {
+if stamp, err := stamps.NewServerStampFromString(staticCfg.Stamp); err == nil {
 if stamp.Proto == stamps.StampProtoTypeDNSCryptRelay || stamp.Proto == stamps.StampProtoTypeODoHRelay {
 dlog.Debugf("Adding [%s] to the set of available static relays", name)
 registeredServer := RegisteredServer{name: name, stamp: stamp, description: "static relay"}
@@ -673,11 +714,14 @@ relays = append(relays, registeredServer)
 }
 }
 proxy.registeredRelays = relays
+
 if len(config.ServerNames) == 0 {
 for serverName := range config.StaticsConfig {
 config.ServerNames = append(config.ServerNames, serverName)
 }
 }
+
+servers := make([]RegisteredServer, 0, len(config.ServerNames))
 for _, serverName := range config.ServerNames {
 staticConfig, ok := config.StaticsConfig[serverName]
 if !ok {
@@ -693,25 +737,19 @@ return fmt.Errorf("Stamp error for the static [%s] definition: [%v]", serverName
 servers = append(servers, RegisteredServer{name: serverName, stamp: stamp})
 }
 proxy.registeredServers = servers
+
 if err := proxy.updateRegisteredServers(); err != nil {
 return err
 }
 return nil
 }
 
-func (config *Config) loadSource(proxy *Proxy, cfgSourceName string, cfgSource *SourceConfig) error {
-if len(cfgSource.URLs) == 0 {
-if len(cfgSource.URL) == 0 {
-dlog.Debugf("Missing URLs for source [%s]", cfgSourceName)
-} else {
-cfgSource.URLs = []string{cfgSource.URL}
-}
-}
+func (config *Config) newSourceFromConfig(proxy *Proxy, cfgSourceName string, cfgSource *SourceConfig) (*Source, error) {
 if cfgSource.MinisignKeyStr == "" {
-return fmt.Errorf("Missing Minisign key for source [%s]", cfgSourceName)
+return nil, fmt.Errorf("Missing Minisign key for source [%s]", cfgSourceName)
 }
 if cfgSource.CacheFile == "" {
-return fmt.Errorf("Missing cache file for source [%s]", cfgSourceName)
+return nil, fmt.Errorf("Missing cache file for source [%s]", cfgSourceName)
 }
 if cfgSource.FormatStr == "" {
 cfgSource.FormatStr = "v2"
@@ -720,6 +758,7 @@ if cfgSource.RefreshDelay <= 0 {
 cfgSource.RefreshDelay = 72
 }
 cfgSource.RefreshDelay = Min(169, Max(25, cfgSource.RefreshDelay))
+
 source, err := NewSource(
 cfgSourceName,
 proxy.xTransport,
@@ -733,12 +772,11 @@ cfgSource.Prefix,
 if err != nil {
 if len(source.bin) <= 0 {
 dlog.Criticalf("Unable to retrieve source [%s]: [%s]", cfgSourceName, err)
-return err
+return nil, err
 }
 dlog.Infof("Downloading [%s] failed: %v, using cache file to startup", source.name, err)
 }
-proxy.sources = append(proxy.sources, source)
-return nil
+return source, nil
 }
 
 func includesName(names []string, name string) bool {
@@ -750,32 +788,21 @@ return true
 return false
 }
 
-func cdFileDir(fileName string) error {
-return os.Chdir(filepath.Dir(fileName))
-}
-
-func cdLocal() {
-exeFileName, err := os.Executable()
-if err != nil {
-dlog.Warnf(
-"Unable to determine the executable directory: [%s] -- You will need to specify absolute paths in the configuration file",
-err,
-)
-} else if err := os.Chdir(filepath.Dir(exeFileName)); err != nil {
-dlog.Warnf("Unable to change working directory to [%s]: %s", exeFileName, err)
-}
-}
-
 func isIPAndPort(addrStr string) error {
 host, port := ExtractHostAndPort(addrStr, -1)
-if ip := ParseIP(host); ip == nil {
-return fmt.Errorf("Host does not parse as IP '%s'", addrStr)
-} else if port == -1 {
+if port == -1 {
 return fmt.Errorf("Port missing '%s'", addrStr)
-} else if _, err := strconv.ParseUint(strconv.Itoa(port), 10, 16); err != nil {
-return fmt.Errorf("Port does not parse '%s' [%v]", addrStr, err)
-} else if ip.To4() == nil {
-// IPv6 address must use bracket notation to avoid ambiguity
+}
+if port < 0 || port > 65535 {
+return fmt.Errorf("Port out of range '%s' (%d)", addrStr, port)
+}
+
+ip := ParseIP(host)
+if ip == nil {
+return fmt.Errorf("Host does not parse as IP '%s'", addrStr)
+}
+
+if ip.To4() == nil {
 if !strings.HasPrefix(host, "[") || !strings.HasSuffix(host, "]") {
 return fmt.Errorf("IPv6 addresses must use bracket notation, e.g., [%s]:%d", ip.String(), port)
 }
