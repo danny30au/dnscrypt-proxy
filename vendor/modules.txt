@@ -1,4 +1,4 @@
-# codeberg.org/miekg/dns v0.6.22
+# codeberg.org/miekg/dns v0.6.24
 ## explicit; go 1.25.0
 codeberg.org/miekg/dns
 codeberg.org/miekg/dns/deleg
@@ -8,7 +8,7 @@ codeberg.org/miekg/dns/internal/jump
 codeberg.org/miekg/dns/internal/pack
 codeberg.org/miekg/dns/internal/reverse
 codeberg.org/miekg/dns/internal/unpack
-codeberg.org/miekg/dns/pool
+codeberg.org/miekg/dns/pkg/pool
 codeberg.org/miekg/dns/rdata
 codeberg.org/miekg/dns/svcb
 # github.com/BurntSushi/toml v1.6.0
