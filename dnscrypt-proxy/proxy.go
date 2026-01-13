@@ -452,8 +452,8 @@ func (proxy *Proxy) udpListener(clientPc *net.UDPConn) {
         // Optimization: Get buffer from pool instead of make()
         // We use a pointer so we can put the original array pointer back later
         bufPtr := packetBufferPool.Get().(*[]byte)
-        buffer := *bufPtr
         defer packetBufferPool.Put(bufPtr)
+        buffer := *bufPtr
 
         // Note: MaxDNSPacketSize is usually enough, -1 logic from original code preserved if strict
         length, clientAddr, err := clientPc.ReadFrom(buffer[:MaxDNSPacketSize-1])
@@ -779,7 +779,7 @@ func (proxy *Proxy) clientsCountInc() bool {
         return false
     }
 
-func (proxy *Proxy) clientsCountDec()
+func (proxy *Proxy) clientsCountDec() {
     atomic.AddUint32(&proxy.clientsCount, ^uint32(0))
 }
 
@@ -792,7 +792,6 @@ func (proxy *Proxy) getDynamicTimeout() time.Duration {
     utilization := (currentClients * 100) / proxy.maxClients
 
     // Integer lookup table for 1.0 - x^4 curve (0-100% utilization in 10% steps)
-    // Factors scaled by 100
     factors := [...]int{100, 100, 99, 97, 94, 87, 76, 60, 41, 20, 10} 
 
     idx := utilization / 10
@@ -832,8 +831,6 @@ func (proxy *Proxy) processIncomingQuery(
     var serverInfo *ServerInfo
     var serverName string = "-"
 
-    // Apply query plugins with lazy server selection
-    
     // Optimization: Eager server fetch to avoid double-check
     if serverInfo == nil && !onlyCached {
         serverInfo = proxy.serversInfo.getOne()
@@ -842,6 +839,7 @@ func (proxy *Proxy) processIncomingQuery(
         }
     }
 
+    // Apply query plugins
     query, err := pluginsState.ApplyQueryPlugins(
         &proxy.pluginsGlobals,
         query,
