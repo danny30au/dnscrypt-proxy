@@ -28,7 +28,7 @@ var packetBufferPool = sync.Pool{
 }
 
 type Proxy struct {
-    // Hot path fields (better cache locality)
+    // Hot path fields
     serversInfo                   ServersInfo
     xTransport                    *XTransport
     timeout                       time.Duration
@@ -37,8 +37,7 @@ type Proxy struct {
     timeoutLoadReduction          float64
     udpConnPool                   *UDPConnPool
 
-    // Configuration and other fields
-
+    // Configuration
     pluginsGlobals                PluginsGlobals
     questionSizeEstimator         QuestionSizeEstimator
     registeredServers             []RegisteredServer
@@ -494,13 +493,13 @@ func (proxy *Proxy) udpListener(clientPc *net.UDPConn) {
             continue
         }
 
-                go func(bPtr *[]byte, pkt []byte, addr net.Addr, start time.Time) {
-                    // Optimization: avoid capturing loop variables (packet/clientAddr)
-                    defer packetBufferPool.Put(bPtr)
-                    defer proxy.clientsCountDec()
+        go func(bPtr *[]byte, pkt []byte, addr net.Addr, start time.Time) {
+            // Optimization: avoid capturing loop variables (packet/clientAddr)
+            defer packetBufferPool.Put(bPtr)
+            defer proxy.clientsCountDec()
 
-                    proxy.processIncomingQuery("udp", proxy.xTransport.mainProto, pkt, &addr, clientPc, start, false)
-                }(bPtr, packet, clientAddr, time.Now())
+            proxy.processIncomingQuery("udp", proxy.xTransport.mainProto, pkt, &addr, clientPc, start, false)
+        }(bufPtr, packet, clientAddr, time.Now())
     }
 }
 
@@ -809,21 +808,17 @@ func (proxy *Proxy) getDynamicTimeout() time.Duration {
     if proxy.timeoutLoadReduction <= 0.0 || proxy.maxClients == 0 {
         return proxy.timeout
     }
-
+    // Optimization: Integer math instead of float
     currentClients := atomic.LoadUint32(&proxy.clientsCount)
-    utilization := float64(currentClients) / float64(proxy.maxClients)
+    utilization := (currentClients * 100) / proxy.maxClients
 
-    // Use quartic (power 4) curve for slow decrease at low load, sharp decrease near limit
-    utilization4 := utilization * utilization * utilization * utilization
-    factor := 1.0 - (utilization4 * proxy.timeoutLoadReduction)
-    if factor < 0.1 {
-        factor = 0.1
-    }
+    // 1.0 - x^4 curve approx
+    factors := [...]int{100, 100, 99, 97, 94, 87, 76, 60, 41, 20, 10} 
+    idx := utilization / 10
+    if idx > 10 { idx = 10 }
 
-    dynamicTimeout := time.Duration(float64(proxy.timeout) * factor)
-    dlog.Debugf("Dynamic timeout: %v (utilization: %.2f%%, factor: %.2f)", dynamicTimeout, utilization*100, factor)
-
-    return dynamicTimeout
+    factor := factors[idx]
+    return time.Duration((int64(proxy.timeout) * int64(factor)) / 100)
 }
 
 func (proxy *Proxy) processIncomingQuery(
