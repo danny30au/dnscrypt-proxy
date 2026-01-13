@@ -778,6 +778,7 @@ func (proxy *Proxy) clientsCountInc() bool {
         atomic.AddUint32(&proxy.clientsCount, ^uint32(0)) // Decrement if limit reached
         return false
     }
+}
 
 func (proxy *Proxy) clientsCountDec() {
     atomic.AddUint32(&proxy.clientsCount, ^uint32(0))
