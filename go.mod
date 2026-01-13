@@ -25,7 +25,7 @@ require (
 	github.com/kardianos/service v1.2.4
 	github.com/lifenjoiner/dhcpdns v0.0.7
 	github.com/powerman/check v1.9.0
-	github.com/quic-go/quic-go v0.58.0
+	github.com/quic-go/quic-go v0.59.0
 	golang.org/x/crypto v0.47.0
 	golang.org/x/net v0.48.0
 	golang.org/x/sync v0.19.0
