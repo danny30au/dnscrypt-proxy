@@ -40,6 +40,7 @@ jobs:
           go build \
             -mod=mod \
             -trimpath \
+            -ldflags="-s -w -extldflags '-static'" \
             -gcflags="all=-l=4 -B -C -wb=false -d=checkptr=0" \
             -o dnscrypt-proxy \
             ./dnscrypt-proxy
