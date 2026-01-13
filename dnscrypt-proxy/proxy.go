@@ -28,8 +28,18 @@ var packetBufferPool = sync.Pool{
 }
 
 type Proxy struct {
-    pluginsGlobals                PluginsGlobals
+    // Hot path fields (Cache locality optimization)
     serversInfo                   ServersInfo
+    xTransport                    *XTransport
+    timeout                       time.Duration
+    cacheSize                     int
+    clientsCount                  uint32
+    maxClients                    uint32
+    cache                         bool
+    udpConnPool                   *UDPConnPool
+
+    // Configuration and other fields
+    pluginsGlobals                PluginsGlobals
     questionSizeEstimator         QuestionSizeEstimator
     registeredServers             []RegisteredServer
     dns64Resolvers                []string
@@ -48,7 +58,6 @@ type Proxy struct {
     localDoHListenAddresses       []string
     monitoringUI                  MonitoringUIConfig
     monitoringInstance            *MonitoringUI
-    xTransport                    *XTransport
     allWeeklyRanges               *map[string]WeeklyRanges
     routes                        *map[string][]string
     captivePortalMap              *CaptivePortalMap
@@ -83,24 +92,19 @@ type Proxy struct {
     DisabledServerNames           []string
     requiredProps                 stamps.ServerInformalProperties
     certRefreshDelayAfterFailure  time.Duration
-    timeout                       time.Duration
     certRefreshDelay              time.Duration
     certRefreshConcurrency        int
-    cacheSize                     int
     logMaxBackups                 int
     logMaxAge                     int
     logMaxSize                    int
     cacheNegMinTTL                uint32
     rejectTTL                     uint32
     cacheMaxTTL                   uint32
-    clientsCount                  uint32
-    maxClients                    uint32
     timeoutLoadReduction          float64
     cacheMinTTL                   uint32
     cacheNegMaxTTL                uint32
     cloakTTL                      uint32
     cloakedPTR                    bool
-    cache                         bool
     pluginBlockIPv6               bool
     ephemeralKeys                 bool
     pluginBlockUnqualified        bool
@@ -117,7 +121,6 @@ type Proxy struct {
     SourceODoH                    bool
     listenersMu                   sync.Mutex
     ipCryptConfig                 *IPCryptConfig
-    udpConnPool                   *UDPConnPool
 }
 
 func (proxy *Proxy) registerUDPListener(conn *net.UDPConn) {
@@ -450,11 +453,12 @@ func (proxy *Proxy) udpListener(clientPc *net.UDPConn) {
         // We use a pointer so we can put the original array pointer back later
         bufPtr := packetBufferPool.Get().(*[]byte)
         buffer := *bufPtr
+        defer packetBufferPool.Put(bufPtr)
 
         // Note: MaxDNSPacketSize is usually enough, -1 logic from original code preserved if strict
         length, clientAddr, err := clientPc.ReadFrom(buffer[:MaxDNSPacketSize-1])
         if err != nil {
-            packetBufferPool.Put(bufPtr) // Return on error
+            // buffer returned by defer
             return
         }
 
@@ -767,30 +771,16 @@ func (proxy *Proxy) exchangeWithTCPServer(
 
 func (proxy *Proxy) clientsCountInc() bool {
     for {
-        count := atomic.LoadUint32(&proxy.clientsCount)
-        if count >= proxy.maxClients {
-            return false
-        }
-        if atomic.CompareAndSwapUint32(&proxy.clientsCount, count, count+1) {
-            dlog.Debugf("clients count: %d", count+1)
+        old := atomic.AddUint32(&proxy.clientsCount, 1)
+        if old <= proxy.maxClients {
             return true
         }
+        atomic.AddUint32(&proxy.clientsCount, ^uint32(0)) // Decrement if limit reached
+        return false
     }
-}
 
 func (proxy *Proxy) clientsCountDec() {
-    for {
-        count := atomic.LoadUint32(&proxy.clientsCount)
-        if count == 0 {
-            // Already at zero, nothing to do
-            break
-        }
-        if atomic.CompareAndSwapUint32(&proxy.clientsCount, count, count-1) {
-            dlog.Debugf("clients count: %d", count-1)
-            break
-        }
-        // CAS failed, retry with updated count
-    }
+    atomic.AddUint32(&proxy.clientsCount, ^uint32(0))
 }
 
 func (proxy *Proxy) getDynamicTimeout() time.Duration {
@@ -799,19 +789,19 @@ func (proxy *Proxy) getDynamicTimeout() time.Duration {
     }
 
     currentClients := atomic.LoadUint32(&proxy.clientsCount)
-    utilization := float64(currentClients) / float64(proxy.maxClients)
+    utilization := (currentClients * 100) / proxy.maxClients
 
-    // Use quartic (power 4) curve for slow decrease at low load, sharp decrease near limit
-    utilization4 := utilization * utilization * utilization * utilization
-    factor := 1.0 - (utilization4 * proxy.timeoutLoadReduction)
-    if factor < 0.1 {
-        factor = 0.1
+    // Integer lookup table for 1.0 - x^4 curve (0-100% utilization in 10% steps)
+    // Factors scaled by 100
+    factors := [...]int{100, 100, 99, 97, 94, 87, 76, 60, 41, 20, 10} 
+
+    idx := utilization / 10
+    if idx > 10 {
+        idx = 10
     }
 
-    dynamicTimeout := time.Duration(float64(proxy.timeout) * factor)
-    dlog.Debugf("Dynamic timeout: %v (utilization: %.2f%%, factor: %.2f)", dynamicTimeout, utilization*100, factor)
-
-    return dynamicTimeout
+    factor := factors[idx]
+    return time.Duration((int64(proxy.timeout) * int64(factor)) / 100)
 }
 
 func (proxy *Proxy) processIncomingQuery(
@@ -843,23 +833,21 @@ func (proxy *Proxy) processIncomingQuery(
     var serverName string = "-"
 
     // Apply query plugins with lazy server selection
+    
+    // Optimization: Eager server fetch to avoid double-check
+    if serverInfo == nil && !onlyCached {
+        serverInfo = proxy.serversInfo.getOne()
+        if serverInfo != nil {
+            serverName = serverInfo.Name
+        }
+    }
+
     query, err := pluginsState.ApplyQueryPlugins(
         &proxy.pluginsGlobals,
         query,
         func() (*ServerInfo, bool) {
-            // Only get server info once when actually needed
-            if serverInfo == nil {
-                serverInfo = proxy.serversInfo.getOne()
-                if serverInfo != nil {
-                    serverName = serverInfo.Name
-                }
-            }
-            if serverInfo == nil {
-                return nil, false
-            }
-            needsPadding := (serverInfo.Proto == stamps.StampProtoTypeDoH ||
+            return serverInfo, serverInfo != nil && (serverInfo.Proto == stamps.StampProtoTypeDoH ||
                 serverInfo.Proto == stamps.StampProtoTypeTLS)
-            return serverInfo, needsPadding
         },
     )
     if err != nil {
