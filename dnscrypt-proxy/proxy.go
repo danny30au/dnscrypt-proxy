@@ -779,7 +779,7 @@ func (proxy *Proxy) clientsCountInc() bool {
         return false
     }
 
-func (proxy *Proxy) clientsCountDec() {
+func (proxy *Proxy) clientsCountDec()
     atomic.AddUint32(&proxy.clientsCount, ^uint32(0))
 }
 
