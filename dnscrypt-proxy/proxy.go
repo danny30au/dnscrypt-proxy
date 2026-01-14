@@ -28,17 +28,8 @@ var packetBufferPool = sync.Pool{
 }
 
 type Proxy struct {
-    // Hot path fields
-    serversInfo                   ServersInfo
-    xTransport                    *XTransport
-    timeout                       time.Duration
-    clientsCount                  uint32
-    maxClients                    uint32
-    timeoutLoadReduction          float64
-    udpConnPool                   *UDPConnPool
-
-    // Configuration
     pluginsGlobals                PluginsGlobals
+    serversInfo                   ServersInfo
     questionSizeEstimator         QuestionSizeEstimator
     registeredServers             []RegisteredServer
     dns64Resolvers                []string
@@ -57,6 +48,7 @@ type Proxy struct {
     localDoHListenAddresses       []string
     monitoringUI                  MonitoringUIConfig
     monitoringInstance            *MonitoringUI
+    xTransport                    *XTransport
     allWeeklyRanges               *map[string]WeeklyRanges
     routes                        *map[string][]string
     captivePortalMap              *CaptivePortalMap
@@ -91,6 +83,7 @@ type Proxy struct {
     DisabledServerNames           []string
     requiredProps                 stamps.ServerInformalProperties
     certRefreshDelayAfterFailure  time.Duration
+    timeout                       time.Duration
     certRefreshDelay              time.Duration
     certRefreshConcurrency        int
     cacheSize                     int
@@ -100,6 +93,9 @@ type Proxy struct {
     cacheNegMinTTL                uint32
     rejectTTL                     uint32
     cacheMaxTTL                   uint32
+    clientsCount                  uint32
+    maxClients                    uint32
+    timeoutLoadReduction          float64
     cacheMinTTL                   uint32
     cacheNegMaxTTL                uint32
     cloakTTL                      uint32
@@ -121,6 +117,7 @@ type Proxy struct {
     SourceODoH                    bool
     listenersMu                   sync.Mutex
     ipCryptConfig                 *IPCryptConfig
+    udpConnPool                   *UDPConnPool
 }
 
 func (proxy *Proxy) registerUDPListener(conn *net.UDPConn) {
@@ -329,7 +326,7 @@ func (proxy *Proxy) StartProxy() {
                 lastLogTime = time.Now()
             }
 
-            // runtime.GC() // Removed: let the Go runtime manage GC pacing
+            runtime.GC()
         }
     }()
     if len(proxy.serversInfo.registeredServers) > 0 {
@@ -344,23 +341,13 @@ func (proxy *Proxy) StartProxy() {
                 if liveServers > 0 {
                     proxy.certIgnoreTimestamp = false
                 }
-                // runtime.GC() // Removed: let the Go runtime manage GC pacing
+                runtime.GC()
             }
         }()
     }
 }
 
 func (proxy *Proxy) updateRegisteredServers() error {
-    // Optimization: O(1) membership tests for server filters
-    serverNamesMap := make(map[string]struct{}, len(proxy.ServerNames))
-    for _, name := range proxy.ServerNames {
-        serverNamesMap[name] = struct{}{}
-    }
-    disabledServerNamesMap := make(map[string]struct{}, len(proxy.DisabledServerNames))
-    for _, name := range proxy.DisabledServerNames {
-        disabledServerNamesMap[name] = struct{}{}
-    }
-
     for _, source := range proxy.sources {
         registeredServers, err := source.Parse()
         if err != nil {
@@ -379,14 +366,14 @@ func (proxy *Proxy) updateRegisteredServers() error {
             if registeredServer.stamp.Proto != stamps.StampProtoTypeDNSCryptRelay &&
                 registeredServer.stamp.Proto != stamps.StampProtoTypeODoHRelay {
                 if len(proxy.ServerNames) > 0 {
-                    if _, ok := serverNamesMap[registeredServer.name]; !ok {
+                    if !includesName(proxy.ServerNames, registeredServer.name) {
                         continue
                     }
                 } else if registeredServer.stamp.Props&proxy.requiredProps != proxy.requiredProps {
                     continue
                 }
             }
-            if _, ok := disabledServerNamesMap[registeredServer.name]; ok {
+            if includesName(proxy.DisabledServerNames, registeredServer.name) {
                 continue
             }
             if proxy.SourceIPv4 || proxy.SourceIPv6 {
@@ -493,13 +480,13 @@ func (proxy *Proxy) udpListener(clientPc *net.UDPConn) {
             continue
         }
 
-        go func(bPtr *[]byte, pkt []byte, addr net.Addr, start time.Time) {
-            // Optimization: avoid capturing loop variables (packet/clientAddr)
+        go func(bPtr *[]byte) {
+            // Optimization: Return buffer to pool when goroutine finishes
             defer packetBufferPool.Put(bPtr)
             defer proxy.clientsCountDec()
 
-            proxy.processIncomingQuery("udp", proxy.xTransport.mainProto, pkt, &addr, clientPc, start, false)
-        }(bufPtr, packet, clientAddr, time.Now())
+            proxy.processIncomingQuery("udp", proxy.xTransport.mainProto, packet, &clientAddr, clientPc, time.Now(), false)
+        }(bufPtr)
     }
 }
 
@@ -779,46 +766,52 @@ func (proxy *Proxy) exchangeWithTCPServer(
 }
 
 func (proxy *Proxy) clientsCountInc() bool {
-    // Optimization: fast atomic increment with rollback if limit reached
-    newCount := atomic.AddUint32(&proxy.clientsCount, 1)
-    if newCount <= proxy.maxClients {
-        dlog.Debugf("clients count: %d", newCount)
-        return true
+    for {
+        count := atomic.LoadUint32(&proxy.clientsCount)
+        if count >= proxy.maxClients {
+            return false
+        }
+        if atomic.CompareAndSwapUint32(&proxy.clientsCount, count, count+1) {
+            dlog.Debugf("clients count: %d", count+1)
+            return true
+        }
     }
-    atomic.AddUint32(&proxy.clientsCount, ^uint32(0))
-    return false
 }
-
 
 func (proxy *Proxy) clientsCountDec() {
     for {
         count := atomic.LoadUint32(&proxy.clientsCount)
         if count == 0 {
-            return
+            // Already at zero, nothing to do
+            break
         }
         if atomic.CompareAndSwapUint32(&proxy.clientsCount, count, count-1) {
             dlog.Debugf("clients count: %d", count-1)
-            return
+            break
         }
+        // CAS failed, retry with updated count
     }
 }
-
 
 func (proxy *Proxy) getDynamicTimeout() time.Duration {
     if proxy.timeoutLoadReduction <= 0.0 || proxy.maxClients == 0 {
         return proxy.timeout
     }
-    // Optimization: Integer math instead of float
+
     currentClients := atomic.LoadUint32(&proxy.clientsCount)
-    utilization := (currentClients * 100) / proxy.maxClients
+    utilization := float64(currentClients) / float64(proxy.maxClients)
 
-    // 1.0 - x^4 curve approx
-    factors := [...]int{100, 100, 99, 97, 94, 87, 76, 60, 41, 20, 10} 
-    idx := utilization / 10
-    if idx > 10 { idx = 10 }
+    // Use quartic (power 4) curve for slow decrease at low load, sharp decrease near limit
+    utilization4 := utilization * utilization * utilization * utilization
+    factor := 1.0 - (utilization4 * proxy.timeoutLoadReduction)
+    if factor < 0.1 {
+        factor = 0.1
+    }
 
-    factor := factors[idx]
-    return time.Duration((int64(proxy.timeout) * int64(factor)) / 100)
+    dynamicTimeout := time.Duration(float64(proxy.timeout) * factor)
+    dlog.Debugf("Dynamic timeout: %v (utilization: %.2f%%, factor: %.2f)", dynamicTimeout, utilization*100, factor)
+
+    return dynamicTimeout
 }
 
 func (proxy *Proxy) processIncomingQuery(
