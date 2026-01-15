@@ -68,57 +68,25 @@ return newPacket, nil
 }
 
 // ReadPrefixed - OPTIMIZED: Start with smaller buffer, grow only if needed
+// ReadPrefixed reads a 2-byte big-endian length prefix, then reads that many bytes.
+// This avoids incremental buffer growth/copying.
 func ReadPrefixed(conn *net.Conn) ([]byte, error) {
-buf := make([]byte, 512) // Start small instead of 4KB
-packetLength, pos := -1, 0
-for {
-if pos >= len(buf) {
-// Only resize if we hit the limit
-if len(buf) >= 2+MaxDNSPacketSize {
-return buf, errors.New("Packet too large")
-}
-newBuf := make([]byte, min(len(buf)*2, 2+MaxDNSPacketSize))
-copy(newBuf, buf)
-buf = newBuf
-}
-readnb, err := (*conn).Read(buf[pos:])
-if err != nil {
-return buf[:pos], err
-}
-pos += readnb
-if pos >= 2 && packetLength < 0 {
-packetLength = int(binary.BigEndian.Uint16(buf[0:2]))
-if packetLength > MaxDNSPacketSize-1 {
-return buf, errors.New("Packet too large")
-}
-if packetLength < MinDNSPacketSize {
-return buf, errors.New("Packet too short")
-}
-// Ensure buffer is large enough for expected packet
-if 2+packetLength > len(buf) {
-newBuf := make([]byte, 2+packetLength)
-copy(newBuf, buf[:pos])
-buf = newBuf
-}
-}
-if packetLength >= 0 && pos >= 2+packetLength {
-return buf[2 : 2+packetLength], nil
-}
-}
-}
-
-func Min(a, b int) int {
-if a < b {
-return a
-}
-return b
-}
-
-func Max(a, b int) int {
-if a > b {
-return a
-}
-return b
+    lenBuf := make([]byte, 2)
+    if _, err := io.ReadFull(*conn, lenBuf); err != nil {
+        return nil, err
+    }
+    packetLength := int(binary.BigEndian.Uint16(lenBuf))
+    if packetLength > MaxDNSPacketSize-1 {
+        return nil, errors.New("Packet too large")
+    }
+    if packetLength < MinDNSPacketSize {
+        return nil, errors.New("Packet too short")
+    }
+    packet := make([]byte, packetLength)
+    if _, err := io.ReadFull(*conn, packet); err != nil {
+        return nil, err
+    }
+    return packet, nil
 }
 
 func min(a, b int) int {
@@ -154,101 +122,80 @@ r[i], r[j] = r[j], r[i]
 return string(r)
 }
 
+func isWhitespace(b byte) bool { return b == ' ' || b == '\t' || b == '\n' || b == '\r' }
+
 // StringTwoFields - OPTIMIZED: Single pass with manual trimming
 func StringTwoFields(str string) (string, string, bool) {
-if len(str) < 3 {
-return "", "", false
+    if len(str) < 3 {
+        return "", "", false
+    }
+
+    i := 0
+    for i < len(str) && !isWhitespace(str[i]) {
+        i++
+    }
+    if i == len(str) || i == 0 {
+        return "", "", false
+    }
+    a := str[:i]
+
+    j := i
+    for j < len(str) && isWhitespace(str[j]) {
+        j++
+    }
+    if j >= len(str) {
+        return "", "", false
+    }
+
+    k := len(str) - 1
+    for k > j && isWhitespace(str[k]) {
+        k--
+    }
+
+    b := str[j : k+1]
+    if len(b) == 0 {
+        return "", "", false
+    }
+    return a, b, true
 }
 
-// Find first whitespace
-var i int
-for i = 0; i < len(str); i++ {
-if str[i] == ' ' || str[i] == '\t' || str[i] == '\n' || str[i] == '\r' {
-break
-}
-}
-
-if i == len(str) || i == 0 {
-return "", "", false
-}
-
-a := str[:i]
-
-// Skip whitespace
-var j int
-for j = i; j < len(str); j++ {
-if str[j] != ' ' && str[j] != '\t' && str[j] != '\n' && str[j] != '\r' {
-break
-}
-}
-
-if j >= len(str) {
-return "", "", false
-}
-
-// Trim trailing whitespace from b
-k := len(str) - 1
-for k > j && (str[k] == ' ' || str[k] == '\t' || str[k] == '\n' || str[k] == '\r') {
-k--
-}
-
-b := str[j : k+1]
-if len(b) == 0 {
-return "", "", false
-}
-
-return a, b, true
-}
-
-func StringQuote(str string) string {
+func StringQuote(str string) string {(str string) string {
 str = strconv.QuoteToGraphic(str)
 return str[1 : len(str)-1]
 }
 
 // StringStripSpaces - OPTIMIZED: Use strings.Builder for better performance
 func StringStripSpaces(str string) string {
-var buf strings.Builder
-buf.Grow(len(str))
-for _, r := range str {
-if !unicode.IsSpace(r) {
-buf.WriteRune(r)
-}
-}
-return buf.String()
+    var buf strings.Builder
+    buf.Grow(len(str))
+
+    for i := 0; i < len(str); i++ {
+        b := str[i]
+        if b > ' ' && b != '	' && b != '
+' && b != '' {
+            buf.WriteByte(b)
+            continue
+        }
+        if !unicode.IsSpace(rune(b)) {
+            buf.WriteRune(rune(b))
+        }
+    }
+    return buf.String()
 }
 
 // TrimAndStripInlineComments - OPTIMIZED: Single pass with index tracking
 func TrimAndStripInlineComments(str string) string {
-// Find last # preceded by space or tab
-idx := -1
-for i := len(str) - 1; i >= 0; i-- {
-if str[i] == '#' {
-if i == 0 {
-return ""
-}
-if str[i-1] == ' ' || str[i-1] == '\t' {
-idx = i - 1
-break
-}
-}
-}
-
-if idx >= 0 {
-str = str[:idx]
-}
-
-// Trim whitespace manually
-start := 0
-for start < len(str) && (str[start] == ' ' || str[start] == '\t' || str[start] == '\n' || str[start] == '\r') {
-start++
-}
-
-end := len(str)
-for end > start && (str[end-1] == ' ' || str[end-1] == '\t' || str[end-1] == '\n' || str[end-1] == '\r') {
-end--
-}
-
-return str[start:end]
+    idx := -1
+    for i := len(str) - 1; i > 0; i-- {
+        if str[i] == '#' && isWhitespace(str[i-1]) {
+            idx = i - 1
+            break
+        }
+    }
+    if idx >= 0 {
+        str = str[:idx]
+    }
+    return strings.TrimFunc(str, unicode.IsSpace)
 }
 
 // ExtractHostAndPort parses a string containing a host and optional port.
@@ -287,17 +234,17 @@ func isDigit(b byte) bool { return b >= '0' && b <= '9' }
 
 // ExtractClientIPStr extracts client IP string from pluginsState based on protocol
 func ExtractClientIPStr(pluginsState *PluginsState) (string, bool) {
-if pluginsState.clientAddr == nil {
-return "", false
-}
-switch pluginsState.clientProto {
-case "udp":
-return (*pluginsState.clientAddr).(*net.UDPAddr).IP.String(), true
-case "tcp", "local_doh":
-return (*pluginsState.clientAddr).(*net.TCPAddr).IP.String(), true
-default:
-return "", false
-}
+    if pluginsState.clientAddr == nil {
+        return "", false
+    }
+    switch addr := (*pluginsState.clientAddr).(type) {
+    case *net.UDPAddr:
+        return addr.IP.String(), true
+    case *net.TCPAddr:
+        return addr.IP.String(), true
+    default:
+        return "", false
+    }
 }
 
 // ExtractClientIPStrEncrypted extracts and optionally encrypts client IP string
