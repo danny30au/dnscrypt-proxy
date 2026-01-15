@@ -23,27 +23,19 @@ const (
 )
 
 func A(s *cryptobyte.String) (netip.Addr, error) {
-	in := make([]byte, net.IPv4len)
-	if !s.CopyBytes(in) {
+	var in []byte
+	if !s.ReadBytes(&in, net.IPv4len) {
 		return netip.Addr{}, &Error{"overflow A"}
 	}
-	ip, ok := netip.AddrFromSlice(in)
-	if !ok {
-		return netip.Addr{}, &Error{"invalid A"}
-	}
-	return ip, nil
+	return netip.AddrFrom4(*(*[4]byte)(in)), nil
 }
 
 func AAAA(s *cryptobyte.String) (netip.Addr, error) {
-	in := make([]byte, net.IPv6len)
-	if !s.CopyBytes(in) {
+	var in []byte
+	if !s.ReadBytes(&in, net.IPv6len) {
 		return netip.Addr{}, &Error{"overflow AAAA"}
 	}
-	ip, ok := netip.AddrFromSlice(in)
-	if !ok {
-		return netip.Addr{}, &Error{"invalid AAAA"}
-	}
-	return ip, nil
+	return netip.AddrFrom16(*(*[16]byte)(in)), nil
 }
 
 // See [pack.StringAny].
@@ -138,10 +130,11 @@ func Name(s *cryptobyte.String, msgBuf []byte) (string, error) {
 			if len(name)+int(c)+1 > maxNamePresentationLength {
 				return "", &Error{"name exceeded max wire-format octets: " + string(*s)}
 			}
-			var label []byte
-			cs.ReadBytes(&label, int(c))
-			name = append(name, label...)
-			name = append(name, '.')
+
+			ln := len(name)
+			name = name[:ln+int(c)+1]          // extend slice
+			cs.CopyBytes(name[ln : ln+int(c)]) // copy label into correct place
+			name[ln+int(c)] = '.'
 
 		case 0xC0: // pointer
 			if msgBuf == nil {
