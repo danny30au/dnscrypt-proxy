@@ -86,6 +86,20 @@ func ReadPrefixed(conn *net.Conn) ([]byte, error) {
     return packet, nil
 }
 
+func Min(a, b int) int {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+func Max(a, b int) int {
+    if a > b {
+        return a
+    }
+    return b
+}
+
 func min(a, b int) int {
     if a < b {
         return a
