@@ -25,12 +25,12 @@ var ID = id
 
 // id returns a 16 bits random number to be used as a message id. The random provided should be good enough.
 func id() uint16 {
-	var output uint16
-	err := binary.Read(rand.Reader, binary.BigEndian, &output)
+	var b [2]byte
+	_, err := rand.Read(b[:])
 	if err != nil {
 		panic("dns: reading random ID failed: " + err.Error())
 	}
-	return output
+	return uint16(b[0])<<8 | uint16(b[1])
 }
 
 // ClassToString is a maps Classes to strings for each CLASS wire type.
