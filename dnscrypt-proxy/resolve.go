@@ -25,7 +25,6 @@ type Resolver struct {
 	transport *dns.Transport
 	client    *dns.Client
 	ecsOpt    *dns.SUBNET // pre-built ECS option
-	msgPool   sync.Pool   // Reuse *dns.Msg across queries
 }
 
 // NewResolver creates a reusable resolver instance with optimized pooling
@@ -58,27 +57,23 @@ func NewResolver(server string, sendClientSubnet bool) *Resolver {
 		transport: tr,
 		client:    c,
 		ecsOpt:    ecs,
-		msgPool: sync.Pool{
-			New: func() interface{} {
-				return &dns.Msg{}
-			},
-		},
 	}
 }
 
 // resolveQuery performs a DNS query with automatic TCP fallback on truncation
-// Optimized: reuses message objects, better timeout handling, reduced allocations
+// Optimized: better timeout handling, reduced allocations
 func (r *Resolver) resolveQuery(ctx context.Context, qName string, qType uint16, useECS bool) (*dns.Msg, error) {
-	msg := r.msgPool.Get().(*dns.Msg)
-	defer r.msgPool.Put(msg)
-	msg.SetQuestion(qName, qType)
+	msg := dns.NewMsg(qName, qType)
+	if msg == nil {
+		return nil, fmt.Errorf("unsupported DNS record type: %d", qType)
+	}
 	msg.RecursionDesired = true
 	msg.Opcode = dns.OpcodeQuery
 	msg.UDPSize = uint16(MaxDNSPacketSize)
 	msg.Security = true
 
 	if useECS && r.ecsOpt != nil {
-		msg.Pseudo = append(msg.Pseudo[:0], r.ecsOpt) // Reuse slice capacity
+		msg.Pseudo = append(msg.Pseudo, r.ecsOpt)
 	}
 
 	udpTimeout := r.transport.ReadTimeout
