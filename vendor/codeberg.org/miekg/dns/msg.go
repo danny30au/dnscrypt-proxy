@@ -267,21 +267,15 @@ func (m *Msg) Pack() error {
 			}
 		}
 	}
-	m.ps = 0
 
 	// records that really need to be last, TSIG or SGI0
 	for i := range m.Pseudo {
-		if _, ok := m.Pseudo[i].(*TSIG); ok {
+		_, ok1 := m.Pseudo[i].(*TSIG)
+		_, ok2 := m.Pseudo[i].(*SIG)
+		if ok1 || ok2 {
 			if _, off, err = packRR(m.Pseudo[i], m.Data, off, compression); err != nil {
 				return err
 			}
-			m.ps++
-		}
-		if _, ok := m.Pseudo[i].(*SIG); ok {
-			if _, off, err = packRR(m.Pseudo[i], m.Data, off, compression); err != nil {
-				return err
-			}
-			m.ps++
 		}
 	}
 	m.Data = m.Data[:off]
@@ -379,50 +373,40 @@ func (m *Msg) unpack(dh header, msg, msgBuf []byte) error {
 		return err
 	}
 
-	m.Pseudo, m.Stateful = nil, nil // we append here, so don't want carry stuff from before with us
-
 	// Check for the OPT RR and remove it entirely, unpack the OPT for option codes and put those in the Pseudo
-	// section. Any TSIG and SIG0 records will also be put in the pseudo section, but after the options.
-	j := 0
-	for i := 0; i < len(m.Extra)-j; i++ {
+	// section. We will only check one OPT, any others will be left in Extra.
+	for i := 0; i < len(m.Extra); i++ {
 		if opt, ok := m.Extra[i].(*OPT); ok {
-			// move to end, so it can be removed later and unpack the opt for the settings.
 			m.Security = opt.Security()
 			m.CompactAnswers = opt.CompactAnswers()
 			m.Delegation = opt.Delegation()
 			m.Rcode += opt.Rcode() // See TestMsgExtendedRcode.
 			m.Version = opt.Version()
-			m.UDPSize = max(
-				// RFC 6891 mandates that the payload size in an OPT record less than 512 (MinMsgSize) bytes must be treated as equal to 512 bytes.
-				opt.UDPSize(), MinMsgSize)
+			// RFC 6891 mandates that the payload size in an OPT record less than 512 (MinMsgSize) bytes must be treated as equal to 512 bytes.
+			m.UDPSize = max(opt.UDPSize(), MinMsgSize)
 
-			m.Pseudo = make([]RR, len(opt.Options))
+			m.Pseudo = make([]RR, len(opt.Options), len(opt.Options)+1) // +1 for tsig/sig zero, avoid 2x in a append
 			for i := range opt.Options {
 				m.Pseudo[i] = RR(opt.Options[i])
 			}
+			m.Extra[i] = m.Extra[len(m.Extra)-1] // opt's place taken with last rr
+			m.Extra = m.Extra[:len(m.Extra)-1]   // remove the OPT RR
 
-			m.Extra[len(m.Extra)-j-1] = m.Extra[i]
-			j++
+			break
 		}
 	}
-	// remove the OPT RR
-	m.Extra = m.Extra[:len(m.Extra)-j]
-	m.ps = 0
 
 	// Check for m.Extra TSIG and SIG(0) and move them to pseudo. This MUST be the the last RR in the extra section.
-	// Now we should also error out on having these both. TODO(miek): flag protocol error?
-	if last := len(m.Extra); last > 0 {
-		if _, ok := m.Extra[last-1].(*TSIG); ok {
-			m.ps++
-			m.Pseudo = append(m.Pseudo, m.Extra[last-1])
-			m.Extra = m.Extra[:last-1]
-		}
-	}
-	if last := len(m.Extra); last > 0 {
-		if _, ok := m.Extra[last-1].(*SIG); ok {
-			m.ps++
-			m.Pseudo = append(m.Pseudo, m.Extra[last-1])
-			m.Extra = m.Extra[:last-1]
+	// But as we may have moved things around, we need to iterate over m.Extra again.
+	for i := 0; i < len(m.Extra); i++ {
+		_, ok1 := m.Extra[i].(*TSIG)
+		_, ok2 := m.Extra[i].(*SIG)
+		if ok1 || ok2 {
+			m.Pseudo = append(m.Pseudo, m.Extra[i])
+			m.Extra[i] = m.Extra[len(m.Extra)-1] // sig/tsig's place taken with last rr
+			m.Extra = m.Extra[:len(m.Extra)-1]   // remove the sig/tsig RR
+
+			break
 		}
 	}
 
@@ -734,7 +718,7 @@ func (m *Msg) WriteTo(w io.Writer) (int64, error) {
 			n, _, err := sock.WriteMsgUDP(m.Data, oob, sess.Addr)
 			if m.msgPool != nil && !m.hijacked.Load() {
 				m.msgPool.Put(m.Data)
-				m.Data = nil
+				m.Data, m.msgPool = nil, nil
 			}
 			return int64(n), err
 		}
@@ -742,7 +726,7 @@ func (m *Msg) WriteTo(w io.Writer) (int64, error) {
 		n, err := r.Conn().Write(m.Data)
 		if m.msgPool != nil && !m.hijacked.Load() {
 			m.msgPool.Put(m.Data)
-			m.Data = nil
+			m.Data, m.msgPool = nil, nil
 		}
 		return int64(n), err
 	}
@@ -753,7 +737,7 @@ func (m *Msg) WriteTo(w io.Writer) (int64, error) {
 	n, err := r.Write(l)
 	if m.msgPool != nil && !m.hijacked.Load() {
 		m.msgPool.Put(m.Data)
-		m.Data = nil
+		m.Data, m.msgPool = nil, nil
 	}
 	return int64(n), err
 }
@@ -833,11 +817,6 @@ func (m *Msg) RRs() iter.Seq[RR] {
 					return
 				}
 			}
-			for i := range m.Stateful {
-				if !yield(m.Stateful[i]) {
-					return
-				}
-			}
 			break
 		}
 	}
@@ -850,16 +829,12 @@ func (m *Msg) RRs() iter.Seq[RR] {
 func (m *Msg) Copy() *Msg {
 	return &Msg{
 		MsgHeader: m.MsgHeader,
-		qtype:     m.qtype,
 		Question:  m.Question,
 		Answer:    m.Answer,
 		Ns:        m.Ns,
 		Extra:     m.Extra,
-		ps:        m.ps,
 		Pseudo:    m.Pseudo,
-		Stateful:  m.Stateful,
 		Data:      m.Data,
-		Options:   m.Options,
 		msgPool:   m.msgPool,
 	}
 }
