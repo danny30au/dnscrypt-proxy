@@ -23,13 +23,6 @@ return new(dns.Msg)
 },
 }
 
-var bufferPool = sync.Pool{
-New: func() interface{} {
-buf := make([]byte, MaxDNSPacketSize)
-return &buf
-},
-}
-
 func GetMsg() *dns.Msg {
 return msgPool.Get().(*dns.Msg)
 }
@@ -55,14 +48,6 @@ m.Pseudo = ps
 m.Data = data
 
 msgPool.Put(m)
-}
-
-func getBuffer() *[]byte {
-return bufferPool.Get().(*[]byte)
-}
-
-func putBuffer(buf *[]byte) {
-bufferPool.Put(buf)
 }
 
 var (
@@ -570,17 +555,17 @@ if _, err := pc.Write(binQuery); err != nil {
 return DNSExchangeResponse{err: err}
 }
 
-buf := getBuffer()
+buf := getBuffer(MaxDNSPacketSize)
 defer putBuffer(buf)
 
-length, err := pc.Read(*buf)
+length, err := pc.Read(buf)
 if err != nil {
 return DNSExchangeResponse{err: err}
 }
 rtt = time.Since(now)
 
 packet = make([]byte, length)
-copy(packet, (*buf)[:length])
+copy(packet, buf[:length])
 } else {
 if err := query.Pack(); err != nil {
 return DNSExchangeResponse{err: err}
