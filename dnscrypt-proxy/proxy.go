@@ -5,8 +5,6 @@ import (
     crypto_rand "crypto/rand"
     "encoding/binary"
     "net"
-    "net/http"
-    _ "net/http/pprof"
     "os"
     "runtime"
     "strings"
@@ -14,7 +12,6 @@ import (
     "sync/atomic"
     "time"
 
-    "github.com/felixge/fgprof"
     "github.com/jedisct1/dlog"
     clocksmith "github.com/jedisct1/go-clocksmith"
     stamps "github.com/jedisct1/go-dnsstamps"
@@ -293,18 +290,6 @@ func (proxy *Proxy) StartProxy() {
             }
         }
     }
-
-    
-    // Start pprof and fgprof profiling server on localhost:6060
-    go func() {
-        http.DefaultServeMux.Handle("/debug/fgprof", fgprof.Handler())
-        dlog.Noticef("Starting profiling server on localhost:6060")
-        dlog.Noticef("pprof available at: http://localhost:6060/debug/pprof/")
-        dlog.Noticef("fgprof available at: http://localhost:6060/debug/fgprof")
-        if err := http.ListenAndServe("localhost:6060", nil); err != nil {
-            dlog.Errorf("Failed to start profiling server: %v", err)
-        }
-    }()
 
     proxy.startAcceptingClients()
     if !proxy.child {
