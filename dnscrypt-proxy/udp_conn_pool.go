@@ -78,7 +78,7 @@ s := make([]*net.UDPConn, 0, 64)
 return &s
 }
 
-for i := range p.shards {
+for i := range pool.shards {
 shard := &pool.shards[i]
 shard.conns = make(map[unique.Handle[connKey]][]pooledConn, 64)
 shard.connPool.New = func() interface{} {
