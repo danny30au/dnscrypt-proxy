@@ -2,9 +2,11 @@ package main
 
 import (
 "bytes"
+"crypto/tls"
 "encoding/binary"
 "errors"
 "net"
+"net/http"
 "net/netip"
 "strings"
 "sync"
@@ -15,12 +17,119 @@ import (
 "codeberg.org/miekg/dns"
 "codeberg.org/miekg/dns/rdata"
 "github.com/jedisct1/dlog"
+"golang.org/x/net/http2"
 )
 
 var msgPool = sync.Pool{
 New: func() interface{} {
 return new(dns.Msg)
 },
+}
+
+var httpTransport = &http.Transport{
+MaxIdleConns:          200,
+MaxIdleConnsPerHost:   100,
+MaxConnsPerHost:       100,
+IdleConnTimeout:       90 * time.Second,
+TLSHandshakeTimeout:   10 * time.Second,
+ExpectContinueTimeout: 1 * time.Second,
+DisableKeepAlives:     false,
+DisableCompression:    true,
+ForceAttemptHTTP2:     true,
+TLSClientConfig: &tls.Config{
+MinVersion:         tls.VersionTLS12,
+ClientSessionCache: tls.NewLRUClientSessionCache(128),
+},
+}
+
+var http2Transport *http2.Transport
+
+var tcpConnPool = struct {
+sync.RWMutex
+conns map[string][]*tcpConnWrapper
+}{
+conns: make(map[string][]*tcpConnWrapper),
+}
+
+type tcpConnWrapper struct {
+conn     net.Conn
+lastUsed time.Time
+}
+
+func init() {
+http2.ConfigureTransport(httpTransport)
+http2Transport = &http2.Transport{
+TLSClientConfig: &tls.Config{
+MinVersion:         tls.VersionTLS12,
+ClientSessionCache: tls.NewLRUClientSessionCache(128),
+},
+AllowHTTP:           false,
+DisableCompression:  true,
+MaxReadFrameSize:    262144,
+ReadIdleTimeout:     30 * time.Second,
+PingTimeout:         15 * time.Second,
+}
+
+go connectionPoolCleaner()
+}
+
+func connectionPoolCleaner() {
+ticker := time.NewTicker(30 * time.Second)
+defer ticker.Stop()
+
+for range ticker.C {
+tcpConnPool.Lock()
+now := time.Now()
+for addr, conns := range tcpConnPool.conns {
+var kept []*tcpConnWrapper
+for _, c := range conns {
+if now.Sub(c.lastUsed) < 60*time.Second {
+kept = append(kept, c)
+} else {
+c.conn.Close()
+}
+}
+if len(kept) > 0 {
+tcpConnPool.conns[addr] = kept
+} else {
+delete(tcpConnPool.conns, addr)
+}
+}
+tcpConnPool.Unlock()
+}
+}
+
+func getTCPConn(addr string, timeout time.Duration) (net.Conn, bool, error) {
+tcpConnPool.Lock()
+conns := tcpConnPool.conns[addr]
+if len(conns) > 0 {
+wrapper := conns[len(conns)-1]
+tcpConnPool.conns[addr] = conns[:len(conns)-1]
+tcpConnPool.Unlock()
+wrapper.lastUsed = time.Now()
+return wrapper.conn, true, nil
+}
+tcpConnPool.Unlock()
+
+conn, err := net.DialTimeout("tcp", addr, timeout)
+return conn, false, err
+}
+
+func putTCPConn(addr string, conn net.Conn) {
+tcpConnPool.Lock()
+defer tcpConnPool.Unlock()
+
+wrapper := &tcpConnWrapper{
+conn:     conn,
+lastUsed: time.Now(),
+}
+
+conns := tcpConnPool.conns[addr]
+if len(conns) < 10 {
+tcpConnPool.conns[addr] = append(conns, wrapper)
+} else {
+conn.Close()
+}
 }
 
 func GetMsg() *dns.Msg {
@@ -582,31 +691,45 @@ upstreamAddr = relay.RelayTCPAddr
 }
 now := time.Now()
 var pc net.Conn
+var reused bool
 proxyDialer := proxy.xTransport.proxyDialer
 if proxyDialer == nil {
-pc, err = net.DialTimeout("tcp", upstreamAddr.String(), proxy.timeout)
+pc, reused, err = getTCPConn(upstreamAddr.String(), proxy.timeout)
 } else {
 pc, err = (*proxyDialer).Dial("tcp", tcpAddr.String())
 }
 if err != nil {
 return DNSExchangeResponse{err: err}
 }
-defer pc.Close()
+
+shouldPool := proxyDialer == nil && !reused
+
 if err := pc.SetDeadline(time.Now().Add(proxy.timeout)); err != nil {
+pc.Close()
 return DNSExchangeResponse{err: err}
 }
 binQuery, err = PrefixWithSize(binQuery)
 if err != nil {
+pc.Close()
 return DNSExchangeResponse{err: err}
 }
 if _, err := pc.Write(binQuery); err != nil {
+pc.Close()
 return DNSExchangeResponse{err: err}
 }
 packet, err = ReadPrefixed(&pc)
 if err != nil {
+pc.Close()
 return DNSExchangeResponse{err: err}
 }
 rtt = time.Since(now)
+
+if shouldPool {
+pc.SetDeadline(time.Time{})
+putTCPConn(upstreamAddr.String(), pc)
+} else {
+pc.Close()
+}
 }
 msg := dns.Msg{Data: packet}
 if err := msg.Unpack(); err != nil {
