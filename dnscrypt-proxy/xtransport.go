@@ -332,7 +332,7 @@ func (xTransport *XTransport) rebuildTransport() {
         MaxConnsPerHost:        4,
         IdleConnTimeout:        60 * time.Second,
         ResponseHeaderTimeout:  timeout,
-        ExpectContinueTimeout:  0, // Disabled
+        ExpectContinueTimeout:  0,
         ForceAttemptHTTP2:      true,
         MaxResponseHeaderBytes: 16 * 1024,
         DialContext: func(ctx context.Context, network, addrStr string) (net.Conn, error) {
@@ -362,13 +362,12 @@ func (xTransport *XTransport) rebuildTransport() {
 
             dial := func(address string) (net.Conn, error) {
                 if xTransport.proxyDialer == nil {
-                    // Optimized dialer with 15s KeepAlive
-                    dialer := &net.Dialer{
-                        Timeout:   timeout, 
-                        KeepAlive: 15 * time.Second, 
-                        DualStack: true,
-                    }
-                    return diale// Happy Eyeballs V2: Race connections with 150ms delay
+                    dialer := &net.Dialer{Timeout: timeout, KeepAlive: 15 * time.Second, DualStack: true}
+                    return dialer.DialContext(ctx, network, address)
+                }
+                return (*xTransport.proxyDialer).Dial(network, address)
+            }
+            // Happy Eyeballs: race targets with 150ms delay
             type dialResult struct {
                 conn net.Conn
                 err  error
@@ -383,7 +382,6 @@ func (xTransport *XTransport) rebuildTransport() {
                 go func(i int, target string) {
                     if i > 0 {
                         select {
-                        // Aggressive 150ms delay (RFC 8305 recommends 100-250ms)
                         case <-time.After(time.Duration(i) * 150 * time.Millisecond):
                         case <-done:
                             return
@@ -391,14 +389,17 @@ func (xTransport *XTransport) rebuildTransport() {
                             return
                         }
                     }
-
                     conn, err := dial(target)
                     select {
-                    case ch <- dialResult{conn, err}:
+                    case ch <- dialResult{conn: conn, err: err}:
                     case <-done:
-                        if conn != nil { conn.Close() }
+                        if conn != nil {
+                            _ = conn.Close()
+                        }
                     case <-dialCtx.Done():
-                        if conn != nil { conn.Close() }
+                        if conn != nil {
+                            _ = conn.Close()
+                        }
                     }
                 }(i, target)
             }
@@ -411,18 +412,8 @@ func (xTransport *XTransport) rebuildTransport() {
                         return res.conn, nil
                     }
                     lastErr = res.err
-                    dlog.Debugf("Happy Eyeballs dial attempt failed: %v", res.err)
                 case <-ctx.Done():
                     return nil, ctx.Err()
-                }
-            }
-            return nil, lastErr, err := dial(target)
-                if err == nil {
-                    return conn, nil
-                }
-                lastErr = err
-                if idx < len(targets)-1 {
-                    dlog.Debugf("Dial attempt using [%s] failed: %v", target, err)
                 }
             }
             return nil, lastErr
@@ -670,86 +661,37 @@ func (xTransport *XTransport) resolveUsingServers(
     if len(resolvers) == 0 {
         return nil, 0, errors.New("Empty resolvers")
     }
-    if len(resolvers) == 1 {
-        // Fast path for single resolver
-        var lastErr error
-        resolver := resolvers[0]
+    var lastErr error
+    for i, resolver := range resolvers {
         delay := resolverRetryInitialBackoff
         for attempt := 1; attempt <= resolverRetryCount; attempt++ {
             ips, ttl, err = xTransport.resolveUsingResolver(proto, host, resolver, returnIPv4, returnIPv6)
             if err == nil && len(ips) > 0 {
+                if i > 0 {
+                    dlog.Infof("Resolution succeeded with resolver %s[%s]", proto, resolver)
+                    resolvers[0], resolvers[i] = resolvers[i], resolvers[0]
+                }
                 return ips, ttl, nil
             }
+            if err == nil {
+                err = errors.New("no IP addresses returned")
+            }
             lastErr = err
+            dlog.Debugf("Resolver attempt %d failed for [%s] using [%s] (%s): %v", attempt, host, resolver, proto, err)
             if attempt < resolverRetryCount {
                 time.Sleep(delay)
-                delay *= 2
-                if delay > resolverRetryMaxBackoff {
-                     delay = resolverRetryMaxBackoff
-                }
-            }
-        }
-        return nil, 0, lastErr
-    }
-
-    // Parallel resolution for multiple resolvers
-    type resolveResult struct {
-        ips []net.IP
-        ttl time.Duration
-        err error
-    }
-    ch := make(chan resolveResult, len(resolvers))
-    ctx, cancel := context.WithCancel(context.Background())
-    defer cancel()
-
-    for _, resolver := range resolvers {
-        go func(r string) {
-            var ips []net.IP
-            var ttl time.Duration
-            var err error
-
-            delay := resolverRetryInitialBackoff
-            for attempt := 1; attempt <= resolverRetryCount; attempt++ {
-                if ctx.Err() != nil {
-                    return
-                }
-                ips, ttl, err = xTransport.resolveUsingResolver(proto, host, r, returnIPv4, returnIPv6)
-                if err == nil && len(ips) > 0 {
-                    select {
-                    case ch <- resolveResult{ips, ttl, nil}:
-                    case <-ctx.Done():
-                    }
-                    return
-                }
-
-                if attempt < resolverRetryCount {
-                    select {
-                    case <-time.After(delay):
-                    case <-ctx.Done():
-                        return
-                    }
+                if delay < resolverRetryMaxBackoff {
                     delay *= 2
                     if delay > resolverRetryMaxBackoff {
                         delay = resolverRetryMaxBackoff
                     }
                 }
             }
-            // Only report error if all attempts fail
-            select {
-            case ch <- resolveResult{nil, 0, err}:
-            case <-ctx.Done():
-            }
-        }(resolver)
-    }
-
-    var lastErr error
-
-    for i := 0; i < len(resolvers); i++ {
-        res := <-ch
-        if res.err == nil {
-            return res.ips, res.ttl, nil
         }
-        lastErr = res.err
+        dlog.Infof("Unable to resolve [%s] using resolver [%s] (%s): %v", host, resolver, proto, lastErr)
+    }
+    if lastErr == nil {
+        lastErr = errors.New("no IP addresses returned")
     }
     return nil, 0, lastErr
 }
@@ -890,14 +832,11 @@ func (xTransport *XTransport) Fetch(
             dlog.Debugf("Probing HTTP/3 transport for [%s]", url.Host)
         } else {
             xTransport.altSupport.RLock()
-            item, hasAltSupport := xTransport.altSupport.cache[url.Host]
-            var altPort uint16
-            if hasAltSupport {
-                altPort = item.port
-            }
+            item, ok := xTransport.altSupport.cache[url.Host]
             xTransport.altSupport.RUnlock()
-
-            if hasAltSupport {
+            hasAltSupport = ok
+            if ok {
+                altPort := item.port
                 if altPort > 0 {
                     if int(altPort) == port {
                         if xTransport.h3Client != nil {
@@ -906,10 +845,11 @@ func (xTransport *XTransport) Fetch(
                         dlog.Debugf("Using HTTP/3 transport for [%s]", url.Host)
                     }
                 } else if !item.nextProbe.IsZero() && time.Now().After(item.nextProbe) {
-                     if xTransport.h3Client != nil {
-                         client = xTransport.h3Client
-                         dlog.Debugf("Retrying HTTP/3 probe for [%s]", url.Host)
-                     }
+                    // Retry HTTP/3 periodically after failures
+                    if xTransport.h3Client != nil {
+                        client = xTransport.h3Client
+                        dlog.Debugf("Retrying HTTP/3 probe for [%s]", url.Host)
+                    }
                 }
             }
         }
@@ -1152,10 +1092,7 @@ func (xTransport *XTransport) PrewarmDNSCache(dohResolvers []string) {
         if err != nil {
             continue
         }
-
-        host, port := ExtractHostAndPort(u.Host, 443)
-        _ = port 
-
+        host, _ := ExtractHostAndPort(u.Host, 443)
         go func(h string) {
             dlog.Debugf("Pre-warming DNS cache for [%s]", h)
             if err := xTransport.resolveAndUpdateCacheBlocking(h, nil); err != nil {
