@@ -78,6 +78,7 @@ type AltSupport struct {
 }
 
 type XTransport struct {
+    sessionCache tls.ClientSessionCache
     transport   *http.Transport
     h3Transport *http3.Transport
 
@@ -136,8 +137,9 @@ func NewXTransport() *XTransport {
         tlsDisableSessionTickets: false,
         tlsPreferRSA:             false,
         keyLogWriter:             nil,
+        sessionCache:             tls.NewLRUClientSessionCache(4096),
     }
-
+    
     xTransport.gzipPool.New = func() any { return new(gzip.Reader) }
 
     return xTransport
@@ -232,7 +234,7 @@ func (xTransport *XTransport) loadCachedIPs(host string) (ips []net.IP, expired 
     expiration := item.expiration
     updatingUntil := item.updatingUntil
     xTransport.cachedIPs.RUnlock()
-    if expiration != nil && time.Until(*expiration) < 0 {
+    if expiration != nil && time.Until(*expiration) < 5*time.Minute {
         expired = true
         if updatingUntil != nil && time.Until(*updatingUntil) > 0 {
             updating = true
@@ -332,6 +334,7 @@ func (xTransport *XTransport) rebuildTransport() {
         MaxConnsPerHost:        100,
         IdleConnTimeout:        90 * time.Second,
         ResponseHeaderTimeout:  5 * time.Second,
+        ResponseHeaderTimeout:  timeout,
         ExpectContinueTimeout:  0,
         ForceAttemptHTTP2:      true,
         MaxResponseHeaderBytes: 16 * 1024,
@@ -367,7 +370,7 @@ func (xTransport *XTransport) rebuildTransport() {
                 }
                 return (*xTransport.proxyDialer).Dial(network, address)
             }
-            // Happy Eyeballs: race targets with 50ms delay
+            // Happy Eyeballs: race targets with 150ms delay
             type dialResult struct {
                 conn net.Conn
                 err  error
@@ -446,8 +449,8 @@ func (xTransport *XTransport) rebuildTransport() {
     if certPool != nil {
         // Some operating systems don't include Let's Encrypt ISRG Root X1 certificate yet
         letsEncryptX1Cert := []byte(`-----BEGIN CERTIFICATE-----
-MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAwTzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2VhcmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4WhcNMzUwNjA0MTEwNDM4WjBPMQswCQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJuZXQgU2VjdXJpdHkgUmVzZWFyY2ggR3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBYMTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAK3oJHP0FDfzm54rVygch77ct984kIxuPOZXoHj3dcKi/vVqbvYATyjb3miGbESTtrFj/RQSa78f0uoxmyF+0TM8ukj13Xnfs7j/EvEhmkvBioZxaUpmZmyPfjxwv60pIgbz5MDmgK7iS4+3mX6UA5/TR5d8mUgjU+g4rk8Kb4Mu0UlXjIB0ttov0DiNewNwIRt18jA8+o+u3dpjq+sWT8KOEUt+zwvo/7V3LvSye0rgTBIlDHCNAymg4VMk7BPZ7hm/ELNKjD+Jo2FR3qyHB5T0Y3HsLuJvW5iB4YlcNHlsdu87kGJ55tukmi8mxdAQ4Q7e2RCOFvu396j3x+UCB5iPNgiV5+I3lg02dZ77DnKxHZu8A/lJBdiB3QW0KtZB6awBdpUKD9jf1b0SHzUvKBds0pjBqAlkd25HN7rOrFleaJ1/ctaJxQZBKT5ZPt0m9STJEadao0xAH0ahmbWnOlFuhjuefXKnEgV4We0+UXgVCwOPjdAvBbI+e0ocS3MFEvzG6uBQE3xDk3SzynTnjh8BCNAw1FtxNrQHusEwMFxIt4I7mKZ9YIqioymCzLq9gwQbooMDQaHWBfEbwrbwqHyGO0aoSCqI3Haadr8faqU9GY/rOPNk3sgrDQoo//fb4hVC1CLQJ13hef4Y53CIrU7m2Ys6xt0nUW7/vGT1M0NPAgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQWBBR5tFnme7bl5AFzgAiIyBpY9umbbjANBgkqhkiG9w0BAQsFAAOCAgEAVR9YqbyyqFDQDLHYGmkgJykIrGF1XIpu+ILlaS/V9lZLubhzEFnTIZd+50xx+7LSYK05qAvqFyFWhfFQDlnrzuBZ6brJFe+GnY+EgPbk6ZGQ3BebYhtF8GaV0nxvwuo77x/Py9auJ/GpsMiu/X1+mvoiBOv/2X/qkSsisRcOj/KKNFtY2PwByVS5uCbMiogziUwthDyC3+6WVwW6LLv3xLfHTjuCvjHIInNzktHCgKQ5ORAzI4JMPJ+GslWYHb4phowim57iaztXOoJwTdwJx4nLCgdNbOhdjsnvzqvHu7UrTkXWStAmzOVyyghqpZXjFaH3pO3JLF+l+/+sKAIuvtd7u+Nxe5AW0wdeRlN8NwdCjNPElpzVmbUq4JUagEiuTDkHzsxHpFKVK7q4+63SM1N95R1NbdWhscdCb+ZAJzVcoyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPAmRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57demyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
------END CERTIFICATE-----`)
+ MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAwTzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2VhcmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4WhcNMzUwNjA0MTEwNDM4WjBPMQswCQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJuZXQgU2VjdXJpdHkgUmVzZWFyY2ggR3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBYMTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAK3oJHP0FDfzm54rVygch77ct984kIxuPOZXoHj3dcKi/vVqbvYATyjb3miGbESTtrFj/RQSa78f0uoxmyF+0TM8ukj13Xnfs7j/EvEhmkvBioZxaUpmZmyPfjxwv60pIgbz5MDmgK7iS4+3mX6UA5/TR5d8mUgjU+g4rk8Kb4Mu0UlXjIB0ttov0DiNewNwIRt18jA8+o+u3dpjq+sWT8KOEUt+zwvo/7V3LvSye0rgTBIlDHCNAymg4VMk7BPZ7hm/ELNKjD+Jo2FR3qyHB5T0Y3HsLuJvW5iB4YlcNHlsdu87kGJ55tukmi8mxdAQ4Q7e2RCOFvu396j3x+UCB5iPNgiV5+I3lg02dZ77DnKxHZu8A/lJBdiB3QW0KtZB6awBdpUKD9jf1b0SHzUvKBds0pjBqAlkd25HN7rOrFleaJ1/ctaJxQZBKT5ZPt0m9STJEadao0xAH0ahmbWnOlFuhjuefXKnEgV4We0+UXgVCwOPjdAvBbI+e0ocS3MFEvzG6uBQE3xDk3SzynTnjh8BCNAw1FtxNrQHusEwMFxIt4I7mKZ9YIqioymCzLq9gwQbooMDQaHWBfEbwrbwqHyGO0aoSCqI3Haadr8faqU9GY/rOPNk3sgrDQoo//fb4hVC1CLQJ13hef4Y53CIrU7m2Ys6xt0nUW7/vGT1M0NPAgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQWBBR5tFnme7bl5AFzgAiIyBpY9umbbjANBgkqhkiG9w0BAQsFAAOCAgEAVR9YqbyyqFDQDLHYGmkgJykIrGF1XIpu+ILlaS/V9lZLubhzEFnTIZd+50xx+7LSYK05qAvqFyFWhfFQDlnrzuBZ6brJFe+GnY+EgPbk6ZGQ3BebYhtF8GaV0nxvwuo77x/Py9auJ/GpsMiu/X1+mvoiBOv/2X/qkSsisRcOj/KKNFtY2PwByVS5uCbMiogziUwthDyC3+6WVwW6LLv3xLfHTjuCvjHIInNzktHCgKQ5ORAzI4JMPJ+GslWYHb4phowim57iaztXOoJwTdwJx4nLCgdNbOhdjsnvzqvHu7UrTkXWStAmzOVyyghqpZXjFaH3pO3JLF+l+/+sKAIuvtd7u+Nxe5AW0wdeRlN8NwdCjNPElpzVmbUq4JUagEiuTDkHzsxHpFKVK7q4+63SM1N95R1NbdWhscdCb+ZAJzVcoyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPAmRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57demyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
+ -----END CERTIFICATE-----`)
         certPool.AppendCertsFromPEM(letsEncryptX1Cert)
         tlsClientConfig.RootCAs = certPool
     }
@@ -468,7 +471,7 @@ MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAwTzELMAkGA1UEBhMC
     if xTransport.tlsDisableSessionTickets {
         tlsClientConfig.SessionTicketsDisabled = true
     } else {
-        tlsClientConfig.ClientSessionCache = tls.NewLRUClientSessionCache(4096)
+        tlsClientConfig.ClientSessionCache = xTransport.sessionCache
     }
     tlsClientConfig.MaxVersion = tls.VersionTLS13
     if xTransport.tlsPreferRSA {
@@ -566,7 +569,9 @@ MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAwTzELMAkGA1UEBhMC
                     continue
                 }
                 tlsCfg.ServerName = host
-                if cfg != nil && cfg.KeepAlivePeriod == 0 {
+                if cfg == nil { cfg = &quic.Config{} }
+                cfg.Allow0RTT = true
+                if cfg.KeepAlivePeriod == 0 {
                     cfg.KeepAlivePeriod = 15 * time.Second
                 }
                 conn, err := tr.DialEarly(ctx, udpAddr, tlsCfg, cfg)
@@ -629,7 +634,6 @@ func (xTransport *XTransport) resolveUsingResolver(
         return nil, 0, errors.New("no query types requested")
     }
 
-    // Use parallel execution for A and AAAA queries
     results := make(chan queryResult, len(queryTypes))
     ctx, cancel := context.WithTimeout(context.Background(), ResolverReadTimeout)
     defer cancel()
@@ -642,12 +646,13 @@ func (xTransport *XTransport) resolveUsingResolver(
         go func(qt uint16) {
             msg := dns.NewMsg(fqdn(host), qt)
             if msg == nil {
-                select {
-                case results <- queryResult{ips: nil, ttl: 0, err: errors.New("failed to create DNS message")}:
-                case <-ctx.Done():
-                }
-                return
+                 select {
+                 case results <- queryResult{ips: nil, ttl: 0, err: errors.New("failed to create DNS message")}:
+                 case <-ctx.Done():
+                 }
+                 return
             }
+            msg.Compress = true
             msg.RecursionDesired = true
             msg.UDPSize = uint16(MaxDNSPacketSize)
             msg.Security = true
@@ -655,8 +660,8 @@ func (xTransport *XTransport) resolveUsingResolver(
             var qIPs []net.IP
             var qTTL uint32
 
-            in, _, qErr := dnsClient.Exchange(ctx, msg, proto, resolver)
-            if qErr == nil && in != nil {
+            in, _, err := dnsClient.Exchange(ctx, msg, proto, resolver)
+            if err == nil && in != nil {
                 for _, answer := range in.Answer {
                     if dns.RRToType(answer) == qt {
                         switch qt {
@@ -675,7 +680,7 @@ func (xTransport *XTransport) resolveUsingResolver(
                 }
             }
             select {
-            case results <- queryResult{ips: qIPs, ttl: time.Duration(qTTL) * time.Second, err: qErr}:
+            case results <- queryResult{ips: qIPs, ttl: time.Duration(qTTL) * time.Second, err: err}:
             case <-ctx.Done():
             }
         }(qType)
@@ -929,8 +934,7 @@ func (xTransport *XTransport) Fetch(
     header["Cache-Control"] = []string{"max-stale"}
 
     if body != nil {
-        h := fnv.New128a()
-        h.Write(*body)
+        h := fnv.New128a(); h.Write(*body)
         qs := url.Query()
         qs.Add("body_hash", hex.EncodeToString(h.Sum(nil)))
         url2 := *url
@@ -1042,8 +1046,7 @@ func (xTransport *XTransport) Fetch(
                         }
                         v = strings.TrimSpace(v)
                         if strings.HasPrefix(v, `h3=":`) {
-                            v = strings.TrimPrefix(v, `h3="`)
-                            v = strings.TrimPrefix(v, `:`)
+                            v = strings.TrimPrefix(v, `h3=":`)
                             v = strings.TrimSuffix(v, `"`)
                             if xAltPort, err := strconv.ParseUint(v, 10, 16); err == nil && xAltPort <= 65535 {
                                 altPort = uint16(xAltPort)
@@ -1150,6 +1153,7 @@ func (xTransport *XTransport) ObliviousDoHQuery(
     return xTransport.dohLikeQuery("application/oblivious-dns-message", useGet, url, body, timeout)
 }
 
+
 func (xTransport *XTransport) PrewarmDNSCache(dohResolvers []string) {
     if len(dohResolvers) == 0 {
         return
@@ -1165,7 +1169,6 @@ func (xTransport *XTransport) PrewarmDNSCache(dohResolvers []string) {
         hosts = append(hosts, host)
     }
 
-    // Bounded concurrency: prevent overwhelming resolvers
     maxConcurrency := 10
     sem := make(chan struct{}, maxConcurrency)
     var wg sync.WaitGroup
