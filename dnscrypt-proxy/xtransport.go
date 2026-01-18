@@ -45,15 +45,15 @@ var hasAESGCMHardwareSupport = cpu.X86.HasAES && cpu.X86.HasPCLMULQDQ ||
 const (
     DefaultBootstrapResolver    = "9.9.9.9:53"
     DefaultKeepAlive            = 360 * time.Second
-    DefaultTimeout              = 30 * time.Second
-    ResolverReadTimeout         = 5 * time.Second
+    DefaultTimeout              = 10 * time.Second
+    ResolverReadTimeout         = 2 * time.Second
     SystemResolverIPTTL         = 12 * time.Hour
-    MinResolverIPTTL            = 4 * time.Hour
+    MinResolverIPTTL            = 30 * time.Minute
     ResolverIPTTLMaxJitter      = 15 * time.Minute
     ExpiredCachedIPGraceTTL     = 15 * time.Minute
     resolverRetryCount          = 3
-    resolverRetryInitialBackoff = 150 * time.Millisecond
-    resolverRetryMaxBackoff     = 1 * time.Second
+    resolverRetryInitialBackoff = 50 * time.Millisecond
+    resolverRetryMaxBackoff     = 300 * time.Millisecond
 )
 
 type CachedIPItem struct {
@@ -328,9 +328,10 @@ func (xTransport *XTransport) rebuildTransport() {
         DisableKeepAlives:      false,
         DisableCompression:     true,
         MaxIdleConns:           2000,
-        MaxIdleConnsPerHost:    4,
-        MaxConnsPerHost:        4,
-        IdleConnTimeout:        60 * time.Second,
+        MaxIdleConnsPerHost:    100,
+        MaxConnsPerHost:        100,
+        IdleConnTimeout:        90 * time.Second,
+        ResponseHeaderTimeout:  5 * time.Second,
         ResponseHeaderTimeout:  timeout,
         ExpectContinueTimeout:  0,
         ForceAttemptHTTP2:      true,
@@ -382,7 +383,7 @@ func (xTransport *XTransport) rebuildTransport() {
                 go func(i int, target string) {
                     if i > 0 {
                         select {
-                        case <-time.After(time.Duration(i) * 150 * time.Millisecond):
+                        case <-time.After(time.Duration(i) * 50 * time.Millisecond):
                         case <-done:
                             return
                         case <-dialCtx.Done():
@@ -495,7 +496,7 @@ func (xTransport *XTransport) rebuildTransport() {
     }
     transport.TLSClientConfig = &tlsClientConfig
     if h2Transport, err := http2.ConfigureTransports(transport); err == nil && h2Transport != nil {
-        h2Transport.ReadIdleTimeout = timeout
+        h2Transport.ReadIdleTimeout = 30 * time.Second
         h2Transport.PingTimeout = 5 * time.Second
         h2Transport.AllowHTTP = false
         h2Transport.StrictMaxConcurrentStreams = true
@@ -611,46 +612,102 @@ func (xTransport *XTransport) resolveUsingResolver(
     resolver string,
     returnIPv4, returnIPv6 bool,
 ) (ips []net.IP, ttl time.Duration, err error) {
+    type queryResult struct {
+        ips []net.IP
+        ttl time.Duration
+        err error
+    }
+
+    queryTypes := make([]uint16, 0, 2)
+    if returnIPv4 {
+        queryTypes = append(queryTypes, dns.TypeA)
+    }
+    if returnIPv6 {
+        queryTypes = append(queryTypes, dns.TypeAAAA)
+    }
+
+    if len(queryTypes) == 0 {
+        return nil, 0, errors.New("no query types requested")
+    }
+
+    // Use singleflight/parallel execution
+    results := make(chan queryResult, len(queryTypes))
+    ctx, cancel := context.WithTimeout(context.Background(), ResolverReadTimeout)
+    defer cancel()
+
     transport := dns.NewTransport()
     transport.ReadTimeout = ResolverReadTimeout
     dnsClient := dns.Client{Transport: transport}
-    queryType := make([]uint16, 0, 2)
-    if returnIPv4 {
-        queryType = append(queryType, dns.TypeA)
-    }
-    if returnIPv6 {
-        queryType = append(queryType, dns.TypeAAAA)
-    }
-    var rrTTL uint32
-    ctx, cancel := context.WithTimeout(context.Background(), ResolverReadTimeout)
-    defer cancel()
-    for _, rrType := range queryType {
-        msg := dns.NewMsg(fqdn(host), rrType)
-        if msg == nil {
-            continue
-        }
-        msg.RecursionDesired = true
-        msg.UDPSize = uint16(MaxDNSPacketSize)
-        msg.Security = true
-        var in *dns.Msg
-        if in, _, err = dnsClient.Exchange(ctx, msg, proto, resolver); err == nil {
-            for _, answer := range in.Answer {
-                if dns.RRToType(answer) == rrType {
-                    switch rrType {
-                    case dns.TypeA:
-                        ips = append(ips, answer.(*dns.A).A.Addr.AsSlice())
-                    case dns.TypeAAAA:
-                        ips = append(ips, answer.(*dns.AAAA).AAAA.Addr.AsSlice())
+
+    for _, qType := range queryTypes {
+        go func(qt uint16) {
+            msg := dns.NewMsg(fqdn(host), qt)
+            msg.RecursionDesired = true
+            msg.UDPSize = uint16(MaxDNSPacketSize)
+            msg.Security = true
+
+            var qIPs []net.IP
+            var qTTL uint32
+
+            in, _, err := dnsClient.Exchange(ctx, msg, proto, resolver)
+            if err == nil && in != nil {
+                for _, answer := range in.Answer {
+                    if dns.RRToType(answer) == qt {
+                        switch qt {
+                        case dns.TypeA:
+                            if a, ok := answer.(*dns.A); ok {
+                                qIPs = append(qIPs, a.A.Addr.AsSlice())
+                                qTTL = a.Header().TTL
+                            }
+                        case dns.TypeAAAA:
+                            if aaaa, ok := answer.(*dns.AAAA); ok {
+                                qIPs = append(qIPs, aaaa.AAAA.Addr.AsSlice())
+                                qTTL = aaaa.Header().TTL
+                            }
+                        }
                     }
-                    rrTTL = answer.Header().TTL
                 }
             }
+            select {
+            case results <- queryResult{ips: qIPs, ttl: time.Duration(qTTL) * time.Second, err: err}:
+            case <-ctx.Done():
+            }
+        }(qType)
+    }
+
+    var collectedIPs []net.IP
+    var minTTL time.Duration
+    var lastErr error
+
+    for i := 0; i < len(queryTypes); i++ {
+        select {
+        case res := <-results:
+            if res.err == nil {
+                if len(res.ips) > 0 {
+                    collectedIPs = append(collectedIPs, res.ips...)
+                    if minTTL == 0 || res.ttl < minTTL {
+                        minTTL = res.ttl
+                    }
+                }
+            } else {
+                lastErr = res.err
+            }
+        case <-ctx.Done():
+            if len(collectedIPs) > 0 {
+                break
+            }
+            return nil, 0, ctx.Err()
         }
     }
-    if len(ips) > 0 {
-        ttl = time.Duration(rrTTL) * time.Second
+
+    if len(collectedIPs) > 0 {
+        return collectedIPs, minTTL, nil
     }
-    return ips, ttl, err
+
+    if lastErr != nil {
+        return nil, 0, lastErr
+    }
+    return nil, 0, errors.New("no IP addresses returned")
 }
 
 func (xTransport *XTransport) resolveUsingServers(
@@ -917,7 +974,7 @@ func (xTransport *XTransport) Fetch(
 
         // Add server to negative cache when HTTP/3 fails
         xTransport.altSupport.Lock()
-        xTransport.altSupport.cache[url.Host] = AltSupportItem{port: 0, nextProbe: time.Now().Add(1 * time.Hour)}
+        xTransport.altSupport.cache[url.Host] = AltSupportItem{port: 0, nextProbe: time.Now().Add(5 * time.Minute)}
         xTransport.altSupport.Unlock()
 
         // Retry with HTTP/2
@@ -1087,17 +1144,37 @@ func (xTransport *XTransport) ObliviousDoHQuery(
 
 
 func (xTransport *XTransport) PrewarmDNSCache(dohResolvers []string) {
+    if len(dohResolvers) == 0 {
+        return
+    }
+
+    hosts := make([]string, 0, len(dohResolvers))
     for _, resolver := range dohResolvers {
         u, err := url.Parse(resolver)
         if err != nil {
             continue
         }
         host, _ := ExtractHostAndPort(u.Host, 443)
-        go func(h string) {
-            dlog.Debugf("Pre-warming DNS cache for [%s]", h)
-            if err := xTransport.resolveAndUpdateCacheBlocking(h, nil); err != nil {
-                dlog.Warnf("Failed to pre-warm DNS for [%s]: %v", h, err)
-            }
-        }(host)
+        hosts = append(hosts, host)
     }
+
+    // Bounded concurrency
+    maxConcurrency := 10
+    sem := make(chan struct{}, maxConcurrency)
+    var wg sync.WaitGroup
+
+    for _, h := range hosts {
+        wg.Add(1)
+        go func(host string) {
+            defer wg.Done()
+            sem <- struct{}{}
+            defer func() { <-sem }()
+
+            dlog.Debugf("Pre-warming DNS cache for [%s]", host)
+            if err := xTransport.resolveAndUpdateCacheBlocking(host, nil); err != nil {
+                dlog.Warnf("Failed to pre-warm DNS for [%s]: %v", host, err)
+            }
+        }(h)
+    }
+    wg.Wait()
 }
