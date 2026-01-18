@@ -332,8 +332,9 @@ func (xTransport *XTransport) rebuildTransport() {
         MaxConnsPerHost:        4,
         IdleConnTimeout:        60 * time.Second,
         ResponseHeaderTimeout:  timeout,
-        ExpectContinueTimeout:  timeout,
-        MaxResponseHeaderBytes: 4096,
+        ExpectContinueTimeout:  0, // Disabled
+        ForceAttemptHTTP2:      true,
+        MaxResponseHeaderBytes: 16 * 1024,
         DialContext: func(ctx context.Context, network, addrStr string) (net.Conn, error) {
             host, port := ExtractHostAndPort(addrStr, stamps.DefaultPort)
             formatEndpoint := func(ip net.IP) string {
@@ -361,21 +362,19 @@ func (xTransport *XTransport) rebuildTransport() {
 
             dial := func(address string) (net.Conn, error) {
                 if xTransport.proxyDialer == nil {
-                    dialer := &net.Dialer{Timeout: timeout, KeepAlive: xTransport.keepAlive, DualStack: true}
-                    return dialer.DialContext(ctx, network, address)
-                }
-                return (*xTransport.proxyDialer).Dial(network, address)
-            }
-
-            // Happy Eyeballs: Race connections with 300ms delay
+                    // Optimized dialer with 15s KeepAlive
+                    dialer := &net.Dialer{
+                        Timeout:   timeout, 
+                        KeepAlive: 15 * time.Second, 
+                        DualStack: true,
+                    }
+                    return diale// Happy Eyeballs V2: Race connections with 150ms delay
             type dialResult struct {
                 conn net.Conn
                 err  error
             }
-            // Buffer channel to avoid blocking
             ch := make(chan dialResult, len(targets))
             done := make(chan struct{})
-            // We use a separate context for the goroutines to ensure cancellation
             dialCtx, cancelDial := context.WithCancel(ctx)
             defer cancelDial()
             defer close(done)
@@ -384,7 +383,8 @@ func (xTransport *XTransport) rebuildTransport() {
                 go func(i int, target string) {
                     if i > 0 {
                         select {
-                        case <-time.After(time.Duration(i) * 300 * time.Millisecond):
+                        // Aggressive 150ms delay (RFC 8305 recommends 100-250ms)
+                        case <-time.After(time.Duration(i) * 150 * time.Millisecond):
                         case <-done:
                             return
                         case <-dialCtx.Done():
@@ -414,6 +414,15 @@ func (xTransport *XTransport) rebuildTransport() {
                     dlog.Debugf("Happy Eyeballs dial attempt failed: %v", res.err)
                 case <-ctx.Done():
                     return nil, ctx.Err()
+                }
+            }
+            return nil, lastErr, err := dial(target)
+                if err == nil {
+                    return conn, nil
+                }
+                lastErr = err
+                if idx < len(targets)-1 {
+                    dlog.Debugf("Dial attempt using [%s] failed: %v", target, err)
                 }
             }
             return nil, lastErr
