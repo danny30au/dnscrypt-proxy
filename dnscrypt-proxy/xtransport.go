@@ -67,9 +67,14 @@ type CachedIPs struct {
     cache map[string]*CachedIPItem
 }
 
+type AltSupportItem struct {
+    port      uint16
+    nextProbe time.Time
+}
+
 type AltSupport struct {
     sync.RWMutex
-    cache map[string]uint16
+    cache map[string]AltSupportItem
 }
 
 type XTransport struct {
@@ -119,7 +124,7 @@ func NewXTransport() *XTransport {
     }
     xTransport := &XTransport{
         cachedIPs:                CachedIPs{cache: make(map[string]*CachedIPItem)},
-        altSupport:               AltSupport{cache: make(map[string]uint16)},
+        altSupport:               AltSupport{cache: make(map[string]AltSupportItem)},
         keepAlive:                DefaultKeepAlive,
         timeout:                  DefaultTimeout,
         bootstrapResolvers:       []string{DefaultBootstrapResolver},
@@ -323,9 +328,9 @@ func (xTransport *XTransport) rebuildTransport() {
         DisableKeepAlives:      false,
         DisableCompression:     true,
         MaxIdleConns:           2000,
-        MaxIdleConnsPerHost:    200,
-        MaxConnsPerHost:        0,
-        IdleConnTimeout:        xTransport.keepAlive,
+        MaxIdleConnsPerHost:    4,
+        MaxConnsPerHost:        4,
+        IdleConnTimeout:        60 * time.Second,
         ResponseHeaderTimeout:  timeout,
         ExpectContinueTimeout:  timeout,
         MaxResponseHeaderBytes: 4096,
@@ -427,6 +432,7 @@ func (xTransport *XTransport) rebuildTransport() {
     } else {
         tlsClientConfig.ClientSessionCache = tls.NewLRUClientSessionCache(4096)
     }
+    tlsClientConfig.MaxVersion = tls.VersionTLS13
     if xTransport.tlsPreferRSA {
         tlsClientConfig.MaxVersion = tls.VersionTLS13
         if hasAESGCMHardwareSupport {
@@ -455,6 +461,8 @@ func (xTransport *XTransport) rebuildTransport() {
         h2Transport.PingTimeout = 5 * time.Second
         h2Transport.AllowHTTP = false
         h2Transport.StrictMaxConcurrentStreams = true
+        h2Transport.MaxConcurrentStreams = 250
+        h2Transport.MaxReadFrameSize = 256 * 1024
     }
     xTransport.transport = transport
     xTransport.httpClient = &http.Client{Transport: xTransport.transport}
@@ -788,14 +796,26 @@ func (xTransport *XTransport) Fetch(
         } else {
             xTransport.altSupport.RLock()
             var altPort uint16
-            altPort, hasAltSupport = xTransport.altSupport.cache[url.Host]
+            item, hasAltSupport := xTransport.altSupport.cache[url.Host]
+            if hasAltSupport {
+                altPort = item.port
+            }
             xTransport.altSupport.RUnlock()
-            if hasAltSupport && altPort > 0 {
-                if int(altPort) == port {
-                    if xTransport.h3Client != nil {
-                        client = xTransport.h3Client
+
+            if hasAltSupport {
+                if altPort > 0 {
+                    if int(altPort) == port {
+                        if xTransport.h3Client != nil {
+                            client = xTransport.h3Client
+                        }
+                        dlog.Debugf("Using HTTP/3 transport for [%s]", url.Host)
                     }
-                    dlog.Debugf("Using HTTP/3 transport for [%s]", url.Host)
+                } else if !item.nextProbe.IsZero() && time.Now().After(item.nextProbe) {
+                     // Retry probe by forcing h3Client
+                     if xTransport.h3Client != nil {
+                         client = xTransport.h3Client
+                         dlog.Debugf("Retrying HTTP/3 probe for [%s]", url.Host)
+                     }
                 }
             }
         }
@@ -863,7 +883,7 @@ func (xTransport *XTransport) Fetch(
 
         // Add server to negative cache when HTTP/3 fails
         xTransport.altSupport.Lock()
-        xTransport.altSupport.cache[url.Host] = 0
+        xTransport.altSupport.cache[url.Host] = AltSupportItem{port: 0, nextProbe: time.Now().Add(1 * time.Hour)}
         xTransport.altSupport.Unlock()
 
         // Retry with HTTP/2
@@ -904,11 +924,13 @@ func (xTransport *XTransport) Fetch(
         skipAltSvcParsing := false
         if xTransport.http3Probe {
             xTransport.altSupport.RLock()
-            altPort, inCache := xTransport.altSupport.cache[url.Host]
+            item, inCache := xTransport.altSupport.cache[url.Host]
             xTransport.altSupport.RUnlock()
-            if inCache && altPort == 0 {
-                dlog.Debugf("Skipping Alt-Svc parsing for [%s] - previously failed HTTP/3 probe", url.Host)
-                skipAltSvcParsing = true
+            if inCache && item.port == 0 {
+                if item.nextProbe.IsZero() || time.Now().Before(item.nextProbe) {
+                    dlog.Debugf("Skipping Alt-Svc parsing for [%s] - previously failed HTTP/3 probe", url.Host)
+                    skipAltSvcParsing = true
+                }
             }
         }
         if !skipAltSvcParsing {
@@ -933,7 +955,7 @@ func (xTransport *XTransport) Fetch(
                     }
                 }
                 xTransport.altSupport.Lock()
-                xTransport.altSupport.cache[url.Host] = altPort
+                xTransport.altSupport.cache[url.Host] = AltSupportItem{port: altPort}
                 dlog.Debugf("Caching altPort for [%v]", url.Host)
                 xTransport.altSupport.Unlock()
             }
@@ -1011,6 +1033,12 @@ func (xTransport *XTransport) DoHQuery(
     body []byte,
     timeout time.Duration,
 ) ([]byte, int, *tls.ConnectionState, time.Duration, error) {
+    // Optimize method selection: GET for small queries, POST for large
+    if !useGet && len(body) < 190 {
+        useGet = true
+    } else if useGet && len(body) > 256 {
+        useGet = false
+    }
     return xTransport.dohLikeQuery("application/dns-message", useGet, url, body, timeout)
 }
 
@@ -1021,4 +1049,24 @@ func (xTransport *XTransport) ObliviousDoHQuery(
     timeout time.Duration,
 ) ([]byte, int, *tls.ConnectionState, time.Duration, error) {
     return xTransport.dohLikeQuery("application/oblivious-dns-message", useGet, url, body, timeout)
+}
+
+
+func (xTransport *XTransport) PrewarmDNSCache(dohResolvers []string) {
+    for _, resolver := range dohResolvers {
+        u, err := url.Parse(resolver)
+        if err != nil {
+            continue
+        }
+
+        host, port := ExtractHostAndPort(u.Host, 443)
+        _ = port // unused
+
+        go func(h string) {
+            dlog.Debugf("Pre-warming DNS cache for [%s]", h)
+            if err := xTransport.resolveAndUpdateCacheBlocking(h, nil); err != nil {
+                dlog.Warnf("Failed to pre-warm DNS for [%s]: %v", h, err)
+            }
+        }(host)
+    }
 }
