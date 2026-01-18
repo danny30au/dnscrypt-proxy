@@ -461,7 +461,7 @@ func (xTransport *XTransport) rebuildTransport() {
         h2Transport.PingTimeout = 5 * time.Second
         h2Transport.AllowHTTP = false
         h2Transport.StrictMaxConcurrentStreams = true
-        h2Transport.MaxConcurrentStreams = 250
+        // MaxConcurrentStreams is not supported on client Transport, relying on server settings
         h2Transport.MaxReadFrameSize = 256 * 1024
     }
     xTransport.transport = transport
@@ -795,8 +795,8 @@ func (xTransport *XTransport) Fetch(
             dlog.Debugf("Probing HTTP/3 transport for [%s]", url.Host)
         } else {
             xTransport.altSupport.RLock()
-            var altPort uint16
             item, hasAltSupport := xTransport.altSupport.cache[url.Host]
+            var altPort uint16
             if hasAltSupport {
                 altPort = item.port
             }
@@ -811,7 +811,6 @@ func (xTransport *XTransport) Fetch(
                         dlog.Debugf("Using HTTP/3 transport for [%s]", url.Host)
                     }
                 } else if !item.nextProbe.IsZero() && time.Now().After(item.nextProbe) {
-                     // Retry probe by forcing h3Client
                      if xTransport.h3Client != nil {
                          client = xTransport.h3Client
                          dlog.Debugf("Retrying HTTP/3 probe for [%s]", url.Host)
@@ -1060,7 +1059,7 @@ func (xTransport *XTransport) PrewarmDNSCache(dohResolvers []string) {
         }
 
         host, port := ExtractHostAndPort(u.Host, 443)
-        _ = port // unused
+        _ = port 
 
         go func(h string) {
             dlog.Debugf("Pre-warming DNS cache for [%s]", h)
