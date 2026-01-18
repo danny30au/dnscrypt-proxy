@@ -367,15 +367,53 @@ func (xTransport *XTransport) rebuildTransport() {
                 return (*xTransport.proxyDialer).Dial(network, address)
             }
 
+            // Happy Eyeballs: Race connections with 300ms delay
+            type dialResult struct {
+                conn net.Conn
+                err  error
+            }
+            // Buffer channel to avoid blocking
+            ch := make(chan dialResult, len(targets))
+            done := make(chan struct{})
+            // We use a separate context for the goroutines to ensure cancellation
+            dialCtx, cancelDial := context.WithCancel(ctx)
+            defer cancelDial()
+            defer close(done)
+
+            for i, target := range targets {
+                go func(i int, target string) {
+                    if i > 0 {
+                        select {
+                        case <-time.After(time.Duration(i) * 300 * time.Millisecond):
+                        case <-done:
+                            return
+                        case <-dialCtx.Done():
+                            return
+                        }
+                    }
+
+                    conn, err := dial(target)
+                    select {
+                    case ch <- dialResult{conn, err}:
+                    case <-done:
+                        if conn != nil { conn.Close() }
+                    case <-dialCtx.Done():
+                        if conn != nil { conn.Close() }
+                    }
+                }(i, target)
+            }
+
             var lastErr error
-            for idx, target := range targets {
-                conn, err := dial(target)
-                if err == nil {
-                    return conn, nil
-                }
-                lastErr = err
-                if idx < len(targets)-1 {
-                    dlog.Debugf("Dial attempt using [%s] failed: %v", target, err)
+            for i := 0; i < len(targets); i++ {
+                select {
+                case res := <-ch:
+                    if res.err == nil {
+                        return res.conn, nil
+                    }
+                    lastErr = res.err
+                    dlog.Debugf("Happy Eyeballs dial attempt failed: %v", res.err)
+                case <-ctx.Done():
+                    return nil, ctx.Err()
                 }
             }
             return nil, lastErr
@@ -461,7 +499,6 @@ func (xTransport *XTransport) rebuildTransport() {
         h2Transport.PingTimeout = 5 * time.Second
         h2Transport.AllowHTTP = false
         h2Transport.StrictMaxConcurrentStreams = true
-        // MaxConcurrentStreams is not supported on client Transport, relying on server settings
         h2Transport.MaxReadFrameSize = 256 * 1024
     }
     xTransport.transport = transport
@@ -624,37 +661,86 @@ func (xTransport *XTransport) resolveUsingServers(
     if len(resolvers) == 0 {
         return nil, 0, errors.New("Empty resolvers")
     }
-    var lastErr error
-    for i, resolver := range resolvers {
+    if len(resolvers) == 1 {
+        // Fast path for single resolver
+        var lastErr error
+        resolver := resolvers[0]
         delay := resolverRetryInitialBackoff
         for attempt := 1; attempt <= resolverRetryCount; attempt++ {
             ips, ttl, err = xTransport.resolveUsingResolver(proto, host, resolver, returnIPv4, returnIPv6)
             if err == nil && len(ips) > 0 {
-                if i > 0 {
-                    dlog.Infof("Resolution succeeded with resolver %s[%s]", proto, resolver)
-                    resolvers[0], resolvers[i] = resolvers[i], resolvers[0]
-                }
                 return ips, ttl, nil
             }
-            if err == nil {
-                err = errors.New("no IP addresses returned")
-            }
             lastErr = err
-            dlog.Debugf("Resolver attempt %d failed for [%s] using [%s] (%s): %v", attempt, host, resolver, proto, err)
             if attempt < resolverRetryCount {
                 time.Sleep(delay)
-                if delay < resolverRetryMaxBackoff {
+                delay *= 2
+                if delay > resolverRetryMaxBackoff {
+                     delay = resolverRetryMaxBackoff
+                }
+            }
+        }
+        return nil, 0, lastErr
+    }
+
+    // Parallel resolution for multiple resolvers
+    type resolveResult struct {
+        ips []net.IP
+        ttl time.Duration
+        err error
+    }
+    ch := make(chan resolveResult, len(resolvers))
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
+
+    for _, resolver := range resolvers {
+        go func(r string) {
+            var ips []net.IP
+            var ttl time.Duration
+            var err error
+
+            delay := resolverRetryInitialBackoff
+            for attempt := 1; attempt <= resolverRetryCount; attempt++ {
+                if ctx.Err() != nil {
+                    return
+                }
+                ips, ttl, err = xTransport.resolveUsingResolver(proto, host, r, returnIPv4, returnIPv6)
+                if err == nil && len(ips) > 0 {
+                    select {
+                    case ch <- resolveResult{ips, ttl, nil}:
+                    case <-ctx.Done():
+                    }
+                    return
+                }
+
+                if attempt < resolverRetryCount {
+                    select {
+                    case <-time.After(delay):
+                    case <-ctx.Done():
+                        return
+                    }
                     delay *= 2
                     if delay > resolverRetryMaxBackoff {
                         delay = resolverRetryMaxBackoff
                     }
                 }
             }
-        }
-        dlog.Infof("Unable to resolve [%s] using resolver [%s] (%s): %v", host, resolver, proto, lastErr)
+            // Only report error if all attempts fail
+            select {
+            case ch <- resolveResult{nil, 0, err}:
+            case <-ctx.Done():
+            }
+        }(resolver)
     }
-    if lastErr == nil {
-        lastErr = errors.New("no IP addresses returned")
+
+    var lastErr error
+
+    for i := 0; i < len(resolvers); i++ {
+        res := <-ch
+        if res.err == nil {
+            return res.ips, res.ttl, nil
+        }
+        lastErr = res.err
     }
     return nil, 0, lastErr
 }
