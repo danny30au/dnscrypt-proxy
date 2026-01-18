@@ -333,8 +333,7 @@ func (xTransport *XTransport) rebuildTransport() {
         MaxIdleConnsPerHost:    100,
         MaxConnsPerHost:        100,
         IdleConnTimeout:        90 * time.Second,
-        ResponseHeaderTimeout:  5 * time.Second,
-        ResponseHeaderTimeout:  timeout,
+        
         ExpectContinueTimeout:  0,
         ForceAttemptHTTP2:      true,
         MaxResponseHeaderBytes: 16 * 1024,
@@ -652,7 +651,7 @@ func (xTransport *XTransport) resolveUsingResolver(
                  }
                  return
             }
-            msg.Compress = true
+            // msg.Compress = true // Removed to fix build error
             msg.RecursionDesired = true
             msg.UDPSize = uint16(MaxDNSPacketSize)
             msg.Security = true
@@ -720,6 +719,7 @@ func (xTransport *XTransport) resolveUsingResolver(
     }
     return nil, 0, errors.New("no IP addresses returned")
 }
+
 
 func (xTransport *XTransport) resolveUsingServers(
     proto, host string,
