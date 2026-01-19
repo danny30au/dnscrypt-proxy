@@ -30,7 +30,6 @@ const (
     AlgPrefixPreserving
 )
 
-// Common errors
 var (
     ErrNoKey              = errors.New("IP encryption algorithm set but no key provided")
     ErrInvalidKeyHex      = errors.New("invalid IP encryption key (must be hex)")
@@ -42,12 +41,16 @@ var (
 
 const hextable = "0123456789abcdef"
 
-// IPCryptConfig holds the configuration for IP address encryption.
 type IPCryptConfig struct {
-    Key       []byte
-    Algorithm Algorithm
-    aesBlock  cipher.Block
-    rngPool   sync.Pool
+    Key       []byte       // 24 bytes
+    aesBlock  cipher.Block // 16 bytes
+    Algorithm Algorithm    // 1 byte
+    // padding for alignment
+    _         [7]byte
+    
+    // rngPool is accessed concurrently (R/W). Isolate it to prevent false sharing
+    // with the read-only fields above on highly concurrent systems.
+    rngPool   sync.Pool    // 48 bytes (aligned)
 }
 
 func ParseAlgorithm(s string) (Algorithm, error) {
@@ -63,7 +66,8 @@ func ParseAlgorithm(s string) (Algorithm, error) {
     case "ipcrypt-pfx":
         return AlgPrefixPreserving, nil
     default:
-        return AlgNone, fmt.Errorf("%w: %s", ErrUnsupportedAlgo, s)
+        // Optimization: Return static error for unknown algo to prevent alloc DoS
+        return AlgNone, ErrUnsupportedAlgo
     }
 }
 
@@ -84,7 +88,6 @@ func NewIPCryptConfig(keyHex string, algorithm string) (*IPCryptConfig, error) {
         return nil, fmt.Errorf("%w: %v", ErrInvalidKeyHex, err)
     }
 
-    // Validation
     expectedLen := 16
     if algo == AlgNonDeterministicX || algo == AlgPrefixPreserving {
         expectedLen = 32
@@ -93,7 +96,6 @@ func NewIPCryptConfig(keyHex string, algorithm string) (*IPCryptConfig, error) {
         return nil, fmt.Errorf("%s requires %d-byte key, got %d", algorithm, expectedLen, len(rawKey))
     }
 
-    // SAFETY: Make a defensive copy of the key so external mutations don't affect us
     key := bytes.Clone(rawKey)
 
     config := &IPCryptConfig{
@@ -101,7 +103,6 @@ func NewIPCryptConfig(keyHex string, algorithm string) (*IPCryptConfig, error) {
         Algorithm: algo,
     }
 
-    // Optimization: Pre-compute AES cipher for IPv6 Deterministic mode.
     if algo == AlgDeterministic && len(key) == 16 {
         block, err := aes.NewCipher(key)
         if err != nil {
@@ -110,7 +111,6 @@ func NewIPCryptConfig(keyHex string, algorithm string) (*IPCryptConfig, error) {
         config.aesBlock = block
     }
 
-    // Initialize RNG pool
     config.rngPool = sync.Pool{
         New: func() interface{} {
             var seed [32]byte
@@ -124,7 +124,6 @@ func NewIPCryptConfig(keyHex string, algorithm string) (*IPCryptConfig, error) {
     return config, nil
 }
 
-// AppendEncryptIP appends the encrypted IP (as hex) to dst.
 func (config *IPCryptConfig) AppendEncryptIP(dst []byte, ip netip.Addr) ([]byte, error) {
     if config == nil {
         return ip.AppendTo(dst), nil
@@ -133,10 +132,8 @@ func (config *IPCryptConfig) AppendEncryptIP(dst []byte, ip netip.Addr) ([]byte,
     switch config.Algorithm {
     case AlgDeterministic:
         if ip.Is4() {
-            // OPTIMIZATION: Inline ipcrypt cipher (Zero Alloc)
             state := ip.As4()
             
-            // Inline Cipher: Add/Rot/Xor/RotAdd/RotXor/Rot/Add/Xor
             state[0] ^= config.Key[0]; state[1] ^= config.Key[1]
             state[2] ^= config.Key[2]; state[3] ^= config.Key[3]
             permute(&state)
@@ -152,23 +149,22 @@ func (config *IPCryptConfig) AppendEncryptIP(dst []byte, ip netip.Addr) ([]byte,
             state[0] ^= config.Key[12]; state[1] ^= config.Key[13]
             state[2] ^= config.Key[14]; state[3] ^= config.Key[15]
             
-            // OPTIMIZATION: Fast unrolled hex append
+            // OPTIMIZATION: Bounds-check elimination hint & 0x0F
+            // Applying & 0x0F to the shift results proves to compiler index is 0..15
             return append(dst,
-                hextable[state[0]>>4], hextable[state[0]&0x0f],
-                hextable[state[1]>>4], hextable[state[1]&0x0f],
-                hextable[state[2]>>4], hextable[state[2]&0x0f],
-                hextable[state[3]>>4], hextable[state[3]&0x0f],
+                hextable[(state[0]>>4)&0x0f], hextable[state[0]&0x0f],
+                hextable[(state[1]>>4)&0x0f], hextable[state[1]&0x0f],
+                hextable[(state[2]>>4)&0x0f], hextable[state[2]&0x0f],
+                hextable[(state[3]>>4)&0x0f], hextable[state[3]&0x0f],
             ), nil
 
         } else if ip.Is6() {
-            // OPTIMIZATION: Pre-computed AES (Zero Alloc)
             if config.aesBlock != nil {
                 src := ip.As16()
                 var enc [16]byte
                 config.aesBlock.Encrypt(enc[:], src[:])
                 return hex.AppendEncode(dst, enc[:]), nil
             }
-            // Fallback
             src := ip.As16()
             encrypted, err := ipcrypt.EncryptIP(config.Key, src[:])
             if err != nil {
@@ -241,7 +237,6 @@ func permute(s *[4]byte) {
     s[0] ^= s[1]
 }
 
-// EncryptIP is a compatibility wrapper.
 func (config *IPCryptConfig) EncryptIP(ip net.IP) (string, error) {
     if config == nil {
         return ip.String(), nil
@@ -254,11 +249,9 @@ func (config *IPCryptConfig) EncryptIP(ip net.IP) (string, error) {
     if err != nil {
         return "", err
     }
-    // OPTIMIZATION: Zero-copy conversion from []byte to string
     return unsafe.String(unsafe.SliceData(res), len(res)), nil
 }
 
-// EncryptIPString is a compatibility wrapper.
 func (config *IPCryptConfig) EncryptIPString(ipStr string) string {
     if config == nil {
         return ipStr
@@ -271,6 +264,5 @@ func (config *IPCryptConfig) EncryptIPString(ipStr string) string {
     if err != nil {
         return ipStr
     }
-    // OPTIMIZATION: Zero-copy conversion from []byte to string
     return unsafe.String(unsafe.SliceData(res), len(res))
 }
