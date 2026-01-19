@@ -7,7 +7,6 @@ import (
     "crypto/tls"
     "crypto/x509"
     "encoding/base64"
-    "encoding/hex"
     "errors"
     "hash/fnv"
     "io"
