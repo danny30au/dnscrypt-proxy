@@ -165,6 +165,8 @@ type DSO interface {
 // MsgHeader is the header of a DNS message. This contains most header bits, except Rcode as that needs to be
 // set via a function because of the extended Rcode that lives in the pseudo section.
 type MsgHeader struct {
+	offset uint16
+
 	// Both qtype and Options are moved there to aid in struct alignment.
 	// aligo -s Msg view .  shows 4 bytes padding for the hijacked field
 
@@ -198,6 +200,7 @@ type MsgHeader struct {
 	Security       bool // Security is the DNSSEC OK bit, see RFC 403{3,4,5}.
 	CompactAnswers bool // Compact Answers OK, https://datatracker.ietf.org/doc/draft-ietf-dnsop-compact-denial-of-existence/.
 	Delegation     bool // Delegation is the DELEG OK bit, see https://datatracker.ietf.org/doc/draft-ietf-deleg/.
+
 }
 
 // Msg is a DNS message. Each message has a Data field that contains the binary data buffer. This is filled when
@@ -239,9 +242,10 @@ type Msg struct {
 	hijacked atomic.Bool // pool's allocation has been hijacked by caller
 }
 
-// Option is an option on how to handle a message. Options can be combined, but that have to be "in order", if
-// you only want to unpack the Question section you must also set unpack header: OptionUnpackHeader |
-// OptionUnpackQuestion.
+// Option is an option on how to handle a message. The options are ordered, MsgOptionUnpackQuestion will also
+// unpack the header of the message. If MsgOptionUnpackQuestion is used, Unpack will track where it left off
+// and then skip unpacking the question section in a subsequent Unpack that is done to get the entire message
+// of which the header and question section where previously deemed valid.
 type MsgOption uint8
 
 const (
@@ -249,7 +253,7 @@ const (
 	MsgOptionUnpackHeader   MsgOption = 1 << iota // Unpack only the header of the message.
 	MsgOptionUnpackQuestion                       // Unpack up the question section of the message.
 	MsgOptionUnpackAnswer                         // Unpack up to the answer section of the message.
-	// OptionNoBufferUse // reuse buffers? Or something else that tells what to do do with the buffer.
+
 )
 
 // Convert a MsgHeader to a string, with dig-like headers:

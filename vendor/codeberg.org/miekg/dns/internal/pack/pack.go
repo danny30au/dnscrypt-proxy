@@ -29,6 +29,7 @@ func Uint16(i uint16, msg []byte, off int) (off1 int, err error) {
 	if off+2 > len(msg) {
 		return len(msg), &Error{"overflow uint16"}
 	}
+	_ = msg[off+1]
 	binary.BigEndian.PutUint16(msg[off:], i)
 	return off + 2, nil
 }
@@ -37,6 +38,7 @@ func Uint32(i uint32, msg []byte, off int) (off1 int, err error) {
 	if off+4 > len(msg) {
 		return len(msg), &Error{"overflow uint32"}
 	}
+	_ = msg[off+3]
 	binary.BigEndian.PutUint32(msg[off:], i)
 	return off + 4, nil
 }
@@ -45,6 +47,7 @@ func Uint48(i uint64, msg []byte, off int) (off1 int, err error) {
 	if off+6 > len(msg) {
 		return len(msg), &Error{"overflow uint64 as uint48"}
 	}
+	_ = msg[off+5]
 	msg[off] = byte(i >> 40)
 	msg[off+1] = byte(i >> 32)
 	msg[off+2] = byte(i >> 24)
@@ -59,6 +62,7 @@ func Uint64(i uint64, msg []byte, off int) (off1 int, err error) {
 	if off+8 > len(msg) {
 		return len(msg), &Error{"overflow uint64"}
 	}
+	_ = msg[off+7]
 	binary.BigEndian.PutUint64(msg[off:], i)
 	off += 8
 	return off, nil
@@ -74,16 +78,8 @@ func StringAny(s string, msg []byte, off int) (int, error) {
 	return off, nil
 }
 
-func StringTxt(s []string, msg []byte, off int) (int, error) {
-	off, err := Txt(s, msg, off)
-	if err != nil {
-		return len(msg), err
-	}
-	return off, nil
-}
-
-func Txt(txt []string, msg []byte, off int) (int, error) {
-	if len(txt) == 0 {
+func Strings(s []string, msg []byte, off int) (int, error) {
+	if len(s) == 0 {
 		if off >= len(msg) {
 			return len(msg), ErrBuf
 		}
@@ -91,8 +87,8 @@ func Txt(txt []string, msg []byte, off int) (int, error) {
 		return off, nil
 	}
 	var err error
-	for i := range txt {
-		off, err = TxtString(txt[i], msg, off)
+	for i := range s {
+		off, err = String(s[i], msg, off)
 		if err != nil {
 			return len(msg), err
 		}
@@ -101,22 +97,28 @@ func Txt(txt []string, msg []byte, off int) (int, error) {
 }
 
 func String(s string, msg []byte, off int) (int, error) {
-	off, err := TxtString(s, msg, off)
-	if err != nil {
-		return len(msg), err
+	if strings.IndexByte(s, '\\') == -1 {
+		l := len(s)
+		if l > 255 {
+			return len(msg), &Error{"overflow string"}
+		}
+		if off+1+l > len(msg) {
+			return len(msg), &Error{"overflow string"}
+		}
+		msg[off] = byte(l)
+		copy(msg[off+1:], s)
+		return off + 1 + l, nil
 	}
-	return off, nil
-}
 
-func TxtString(s string, msg []byte, off int) (int, error) {
 	lenByteoff := off
 	if off >= len(msg) || len(s) > 256*4+1 /* If all \DDD */ {
-		return len(msg), &Error{"buffer size too small"}
+		return len(msg), &Error{"overflow string"}
 	}
 	off++
+
 	for i := 0; i < len(s); i++ {
 		if len(msg) <= off {
-			return off, &Error{"buffer size too small"}
+			return len(msg), &Error{"overflow string"}
 		}
 		if s[i] == '\\' {
 			i++
@@ -151,6 +153,7 @@ func A(a netip.Addr, msg []byte, off int) (int, error) {
 		return len(msg), &Error{"invalid a"}
 	}
 	val := a.As4()
+	_ = msg[off+3]
 	copy(msg[off:off+net.IPv4len], val[:])
 	return off + net.IPv4len, nil
 }
@@ -160,6 +163,7 @@ func AAAA(aaaa netip.Addr, msg []byte, off int) (int, error) {
 		return len(msg), &Error{"overflow aaaa"}
 	}
 	val := aaaa.As16()
+	_ = msg[off+15]
 	copy(msg[off:off+net.IPv6len], val[:])
 	return off + net.IPv6len, nil
 }
@@ -207,7 +211,7 @@ func Name(s string, msg []byte, off int, compression map[string]uint16, compress
 
 		// off can already (we're in a loop) be bigger than len(msg)
 		if off+1+labelLen > lenmsg {
-			return lenmsg, &Error{"buffer size too small"}
+			return lenmsg, &Error{"overflow name"}
 		}
 
 		if compress && labelLen > 1 { // don't try to compress '.'
