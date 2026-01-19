@@ -23,14 +23,14 @@ jobs:
           GOOS: linux
           GOARCH: amd64
           GOFIPS140: "latest"
-          GOEXPERIMENT: "greenteagc,jsonv2,nodwarf5,simd,runtimesecret"
+          GOEXPERIMENT: "greenteagc,jsonv2,nodwarf5,simd"
           GOGC: "1000"
           GOAMD64: v3
           GODEBUG: "thp=1,netdns=go,gctrace=0,fips140=on,madvdontneed=1,tls13=1"
           GOPRIVATE: "codeberg.org/miekg/dns,github.com/quic-go/quic-go,github.com/gorilla/websocket,google.golang.org/grpc,github.com/hashicorp/go-immutable-radix/v2,github.com/davecgh/go-spew"
           GOPROXY: "https://proxy.golang.org,direct"
         run: |
-          go get codeberg.org/miekg/dns@main
+          go get codeberg.org/miekg/dns
           go get github.com/quic-go/quic-go@master
           go get google.golang.org/grpc
           go get github.com/gorilla/websocket@main
