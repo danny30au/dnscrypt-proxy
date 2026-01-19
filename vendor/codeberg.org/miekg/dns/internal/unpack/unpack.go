@@ -7,8 +7,10 @@ import (
 	"net"
 	"net/netip"
 	"strings"
+	"sync"
 
 	"codeberg.org/miekg/dns/internal/ddd"
+	"codeberg.org/miekg/dns/pkg/pool"
 	"golang.org/x/crypto/cryptobyte"
 )
 
@@ -47,9 +49,7 @@ func StringAny(s *cryptobyte.String, len int) (string, error) {
 	return string(b), nil
 }
 
-func StringTxt(s *cryptobyte.String) ([]string, error) { return Txt(s) }
-
-func Txt(s *cryptobyte.String) ([]string, error) {
+func Strings(s *cryptobyte.String) ([]string, error) {
 	var strs []string
 	for !s.Empty() {
 		str, err := String(s)
@@ -66,7 +66,8 @@ func String(s *cryptobyte.String) (string, error) {
 	if !s.ReadUint8LengthPrefixed(&txt) {
 		return "", &Error{"overflow string"}
 	}
-	var sb strings.Builder
+
+	sb := builderPool.Get()
 	consumed := 0
 	for i, b := range txt {
 		switch {
@@ -91,7 +92,9 @@ func String(s *cryptobyte.String) (string, error) {
 		return string(txt), nil
 	}
 	sb.Write(txt[consumed:])
-	return sb.String(), nil
+	t := sb.String()
+	builderPool.Put(sb)
+	return t, nil
 }
 
 // Name unpacks a domain name.
@@ -113,7 +116,7 @@ func Name(s *cryptobyte.String, msgBuf []byte) (string, error) {
 	var c byte
 	for {
 		if !cs.ReadUint8(&c) {
-			return "", &Error{"overflow"}
+			return "", &Error{"overflow name"}
 		}
 		switch c & 0xC0 {
 		case 0x00: // literal string
@@ -142,7 +145,7 @@ func Name(s *cryptobyte.String, msgBuf []byte) (string, error) {
 			}
 			var c1 byte
 			if !cs.ReadUint8(&c1) {
-				return "", &Error{"overflow"}
+				return "", &Error{"overflow name"}
 			}
 			// If this is the first pointer we've seen, we need to advance s to our current position.
 			if !ptrs {
@@ -208,3 +211,5 @@ func Names(s *cryptobyte.String, msgBuf []byte) ([]string, error) {
 	}
 	return names, nil
 }
+
+var builderPool = &pool.Builder{Pool: sync.Pool{New: func() any { return strings.Builder{} }}}

@@ -278,6 +278,7 @@ func (m *Msg) Pack() error {
 			}
 		}
 	}
+	m.offset = 0
 	m.Data = m.Data[:off]
 	return nil
 }
@@ -327,8 +328,11 @@ func (m *Msg) unpackQuestions(cnt uint16, msg *cryptobyte.String, msgBuf []byte)
 }
 
 func unpackRRs(cnt uint16, msg *cryptobyte.String, msgBuf []byte) ([]RR, error) {
+	if cnt == 0 {
+		return []RR{}, nil
+	}
 	// See unpackQuestions for why we don't pre-allocate here.
-	dst := make([]RR, 0, 3)
+	dst := make([]RR, 0, min(5, cnt))
 	for i := 0; i < int(cnt); i++ {
 		r, err := unpackRR(msg, msgBuf)
 		if err != nil {
@@ -336,40 +340,37 @@ func unpackRRs(cnt uint16, msg *cryptobyte.String, msgBuf []byte) ([]RR, error) 
 		}
 		dst = append(dst, r)
 	}
-	if cnt != uint16(len(dst)) {
-		return dst, unpack.Errorf("section count mismatch: %d != %d", cnt, len(dst))
 
-	}
 	return dst, nil
 }
 
-func (m *Msg) unpack(dh header, msg, msgBuf []byte) error {
-	s := cryptobyte.String(msg)
-	var err error
+func (m *Msg) unpack(dh header, s *cryptobyte.String, msgBuf []byte) (err error) {
+	if m.offset > MsgHeaderSize {
+		s.Skip(int(m.offset - MsgHeaderSize)) // should never fail...?
+		goto Rest
+	}
 
-	m.Question, err = m.unpackQuestions(dh.Qdcount, &s, msgBuf)
-	if err != nil {
+	if m.Question, err = m.unpackQuestions(dh.Qdcount, s, msgBuf); err != nil {
 		return err
 	}
 	if m.Options > 0 && m.Options <= MsgOptionUnpackQuestion {
+		m.offset = uint16(len(msgBuf) - len(*s))
 		return nil
 	}
 
-	m.Answer, err = unpackRRs(dh.Ancount, &s, msgBuf)
-	if err != nil {
+Rest:
+	if m.Answer, err = unpackRRs(dh.Ancount, s, msgBuf); err != nil {
 		return err
 	}
 	if m.Options > 0 && m.Options <= MsgOptionUnpackAnswer {
 		return nil
 	}
 
-	m.Ns, err = unpackRRs(dh.Nscount, &s, msgBuf)
-	if err != nil {
+	if m.Ns, err = unpackRRs(dh.Nscount, s, msgBuf); err != nil {
 		return err
 	}
 
-	m.Extra, err = unpackRRs(dh.Arcount, &s, msgBuf)
-	if err != nil {
+	if m.Extra, err = unpackRRs(dh.Arcount, s, msgBuf); err != nil {
 		return err
 	}
 
@@ -411,7 +412,7 @@ func (m *Msg) unpack(dh header, msg, msgBuf []byte) error {
 	}
 
 	if !s.Empty() {
-		return unpack.Errorf("%d more octets", len(s))
+		return unpack.Errorf("%d more octets", len(*s))
 	}
 	return nil
 }
@@ -428,7 +429,7 @@ func (m *Msg) Unpack() error {
 		return nil
 	}
 
-	return m.unpack(dh, s, m.Data)
+	return m.unpack(dh, &s, m.Data)
 }
 
 // Convert a complete message to a string with dig-like output. String also looks at the [Msg.Options] and
@@ -671,7 +672,6 @@ func (m *Msg) Write(p []byte) (n int, err error) {
 			return 0, err
 		}
 	}
-
 	n = copy(m.Data, p)
 	return n, nil
 }
@@ -684,8 +684,10 @@ func (m *Msg) Read(p []byte) (n int, err error) {
 			return 0, err
 		}
 	}
-
 	n = copy(p, m.Data)
+	if len(p) > len(m.Data) {
+		return n, io.EOF
+	}
 	return n, nil
 }
 
