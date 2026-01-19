@@ -94,15 +94,17 @@ func HandleCaptivePortalQuery(msg *dns.Msg, question dns.RR, ips CaptivePortalEn
 
                 var rr dns.RR
                 if isA {
-                    r := new(dns.A)
-                    r.Hdr = dns.Header{Name: hdr.Name, Class: dns.ClassINET, TTL: ttl}
-                    r.A = rdata.A{Addr: ip}
-                    rr = r
+                    // Go 1.26: Pointer initialization via new(expr)
+                    rr = new(dns.A{
+                        Hdr: dns.Header{Name: hdr.Name, Class: dns.ClassINET, TTL: ttl},
+                        A:   rdata.A{Addr: ip},
+                    })
                 } else {
-                    r := new(dns.AAAA)
-                    r.Hdr = dns.Header{Name: hdr.Name, Class: dns.ClassINET, TTL: ttl}
-                    r.AAAA = rdata.AAAA{Addr: ip}
-                    rr = r
+                    // Go 1.26: Pointer initialization via new(expr)
+                    rr = new(dns.AAAA{
+                        Hdr:  dns.Header{Name: hdr.Name, Class: dns.ClassINET, TTL: ttl},
+                        AAAA: rdata.AAAA{Addr: ip},
+                    })
                 }
                 respMsg.Answer = append(respMsg.Answer, rr)
             }
@@ -138,10 +140,8 @@ func addColdStartListener(
     h.conns = append(h.conns, clientPc)
     h.mu.Unlock()
 
-    h.wg.Add(1)
-    go func() {
-        defer h.wg.Done()
-
+    // Go 1.25+: Combined WaitGroup addition and goroutine execution
+    h.wg.Go(func() {
         // Allocating buffer once outside the loop reuses memory for all packets
         buffer := make([]byte, MaxDNSPacketSize)
 
@@ -180,7 +180,7 @@ func addColdStartListener(
                 clientPc.WriteToUDP(respMsg.Data, clientAddr)
             }
         }
-    }()
+    })
     return nil
 }
 
