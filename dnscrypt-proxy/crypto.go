@@ -41,7 +41,7 @@ const (
 	ResponseOverhead = len(ServerMagic) + NonceSize + TagSize
 
 	// Optimized cache configuration
-	AEADCacheShardCount = 32  // Increased from 16 for better distribution
+	AEADCacheShardCount = 32   // Increased from 16 for better distribution
 	AEADCacheMaxSize    = 2048 // Increased from 1000
 
 	// Cache line size for alignment (64 bytes on most modern CPUs)
@@ -67,27 +67,27 @@ var (
 	// Optimized buffer pools with aligned allocations
 	bufferPoolTiny = sync.Pool{
 		New: func() interface{} {
-			return alignedAlloc(256)
+			return make([]byte, 256)
 		},
 	}
 	bufferPoolSmall = sync.Pool{
 		New: func() interface{} {
-			return alignedAlloc(512)
+			return make([]byte, 512)
 		},
 	}
 	bufferPoolMedium = sync.Pool{
 		New: func() interface{} {
-			return alignedAlloc(2048)
+			return make([]byte, 2048)
 		},
 	}
 	bufferPoolLarge = sync.Pool{
 		New: func() interface{} {
-			return alignedAlloc(8192)
+			return make([]byte, 8192)
 		},
 	}
 	bufferPoolHuge = sync.Pool{
 		New: func() interface{} {
-			return alignedAlloc(16384)
+			return make([]byte, 16384)
 		},
 	}
 
@@ -102,19 +102,19 @@ var (
 // CryptoMetrics with cache-line padding to prevent false sharing
 type CryptoMetrics struct {
 	AEADCacheHits   atomic.Uint64
-	_padding1       [cacheLineSize - 8]byte
+	_padding1       [cacheLineSize - unsafe.Sizeof(atomic.Uint64{})]byte
 	AEADCacheMisses atomic.Uint64
-	_padding2       [cacheLineSize - 8]byte
+	_padding2       [cacheLineSize - unsafe.Sizeof(atomic.Uint64{})]byte
 	AEADEvictions   atomic.Uint64
-	_padding3       [cacheLineSize - 8]byte
+	_padding3       [cacheLineSize - unsafe.Sizeof(atomic.Uint64{})]byte
 	WorkerPoolDepth atomic.Int32
-	_padding4       [cacheLineSize - 4]byte
+	_padding4       [cacheLineSize - unsafe.Sizeof(atomic.Int32{})]byte
 	UnpadLatencyUs  atomic.Uint64
-	_padding5       [cacheLineSize - 8]byte
+	_padding5       [cacheLineSize - unsafe.Sizeof(atomic.Uint64{})]byte
 	AvgLatencyUs    atomic.Uint64
-	_padding6       [cacheLineSize - 8]byte
+	_padding6       [cacheLineSize - unsafe.Sizeof(atomic.Uint64{})]byte
 	GCPausesMs      atomic.Uint64
-	_padding7       [cacheLineSize - 8]byte
+	_padding7       [cacheLineSize - unsafe.Sizeof(atomic.Uint64{})]byte
 }
 
 var globalCryptoMetrics CryptoMetrics
@@ -133,14 +133,10 @@ type nonceTrackerShard struct {
 
 var globalNonceTracker *NonceTracker
 
-type AdaptiveWorkerPool struct {
-	minWorkers  int
-	maxWorkers  int
-	jobs        chan batchJob
-	activeCount atomic.Int32
-	idleTimeout time.Duration
-	workerSem   chan struct{}
-	_padding    [cacheLineSize - 48]byte // Prevent false sharing
+type WorkerPool struct {
+	workers int
+	jobs    chan batchJob
+	_       [cacheLineSize - unsafe.Sizeof(int(0))]byte
 }
 
 type batchJob struct {
@@ -161,7 +157,7 @@ type encryptResult struct {
 	err       error
 }
 
-var globalWorkerPool *AdaptiveWorkerPool
+var globalWorkerPool *WorkerPool
 
 // Optimized sharded cache with lock-free reads where possible
 type ShardedAEADCache struct {
@@ -187,16 +183,6 @@ type aeadCacheEntry struct {
 	element   *list.Element
 	createdAt time.Time
 	_padding  [cacheLineSize - 24]byte
-}
-
-// alignedAlloc allocates cache-line aligned memory for better SIMD performance
-//go:noinline
-func alignedAlloc(size int) []byte {
-	// Allocate extra space for alignment
-	buf := make([]byte, size+cacheLineSize)
-	// Calculate aligned offset
-	offset := cacheLineSize - (int(uintptr(unsafe.Pointer(&buf[0]))) & (cacheLineSize - 1))
-	return buf[offset : offset+size : offset+size]
 }
 
 // Optimized constant-time unpadding with SIMD hints
@@ -235,7 +221,7 @@ func unpadConstantTime(packet []byte) ([]byte, error) {
 	return packet[:idx], nil
 }
 
-// AVX2/AVX512-optimized fast unpadding
+// Optimized unpadding
 //go:inline
 func unpadFast(packet []byte) ([]byte, error) {
 	if len(packet) == 0 {
@@ -247,85 +233,11 @@ func unpadFast(packet []byte) ([]byte, error) {
 		return nil, ErrInvalidPadding
 	}
 
-	tailLen := len(packet) - idx - 1
-	_ = packet[len(packet)-1] // BCE hint
-
-	if tailLen == 0 {
-		return packet[:idx], nil
-	}
-
-	// AVX512 path: process 64 bytes at once
-	if tailLen <= 128 && tailLen >= 64 && tailLen%64 == 0 && hasAVX512 {
-		tail := packet[idx+1:]
-		var acc [4]uint64
-		for i := 0; i < tailLen; i += 64 {
-			acc[0] |= binary.LittleEndian.Uint64(tail[i:])
-			acc[1] |= binary.LittleEndian.Uint64(tail[i+16:])
-			acc[2] |= binary.LittleEndian.Uint64(tail[i+32:])
-			acc[3] |= binary.LittleEndian.Uint64(tail[i+48:])
-		}
-		if (acc[0] | acc[1] | acc[2] | acc[3]) != 0 {
+	// Verify tail is all zeros
+	for _, b := range packet[idx+1:] {
+		if b != 0 {
 			return nil, ErrInvalidPadBytes
 		}
-		return packet[:idx], nil
-	}
-
-	// AVX2 path: process 32 bytes at once
-	if tailLen <= 128 && tailLen >= 32 && tailLen%32 == 0 && hasAVX2 {
-		tail := packet[idx+1:]
-		var acc0, acc1, acc2, acc3 uint64
-		for i := 0; i < tailLen; i += 32 {
-			acc0 |= binary.LittleEndian.Uint64(tail[i:])
-			acc1 |= binary.LittleEndian.Uint64(tail[i+8:])
-			acc2 |= binary.LittleEndian.Uint64(tail[i+16:])
-			acc3 |= binary.LittleEndian.Uint64(tail[i+24:])
-		}
-		if (acc0 | acc1 | acc2 | acc3) != 0 {
-			return nil, ErrInvalidPadBytes
-		}
-		return packet[:idx], nil
-	}
-
-	// SSE2 path: 16-byte aligned
-	if tailLen <= 64 && tailLen >= 16 && tailLen%16 == 0 {
-		tail := packet[idx+1:]
-		var acc0, acc1 uint64
-		for i := 0; i < tailLen; i += 16 {
-			acc0 |= binary.LittleEndian.Uint64(tail[i:])
-			acc1 |= binary.LittleEndian.Uint64(tail[i+8:])
-		}
-		if (acc0 | acc1) != 0 {
-			return nil, ErrInvalidPadBytes
-		}
-		return packet[:idx], nil
-	}
-
-	// Scalar path with unrolling
-	var mismatch byte
-	if tailLen <= 64 {
-		tail := packet[idx+1:]
-		// Unroll by 8
-		i := 0
-		for ; i+8 <= tailLen; i += 8 {
-			mismatch |= tail[i] | tail[i+1] | tail[i+2] | tail[i+3] |
-				tail[i+4] | tail[i+5] | tail[i+6] | tail[i+7]
-		}
-		for ; i < tailLen; i++ {
-			mismatch |= tail[i]
-		}
-	} else if tailLen <= len(zeroPage) {
-		if subtle.ConstantTimeCompare(packet[idx+1:], zeroPage[:tailLen]) != 1 {
-			return nil, ErrInvalidPadBytes
-		}
-		return packet[:idx], nil
-	} else {
-		for i := idx + 1; i < len(packet); i++ {
-			mismatch |= packet[i]
-		}
-	}
-
-	if mismatch != 0 {
-		return nil, ErrInvalidPadBytes
 	}
 	return packet[:idx], nil
 }
@@ -357,7 +269,7 @@ func getBuffer(size int) []byte {
 //go:inline
 func putBuffer(buf []byte) {
 	c := cap(buf)
-	if c > 32768 {
+	if c > 16384 {
 		return // Don't pool oversized buffers
 	}
 	switch {
@@ -377,20 +289,7 @@ func putBuffer(buf []byte) {
 // Optimized zero-copy clearBytes using assembly hints
 //go:noinline
 func clearBytes(b []byte) {
-	// Use memclrNoHeapPointers for zero-cost clearing (Go 1.21+)
-	for i := range b {
-		b[i] = 0
-	}
-	runtime.KeepAlive(b)
-}
-
-// Fast clearing using compiler intrinsics
-//go:inline
-func clearBytesFast(b []byte) {
-	// Let compiler optimize to REP STOSB or SIMD
-	for i := range b {
-		b[i] = 0
-	}
+	clear(b)
 }
 
 // ComputeSharedKey with optimized error handling
@@ -468,16 +367,17 @@ func newShardedAEADCache(shardCount int, maxSize int) *ShardedAEADCache {
 	return cache
 }
 
-// Fast shard selection using bitmask instead of modulo
+// Fast shard selection using XOR-folding
 //go:inline
 func (sc *ShardedAEADCache) getShard(key *[32]byte) *aeadCacheShard {
-	// Use FNV-1a hash for better distribution
-	hash := uint32(2166136261)
-	for _, b := range key[:8] { // Hash first 8 bytes for speed
-		hash ^= uint32(b)
-		hash *= 16777619
-	}
-	return &sc.shards[hash&sc.shardMask]
+	// XOR-fold key to 64-bit for better distribution
+	k := *(*[4]uint64)(unsafe.Pointer(key))
+	h := k[0] ^ k[1] ^ k[2] ^ k[3]
+	// Mix
+	h ^= h >> 33
+	h *= 0xff51afd7ed558ccd
+	h ^= h >> 33
+	return &sc.shards[h&uint64(sc.shardMask)]
 }
 
 // Optimized AEAD cache with lock-free fast path
@@ -495,12 +395,6 @@ func (sc *ShardedAEADCache) getOrCreateAEAD(sharedKey *[32]byte, isXChaCha bool)
 		shard.mu.Lock()
 		if entry.element != nil {
 			shard.lru.MoveToFront(entry.element)
-		}
-
-		// Probabilistic refresh
-		now := time.Now()
-		if now.Sub(entry.createdAt) > 5*time.Minute && fastRand64()&0xFF < 13 { // ~5%
-			entry.createdAt = now
 		}
 		shard.mu.Unlock()
 
@@ -571,74 +465,38 @@ func fastRand64() uint64 {
 }
 
 // Init worker pool
-func initAdaptiveWorkerPool(minWorkers, maxWorkers int) {
-	if minWorkers <= 0 {
-		minWorkers = 2
-	}
-	if maxWorkers <= 0 {
-		maxWorkers = runtime.NumCPU()
-	}
-	if minWorkers > maxWorkers {
-		minWorkers = maxWorkers
+func initWorkerPool(workers int) {
+	if workers <= 0 {
+		workers = runtime.NumCPU()
 	}
 
-	globalWorkerPool = &AdaptiveWorkerPool{
-		minWorkers:  minWorkers,
-		maxWorkers:  maxWorkers,
-		jobs:        make(chan batchJob, maxWorkers*4), // Increased buffer
-		idleTimeout: 30 * time.Second,
-		workerSem:   make(chan struct{}, maxWorkers),
+	globalWorkerPool = &WorkerPool{
+		workers: workers,
+		jobs:    make(chan batchJob, workers*16), // Increased buffer
 	}
 
-	for i := 0; i < minWorkers; i++ {
-		globalWorkerPool.activeCount.Add(1)
+	for i := 0; i < workers; i++ {
 		go globalWorkerPool.worker()
 	}
 }
 
-func (p *AdaptiveWorkerPool) worker() {
-	defer p.activeCount.Add(-1)
+func (p *WorkerPool) worker() {
+	for job := range p.jobs {
+		if job.packet == nil {
+			return
+		}
 
-	idleTimer := time.NewTimer(p.idleTimeout)
-	defer idleTimer.Stop()
+		_, enc, nonce, err := job.proxy.EncryptInto(
+			job.dst, nil, job.serverInfo, job.packet, job.proto,
+		)
 
-	for {
-		select {
-		case job := <-p.jobs:
-			if job.packet == nil {
-				return
-			}
-			idleTimer.Reset(p.idleTimeout)
-
-			_, enc, nonce, err := job.proxy.EncryptInto(
-				job.dst, nil, job.serverInfo, job.packet, job.proto,
-			)
-			job.result <- encryptResult{
-				idx:       job.idx,
-				encrypted: enc,
-				nonce:     nonce,
-				err:       err,
-			}
-
-		case <-idleTimer.C:
-			if p.activeCount.Load() > int32(p.minWorkers) {
-				return
-			}
-			idleTimer.Reset(p.idleTimeout)
+		job.result <- encryptResult{
+			idx:       job.idx,
+			encrypted: enc,
+			nonce:     nonce,
+			err:       err,
 		}
 	}
-}
-
-func (p *AdaptiveWorkerPool) scaleUp() {
-	if p.activeCount.Load() < int32(p.maxWorkers) {
-		p.activeCount.Add(1)
-		go p.worker()
-	}
-}
-
-func randomFloat64() float64 {
-	val := fastRand64()
-	return float64(val) / float64(^uint64(0))
 }
 
 // Init function with AVX512 detection
@@ -678,12 +536,12 @@ func init() {
 	}
 
 	for i := 0; i < poolWarmupSize; i++ {
-		bufferPoolTiny.Put(alignedAlloc(256))
-		bufferPoolSmall.Put(alignedAlloc(512))
-		bufferPoolMedium.Put(alignedAlloc(2048))
-		bufferPoolLarge.Put(alignedAlloc(8192))
+		bufferPoolTiny.Put(make([]byte, 256))
+		bufferPoolSmall.Put(make([]byte, 512))
+		bufferPoolMedium.Put(make([]byte, 2048))
+		bufferPoolLarge.Put(make([]byte, 8192))
 		if i < poolWarmupSize/2 {
-			bufferPoolHuge.Put(alignedAlloc(16384))
+			bufferPoolHuge.Put(make([]byte, 16384))
 		}
 	}
 
@@ -703,7 +561,7 @@ func init() {
 			maxWorkers = min(w, 256)
 		}
 	}
-	initAdaptiveWorkerPool(minWorkers, maxWorkers)
+	initWorkerPool(maxWorkers)
 
 	// Optional nonce tracker
 	if os.Getenv("DNSCRYPT_TRACK_NONCES") == "1" {
@@ -786,7 +644,7 @@ func (proxy *Proxy) EncryptInto(
 			return nil, nil, nil, keyErr
 		}
 		// Clear ephemeral key
-		clearBytesFast(ephSk[:])
+		clearBytes(ephSk[:])
 	} else {
 		computedSharedKey = serverInfo.SharedKey
 		publicKey = &proxy.proxyPublicKey
@@ -842,7 +700,7 @@ func (proxy *Proxy) EncryptInto(
 
 	// Fast zero tail
 	if packetLen+1 < plaintextLen {
-		clearBytesFast(plaintext[packetLen+1:])
+		clearBytes(plaintext[packetLen+1:])
 	}
 
 	// Use cached AEAD
@@ -947,87 +805,6 @@ func (proxy *Proxy) Decrypt(
 	return packet, nil
 }
 
-// Elligator 2 Implementation for Censorship Resistance
-// PLACEHOLDER: production code should use filippo.io/edwards25519/field
-
-// ElligatorForward maps a representative (uniform random) to a Curve25519 point
-// PLACEHOLDER: Use filippo.io/edwards25519 or monocypher for production
-func ElligatorForward(representative []byte) []byte {
-	if len(representative) != 32 {
-		return nil
-	}
-
-	// PLACEHOLDER: Real implementation requires proper field arithmetic
-	// For production, use filippo.io/edwards25519/field or libsodium bindings
-	out := make([]byte, 32)
-	copy(out, representative)
-	return out
-}
-
-// ElligatorReverse attempts to map a Curve25519 public key to uniform representative
-// Returns (representative, true) on success, (nil, false) if point cannot be encoded
-// PLACEHOLDER: Only ~50% of valid points can be mapped (need retry in key generation)
-func ElligatorReverse(publicKey *[32]byte) ([]byte, bool) {
-	// PLACEHOLDER: Real implementation requires:
-	// 1. Check if -u*(u+A) is a square in GF(2^255-19)
-	// 2. Compute r via constant-time sqrt and selection
-	// 3. Use filippo.io/edwards25519/field for proper field operations
-
-	representative := make([]byte, 32)
-	copy(representative, publicKey[:])
-	representative[31] &= 0x3F // Clear top 2 bits for uniformity
-
-	// WARNING: This always returns true - real implementation returns false ~50% of time
-	return representative, true
-}
-
-// GenerateObfuscatedKeyPairWithHint generates X25519 keypair with hint-based optimization
-// May need multiple attempts (average 2 tries) since only ~50% of points work
-func GenerateObfuscatedKeyPairWithHint(hint byte) (privateKey, publicKey, representative []byte, err error) {
-	for attempts := 0; attempts < 128; attempts++ {
-		priv := make([]byte, 32)
-		if err := readRandom(priv); err != nil {
-			return nil, nil, nil, err
-		}
-
-		// Clamp for X25519
-		priv[0] &= 248
-		priv[31] &= 127
-		priv[31] |= 64
-
-		// Use hint to guide generation
-		if hint != 0 {
-			priv[0] ^= hint
-		}
-
-		// Compute public key
-		pub, err := curve25519.X25519(priv, curve25519.Basepoint)
-		if err != nil {
-			continue
-		}
-
-		// Try to encode as Elligator representative
-		var pubArray [32]byte
-		copy(pubArray[:], pub)
-		repr, ok := ElligatorReverse(&pubArray)
-		if ok {
-			return priv, pub, repr, nil
-		}
-	}
-
-	return nil, nil, nil, errors.New("failed to generate Elligator-encodable key after 128 attempts")
-}
-
-// GenerateObfuscatedKeyPair generates X25519 keypair encodable via Elligator 2
-func GenerateObfuscatedKeyPair() (privateKey, publicKey, representative []byte, err error) {
-	var hint byte
-	var hintBuf [1]byte
-	if err := readRandom(hintBuf[:]); err == nil {
-		hint = hintBuf[0]
-	}
-	return GenerateObfuscatedKeyPairWithHint(hint)
-}
-
 // EncryptBatch processes multiple packets using worker pool
 func (proxy *Proxy) EncryptBatch(
 	serverInfo *ServerInfo,
@@ -1091,5 +868,5 @@ dnscrypt_aead_cache_size %d
 # HELP dnscrypt_worker_pool_depth Active worker count
 # TYPE dnscrypt_worker_pool_depth gauge
 dnscrypt_worker_pool_depth %d
-`, hitRate, len(globalAEADCache.shards), globalWorkerPool.activeCount.Load())
+`, hitRate, len(globalAEADCache.shards), int32(globalWorkerPool.workers))
 }
