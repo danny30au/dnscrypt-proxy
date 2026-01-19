@@ -119,6 +119,7 @@ func NewIPCryptConfig(keyHex string, algorithm string) (*IPCryptConfig, error) {
         New: func() interface{} {
             var seed [32]byte
             if _, err := crand.Read(seed[:]); err != nil {
+                // Should not happen, but safe fallback logic
                 panic("failed to seed RNG: " + err.Error())
             }
             return mrand.NewChaCha8(seed)
@@ -129,7 +130,6 @@ func NewIPCryptConfig(keyHex string, algorithm string) (*IPCryptConfig, error) {
 }
 
 // AppendEncryptIP appends the encrypted IP (as hex) to dst.
-// This is the high-performance zero-allocation method.
 func (config *IPCryptConfig) AppendEncryptIP(dst []byte, ip netip.Addr) ([]byte, error) {
     if config == nil {
         return ip.AppendTo(dst), nil
@@ -224,11 +224,10 @@ func (config *IPCryptConfig) EncryptIP(ip net.IP) (string, error) {
     if config == nil {
         return ip.String(), nil
     }
-    addr, ok := netip.FromSlice(ip)
+    addr, ok := netip.AddrFromSlice(ip)
     if !ok {
         return "", ErrInvalidIP
     }
-    // Append to empty buffer and convert to string
     res, err := config.AppendEncryptIP(nil, addr)
     if err != nil {
         return "", err
@@ -237,18 +236,20 @@ func (config *IPCryptConfig) EncryptIP(ip net.IP) (string, error) {
 }
 
 // EncryptIPString is a compatibility wrapper for code passing string IPs.
-// This fixes the 'ipCryptConfig.EncryptIPString undefined' error.
-func (config *IPCryptConfig) EncryptIPString(ipStr string) (string, error) {
+// Returns the original IP if encryption fails or config is nil.
+func (config *IPCryptConfig) EncryptIPString(ipStr string) string {
     if config == nil {
-        return ipStr, nil
+        return ipStr
     }
     addr, err := netip.ParseAddr(ipStr)
     if err != nil {
-        return "", fmt.Errorf("%w: %v", ErrInvalidIP, err)
+        // Fallback: return original string if it's not a valid IP (e.g. hostname?)
+        // or just invalid input.
+        return ipStr
     }
     res, err := config.AppendEncryptIP(nil, addr)
     if err != nil {
-        return "", err
+        return ipStr
     }
-    return string(res), nil
+    return string(res)
 }
