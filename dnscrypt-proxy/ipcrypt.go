@@ -2,6 +2,7 @@
 package main
 
 import (
+    "bytes"
     "crypto/aes"
     "crypto/cipher"
     crand "crypto/rand"
@@ -13,11 +14,12 @@ import (
     "net/netip"
     "strings"
     "sync"
+    "unsafe"
 
     ipcrypt "github.com/jedisct1/go-ipcrypt"
 )
 
-// Algorithm type constants to avoid string comparisons in hot paths
+// Algorithm type constants
 type Algorithm uint8
 
 const (
@@ -28,7 +30,7 @@ const (
     AlgPrefixPreserving
 )
 
-// Common errors pre-allocated to avoid runtime allocation
+// Common errors
 var (
     ErrNoKey              = errors.New("IP encryption algorithm set but no key provided")
     ErrInvalidKeyHex      = errors.New("invalid IP encryption key (must be hex)")
@@ -44,15 +46,10 @@ const hextable = "0123456789abcdef"
 type IPCryptConfig struct {
     Key       []byte
     Algorithm Algorithm
-
-    // Optimization: Pre-computed AES block for IPv6 (AlgDeterministic)
-    aesBlock cipher.Block
-
-    // Optimization: Pool of RNGs for tweaks
-    rngPool sync.Pool
+    aesBlock  cipher.Block
+    rngPool   sync.Pool
 }
 
-// ParseAlgorithm converts string algorithm name to Algorithm enum.
 func ParseAlgorithm(s string) (Algorithm, error) {
     switch strings.ToLower(s) {
     case "", "none":
@@ -70,7 +67,6 @@ func ParseAlgorithm(s string) (Algorithm, error) {
     }
 }
 
-// NewIPCryptConfig creates a new IPCryptConfig with optimized structures.
 func NewIPCryptConfig(keyHex string, algorithm string) (*IPCryptConfig, error) {
     algo, err := ParseAlgorithm(algorithm)
     if err != nil {
@@ -83,18 +79,22 @@ func NewIPCryptConfig(keyHex string, algorithm string) (*IPCryptConfig, error) {
         return nil, ErrNoKey
     }
 
-    key, err := hex.DecodeString(keyHex)
+    rawKey, err := hex.DecodeString(keyHex)
     if err != nil {
         return nil, fmt.Errorf("%w: %v", ErrInvalidKeyHex, err)
     }
 
+    // Validation
     expectedLen := 16
     if algo == AlgNonDeterministicX || algo == AlgPrefixPreserving {
         expectedLen = 32
     }
-    if len(key) != expectedLen {
-        return nil, fmt.Errorf("%s requires %d-byte key, got %d", algorithm, expectedLen, len(key))
+    if len(rawKey) != expectedLen {
+        return nil, fmt.Errorf("%s requires %d-byte key, got %d", algorithm, expectedLen, len(rawKey))
     }
+
+    // SAFETY: Make a defensive copy of the key so external mutations don't affect us
+    key := bytes.Clone(rawKey)
 
     config := &IPCryptConfig{
         Key:       key,
@@ -110,7 +110,7 @@ func NewIPCryptConfig(keyHex string, algorithm string) (*IPCryptConfig, error) {
         config.aesBlock = block
     }
 
-    // Initialize RNG pool with secure seeding
+    // Initialize RNG pool
     config.rngPool = sync.Pool{
         New: func() interface{} {
             var seed [32]byte
@@ -136,22 +136,19 @@ func (config *IPCryptConfig) AppendEncryptIP(dst []byte, ip netip.Addr) ([]byte,
             // OPTIMIZATION: Inline ipcrypt cipher (Zero Alloc)
             state := ip.As4()
             
-            // Initial Key XOR
+            // Inline Cipher: Add/Rot/Xor/RotAdd/RotXor/Rot/Add/Xor
             state[0] ^= config.Key[0]; state[1] ^= config.Key[1]
             state[2] ^= config.Key[2]; state[3] ^= config.Key[3]
             permute(&state)
 
-            // Round 2
             state[0] ^= config.Key[4]; state[1] ^= config.Key[5]
             state[2] ^= config.Key[6]; state[3] ^= config.Key[7]
             permute(&state)
 
-            // Round 3
             state[0] ^= config.Key[8]; state[1] ^= config.Key[9]
             state[2] ^= config.Key[10]; state[3] ^= config.Key[11]
             permute(&state)
 
-            // Final Key XOR
             state[0] ^= config.Key[12]; state[1] ^= config.Key[13]
             state[2] ^= config.Key[14]; state[3] ^= config.Key[15]
             
@@ -205,7 +202,6 @@ func (config *IPCryptConfig) AppendEncryptIP(dst []byte, ip netip.Addr) ([]byte,
         return hex.AppendEncode(dst, encrypted), nil
 
     case AlgPrefixPreserving:
-        // OPTIMIZATION: Stack allocation for input
         var buf [16]byte
         var inputSlice []byte
         if ip.Is4() {
@@ -217,7 +213,6 @@ func (config *IPCryptConfig) AppendEncryptIP(dst []byte, ip netip.Addr) ([]byte,
             copy(buf[:], a16[:])
             inputSlice = buf[:16]
         }
-        
         encrypted, err := ipcrypt.EncryptIPPfx(inputSlice, config.Key)
         if err != nil {
             return dst, err
@@ -228,7 +223,6 @@ func (config *IPCryptConfig) AppendEncryptIP(dst []byte, ip netip.Addr) ([]byte,
     return dst, ErrUnsupportedAlgo
 }
 
-// permute implements the core ipcrypt permutation (4-byte S-box).
 func permute(s *[4]byte) {
     s[0] += s[1]
     s[2] += s[3]
@@ -247,7 +241,7 @@ func permute(s *[4]byte) {
     s[0] ^= s[1]
 }
 
-// EncryptIP is a compatibility wrapper for code passing net.IP.
+// EncryptIP is a compatibility wrapper.
 func (config *IPCryptConfig) EncryptIP(ip net.IP) (string, error) {
     if config == nil {
         return ip.String(), nil
@@ -260,10 +254,11 @@ func (config *IPCryptConfig) EncryptIP(ip net.IP) (string, error) {
     if err != nil {
         return "", err
     }
-    return string(res), nil
+    // OPTIMIZATION: Zero-copy conversion from []byte to string
+    return unsafe.String(unsafe.SliceData(res), len(res)), nil
 }
 
-// EncryptIPString is a compatibility wrapper for code passing string IPs.
+// EncryptIPString is a compatibility wrapper.
 func (config *IPCryptConfig) EncryptIPString(ipStr string) string {
     if config == nil {
         return ipStr
@@ -276,5 +271,6 @@ func (config *IPCryptConfig) EncryptIPString(ipStr string) string {
     if err != nil {
         return ipStr
     }
-    return string(res)
+    // OPTIMIZATION: Zero-copy conversion from []byte to string
+    return unsafe.String(unsafe.SliceData(res), len(res))
 }
