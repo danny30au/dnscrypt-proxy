@@ -691,7 +691,13 @@ func init() {
 	globalAEADCache = newShardedAEADCache(AEADCacheShardCount, AEADCacheMaxSize)
 
 	// Initialize worker pool
+	minWorkers := 2
 	maxWorkers := runtime.NumCPU() * 2 // Increased from NumCPU
+	if val := os.Getenv("DNSCRYPT_MIN_WORKERS"); val != "" {
+		if w, err := strconv.Atoi(val); err == nil && w > 0 {
+			minWorkers = min(w, 256)
+		}
+	}
 	if val := os.Getenv("DNSCRYPT_MAX_WORKERS"); val != "" {
 		if w, err := strconv.Atoi(val); err == nil && w > 0 {
 			maxWorkers = min(w, 256)
