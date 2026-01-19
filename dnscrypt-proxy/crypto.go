@@ -313,6 +313,7 @@ for ; i < tailLen; i++ {
 mismatch |= tail[i]
 }
 } else if tailLen <= len(zeroPage) {
+// Go 1.26: bytes.Equal uses optimized assembly for zero-checks
 if !bytes.Equal(packet[idx+1:], zeroPage[:tailLen]) {
 return nil, ErrInvalidPadBytes
 }
@@ -717,9 +718,9 @@ if err := readRandom(seed[:]); err == nil {
 rngState.Store(binary.LittleEndian.Uint64(seed[:]))
 }
 
-// Go 1.26+ automatically optimizes GOMAXPROCS for container/hardware limits
+// Go 1.26+ automatically optimizes GOMAXPROCS for hardware/container limits
 if os.Getenv("GOMAXPROCS") == "" {
-// runtime.GOMAXPROCS(runtime.NumCPU()) removed for native runtime handling
+// Go 1.26+ automatically optimizes GOMAXPROCS for hardware/container limits
 }
 }
 
@@ -769,20 +770,22 @@ var publicKey *[32]byte
 var computedSharedKey [32]byte
 
 if proxy.ephemeralKeys {
-var ephSk [32]byte
-var keyErr error
-secret.Do(func() {
+// Stack-allocate derive buffer
 var deriveBuf [HalfNonceSize + 32]byte
 copy(deriveBuf[:HalfNonceSize], randomBuf[:])
 copy(deriveBuf[HalfNonceSize:], proxy.proxySecretKey[:])
-ephSk = sha512.Sum512_256(deriveBuf[:])
+ephSk := sha512.Sum512_256(deriveBuf[:])
+
 curve25519.ScalarBaseMult(&proxy.ephemeralPublicKeyScratch, &ephSk)
-computedSharedKey, keyErr = ComputeSharedKey(cryptoAlgo, &ephSk, &serverPk, nil)
-})
 publicKey = &proxy.ephemeralPublicKeyScratch
+
+var keyErr error
+computedSharedKey, keyErr = ComputeSharedKey(cryptoAlgo, &ephSk, &serverPk, nil)
 if keyErr != nil {
 return nil, nil, nil, keyErr
 }
+// Clear ephemeral key
+clearBytesFast(ephSk[:])
 } else {
 computedSharedKey = serverInfo.SharedKey
 publicKey = &proxy.proxyPublicKey
