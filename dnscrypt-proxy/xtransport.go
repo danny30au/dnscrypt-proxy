@@ -51,12 +51,12 @@ const (
     ResolverIPTTLMaxJitter     = 15 * time.Minute
     ExpiredCachedIPGraceTTL    = 15 * time.Minute
     resolverRetryCount         = 3
-    resolverRetryInitialBackoff = 50 * time.Millisecond
+    resolverRetryInitialBackoff = 25 * time.Millisecond  // Reduced for faster retries
     resolverRetryMaxBackoff    = 300 * time.Millisecond
 )
 
 var resolverBackoffs = [resolverRetryCount]time.Duration{
-    resolverRetryInitialBackoff,
+    25 * time.Millisecond,  // Optimized backoff
     resolverRetryInitialBackoff * 2,
     resolverRetryMaxBackoff,
 }
@@ -116,6 +116,9 @@ type XTransport struct {
     dnsClientPool             sync.Pool
     dnsMessagePool            sync.Pool
     bufferPool                sync.Pool
+smallMsgPool              sync.Pool  // Pool for 512-byte DNS messages
+largeMsgPool              sync.Pool  // Pool for 4096-byte DNS messages
+resolverRTTCache          sync.Map   // Cache resolver RTT for adaptive backoff
     resolveGroup              singleflight.Group
     quicMu                    sync.Mutex
     quicUDP4                  *net.UDPConn
@@ -308,7 +311,7 @@ func (xTransport *XTransport) getQUICTransport(network string) (*quic.Transport,
     xTransport.quicMu.Lock()
     defer xTransport.quicMu.Unlock()
 
-    const sockBuf = 4 << 20
+    const sockBuf = 8 << 20  // Increased from 4MB to 8MB for better performance
 
     switch network {
     case "udp4":
@@ -384,7 +387,7 @@ func (xTransport *XTransport) rebuildTransport() {
     transport := &http.Transport{
         DisableKeepAlives:      false,
         DisableCompression:     true,
-        MaxIdleConns:           2000,
+        MaxIdleConns:           5000  // Increased for better connection reuse,
         MaxIdleConnsPerHost:    100,
         MaxConnsPerHost:        100,
         IdleConnTimeout:        90 * time.Second,
@@ -760,6 +763,7 @@ func (xTransport *XTransport) resolveUsingResolver(
             msg.RecursionDesired = true
             msg.UDPSize = uint16(MaxDNSPacketSize)
             msg.Security = true
+msg.Compress = true  // Enable DNS compression for reduced packet size
 
             var qIPs []net.IP
             var qTTL uint32
