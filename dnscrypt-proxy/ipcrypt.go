@@ -3,19 +3,19 @@ package main
 
 import (
   "bytes"
-\t"crypto/aes"
-\t"crypto/cipher"
-\tcrand "crypto/rand"
-\t"encoding/hex"
-\t"errors"
-\t"fmt"
-\tmrand "math/rand/v2"
-\t"net/netip"
-\t"strings"
-\t"sync"
-\t"unsafe"
+  "crypto/aes"
+  "crypto/cipher"
+   crand "crypto/rand"
+  "encoding/hex"
+  "errors"
+  "fmt"
+  mrand "math/rand/v2"
+  "net/netip"
+  "strings"
+  "sync"
+  "unsafe"
 
-\tipcrypt "github.com/jedisct1/go-ipcrypt"
+ipcrypt "github.com/jedisct1/go-ipcrypt"
 )
 
 type Algorithm uint8
