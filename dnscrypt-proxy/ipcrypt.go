@@ -2,7 +2,7 @@
 package main
 
 import (
-\t"bytes"
+  "bytes"
 \t"crypto/aes"
 \t"crypto/cipher"
 \tcrand "crypto/rand"
