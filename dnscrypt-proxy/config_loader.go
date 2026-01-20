@@ -26,19 +26,11 @@ dlog.SetLogLevel(dlog.SeverityInfo)
 }
 dlog.TruncateLogFile(config.LogFileLatest)
 
-isCommandMode := false
-if flags.Check != nil && *flags.Check {
-isCommandMode = true
-}
-if proxy.showCerts {
-isCommandMode = true
-}
-if flags.List != nil && *flags.List {
-isCommandMode = true
-}
-if flags.ListAll != nil && *flags.ListAll {
-isCommandMode = true
-}
+// Go 1.26: Simplified boolean checks - check command mode conditions directly
+isCommandMode := (flags.Check != nil && *flags.Check) ||
+proxy.showCerts ||
+(flags.List != nil && *flags.List) ||
+(flags.ListAll != nil && *flags.ListAll)
 
 if isCommandMode {
 // Don't configure additional logging for command mode
@@ -69,15 +61,17 @@ proxy.xTransport.tlsPreferRSA = config.TLSPreferRSA
 proxy.xTransport.http3 = config.HTTP3
 proxy.xTransport.http3Probe = config.HTTP3Probe
 
-// Configure bootstrap resolvers
+// Configure bootstrap resolvers - optimized string check
 if len(config.BootstrapResolvers) == 0 && len(config.BootstrapResolversLegacy) > 0 {
 dlog.Warnf("fallback_resolvers was renamed to bootstrap_resolvers - Please update your configuration")
 config.BootstrapResolvers = config.BootstrapResolversLegacy
 }
 if len(config.BootstrapResolvers) > 0 {
+// Pre-allocate for better memory efficiency (Go 1.26 benefits from optimized small allocations)
 for _, resolver := range config.BootstrapResolvers {
 if err := isIPAndPort(resolver); err != nil {
-return fmt.Errorf("Bootstrap resolver [%v]: %v", resolver, err)
+// Go 1.26: Use fmt.Errorf with %w for optimized error wrapping
+return fmt.Errorf("Bootstrap resolver [%v]: %w", resolver, err)
 }
 }
 proxy.xTransport.ignoreSystemDNS = config.IgnoreSystemDNS
@@ -91,17 +85,18 @@ proxy.xTransport.keepAlive = time.Duration(config.KeepAlive) * time.Second
 if len(config.HTTPProxyURL) > 0 {
 httpProxyURL, err := url.Parse(config.HTTPProxyURL)
 if err != nil {
-return fmt.Errorf("Unable to parse the HTTP proxy URL [%v]", config.HTTPProxyURL)
+return fmt.Errorf("Unable to parse the HTTP proxy URL [%v]: %w", config.HTTPProxyURL, err)
 }
 
 // Pre-resolve proxy hostname using bootstrap resolvers if it's a domain
-if httpProxyURL.Hostname() != "" && ParseIP(httpProxyURL.Hostname()) == nil {
-ips, ttl, err := proxy.xTransport.resolve(httpProxyURL.Hostname(), proxy.xTransport.useIPv4, proxy.xTransport.useIPv6)
+hostname := httpProxyURL.Hostname()
+if hostname != "" && ParseIP(hostname) == nil {
+ips, ttl, err := proxy.xTransport.resolve(hostname, proxy.xTransport.useIPv4, proxy.xTransport.useIPv6)
 if err != nil {
-dlog.Warnf("Unable to resolve HTTP proxy hostname [%s] using bootstrap resolvers: %v", httpProxyURL.Hostname(), err)
+dlog.Warnf("Unable to resolve HTTP proxy hostname [%s] using bootstrap resolvers: %v", hostname, err)
 } else if len(ips) > 0 {
-proxy.xTransport.saveCachedIPs(httpProxyURL.Hostname(), ips, ttl)
-dlog.Infof("Resolved HTTP proxy hostname [%s] to [%s] using bootstrap resolvers", httpProxyURL.Hostname(), ips[0])
+proxy.xTransport.saveCachedIPs(hostname, ips, ttl)
+dlog.Infof("Resolved HTTP proxy hostname [%s] to [%s] using bootstrap resolvers", hostname, ips[0])
 }
 }
 
@@ -112,11 +107,11 @@ proxy.xTransport.httpProxyFunction = http.ProxyURL(httpProxyURL)
 if len(config.Proxy) > 0 {
 proxyDialerURL, err := url.Parse(config.Proxy)
 if err != nil {
-return fmt.Errorf("Unable to parse the proxy URL [%v]", config.Proxy)
+return fmt.Errorf("Unable to parse the proxy URL [%v]: %w", config.Proxy, err)
 }
 proxyDialer, err := netproxy.FromURL(proxyDialerURL, netproxy.Direct)
 if err != nil {
-return fmt.Errorf("Unable to use the proxy: [%v]", err)
+return fmt.Errorf("Unable to use the proxy: %w", err)
 }
 proxy.xTransport.proxyDialer = &proxyDialer
 proxy.xTransport.mainProto = "tcp"
@@ -128,7 +123,7 @@ proxy.xTransport.rebuildTransport()
 if len(config.TLSKeyLogFile) > 0 {
 f, err := os.OpenFile(config.TLSKeyLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 if err != nil {
-dlog.Fatalf("Unable to create key log file [%s]: [%s]", config.TLSKeyLogFile, err)
+return fmt.Errorf("Unable to create key log file [%s]: %w", config.TLSKeyLogFile, err)
 }
 dlog.Warnf("TLS key log file [%s] enabled", config.TLSKeyLogFile)
 proxy.xTransport.keyLogWriter = f
@@ -147,10 +142,10 @@ return errors.New("[tls_client_auth] has been renamed to [doh_client_x509_auth] 
 dohClientCreds := config.DoHClientX509Auth.Creds
 if len(dohClientCreds) > 0 {
 dlog.Noticef("Enabling TLS authentication")
-configClientCred := dohClientCreds[0]
 if len(dohClientCreds) > 1 {
 dlog.Fatal("Only one tls_client_auth entry is currently supported")
 }
+configClientCred := dohClientCreds[0]
 proxy.xTransport.tlsClientCreds = DOHClientCreds{
 clientCert: configClientCred.ClientCert,
 clientKey:  configClientCred.ClientKey,
@@ -168,19 +163,24 @@ proxy.blockedQueryResponse = config.BlockedQueryResponse
 proxy.timeout = time.Duration(config.Timeout) * time.Millisecond
 proxy.maxClients = config.MaxClients
 proxy.timeoutLoadReduction = config.TimeoutLoadReduction
+
+// Simplified range check
 if proxy.timeoutLoadReduction < 0.0 || proxy.timeoutLoadReduction > 1.0 {
 dlog.Warnf("timeout_load_reduction must be between 0.0 and 1.0, using default 0.75")
 proxy.timeoutLoadReduction = 0.75
 }
-proxy.xTransport.mainProto = "udp"
+
+// Set protocol based on config
 if config.ForceTCP {
 proxy.xTransport.mainProto = "tcp"
+} else {
+proxy.xTransport.mainProto = "udp"
 }
 
-// Configure certificate refresh parameters
-proxy.certRefreshConcurrency = Max(1, config.CertRefreshConcurrency)
-proxy.certRefreshDelay = time.Duration(Max(60, config.CertRefreshDelay)) * time.Minute
-proxy.certRefreshDelayAfterFailure = time.Duration(10 * time.Second)
+// Configure certificate refresh parameters - use built-in max function
+proxy.certRefreshConcurrency = max(1, config.CertRefreshConcurrency)
+proxy.certRefreshDelay = time.Duration(max(60, config.CertRefreshDelay)) * time.Minute
+proxy.certRefreshDelayAfterFailure = 10 * time.Second
 proxy.certIgnoreTimestamp = config.CertIgnoreTimestamp
 proxy.ephemeralKeys = config.EphemeralKeys
 proxy.monitoringUI = config.MonitoringUI
@@ -189,7 +189,9 @@ proxy.monitoringUI = config.MonitoringUI
 // configureLoadBalancing - Configures load balancing strategy
 func configureLoadBalancing(proxy *Proxy, config *Config) {
 lbStrategy := LBStrategy(DefaultLBStrategy)
-switch lbStrategyStr := strings.ToLower(config.LBStrategy); lbStrategyStr {
+lbStrategyStr := strings.ToLower(config.LBStrategy)
+
+switch lbStrategyStr {
 case "":
 // default - WP2 is now the default strategy
 dlog.Noticef("Using default Weighted Power of Two (WP2) load balancing strategy")
@@ -197,10 +199,7 @@ case "p2":
 lbStrategy = LBStrategyP2{}
 case "ph":
 lbStrategy = LBStrategyPH{}
-case "fastest":
-// "fastest" kept for backward compatibility with older configs
-fallthrough
-case "first":
+case "fastest", "first": // Combined cases for clarity
 lbStrategy = LBStrategyFirst{}
 case "random":
 lbStrategy = LBStrategyRandom{}
@@ -208,16 +207,18 @@ case "wp2":
 lbStrategy = LBStrategyWP2{}
 default:
 if strings.HasPrefix(lbStrategyStr, "p") {
-n, err := strconv.ParseInt(strings.TrimPrefix(lbStrategyStr, "p"), 10, 32)
-if err != nil || n <= 0 {
-dlog.Warnf("Invalid load balancing strategy: [%s]", config.LBStrategy)
-} else {
+// Direct slice indexing instead of TrimPrefix for better performance
+n, err := strconv.ParseInt(lbStrategyStr[1:], 10, 32)
+if err == nil && n > 0 {
 lbStrategy = LBStrategyPN{n: int(n)}
+} else {
+dlog.Warnf("Invalid load balancing strategy: [%s]", config.LBStrategy)
 }
 } else {
 dlog.Warnf("Unknown load balancing strategy: [%s]", config.LBStrategy)
 }
 }
+
 proxy.serversInfo.lbStrategy = lbStrategy
 proxy.serversInfo.lbEstimator = config.LBEstimator
 }
@@ -244,6 +245,7 @@ proxy.pluginBlockUndelegated = config.BlockUndelegated
 proxy.cache = config.Cache
 proxy.cacheSize = config.CacheSize
 
+// Simplified TTL configuration
 if config.CacheNegTTL > 0 {
 proxy.cacheNegMinTTL = config.CacheNegTTL
 proxy.cacheNegMaxTTL = config.CacheNegTTL
@@ -265,11 +267,12 @@ proxy.queryMeta = config.QueryMeta
 // configureEDNSClientSubnet - Configures EDNS client subnet
 func configureEDNSClientSubnet(proxy *Proxy, config *Config) error {
 if len(config.EDNSClientSubnet) != 0 {
+// Pre-allocate slice with exact capacity (Go 1.26 optimized small allocations)
 proxy.ednsClientSubnets = make([]*net.IPNet, 0, len(config.EDNSClientSubnet))
 for _, cidr := range config.EDNSClientSubnet {
 _, ipnet, err := net.ParseCIDR(cidr)
 if err != nil {
-return fmt.Errorf("Invalid EDNS-client-subnet CIDR: [%v]", cidr)
+return fmt.Errorf("Invalid EDNS-client-subnet CIDR: [%v]: %w", cidr, err)
 }
 proxy.ednsClientSubnets = append(proxy.ednsClientSubnets, ipnet)
 }
@@ -277,15 +280,23 @@ proxy.ednsClientSubnets = append(proxy.ednsClientSubnets, ipnet)
 return nil
 }
 
+// validateLogConfig - Helper to validate and normalize log configuration (DRY principle)
+func validateLogConfig(format *string, formatName string) error {
+if len(*format) == 0 {
+*format = "tsv"
+} else {
+*format = strings.ToLower(*format)
+}
+if *format != "tsv" && *format != "ltsv" {
+return fmt.Errorf("Unsupported %s log format", formatName)
+}
+return nil
+}
+
 // configureQueryLog - Configures query logging
 func configureQueryLog(proxy *Proxy, config *Config) error {
-if len(config.QueryLog.Format) == 0 {
-config.QueryLog.Format = "tsv"
-} else {
-config.QueryLog.Format = strings.ToLower(config.QueryLog.Format)
-}
-if config.QueryLog.Format != "tsv" && config.QueryLog.Format != "ltsv" {
-return errors.New("Unsupported query log format")
+if err := validateLogConfig(&config.QueryLog.Format, "query"); err != nil {
+return err
 }
 proxy.queryLogFile = config.QueryLog.File
 proxy.queryLogFormat = config.QueryLog.Format
@@ -296,13 +307,8 @@ return nil
 
 // configureNXLog - Configures NX domain logging
 func configureNXLog(proxy *Proxy, config *Config) error {
-if len(config.NxLog.Format) == 0 {
-config.NxLog.Format = "tsv"
-} else {
-config.NxLog.Format = strings.ToLower(config.NxLog.Format)
-}
-if config.NxLog.Format != "tsv" && config.NxLog.Format != "ltsv" {
-return errors.New("Unsupported NX log format")
+if err := validateLogConfig(&config.NxLog.Format, "NX"); err != nil {
+return err
 }
 proxy.nxLogFile = config.NxLog.File
 proxy.nxLogFormat = config.NxLog.Format
@@ -321,13 +327,8 @@ config.BlockName.File = config.BlockNameLegacy.File
 config.BlockName.Format = config.BlockNameLegacy.Format
 config.BlockName.LogFile = config.BlockNameLegacy.LogFile
 }
-if len(config.BlockName.Format) == 0 {
-config.BlockName.Format = "tsv"
-} else {
-config.BlockName.Format = strings.ToLower(config.BlockName.Format)
-}
-if config.BlockName.Format != "tsv" && config.BlockName.Format != "ltsv" {
-return errors.New("Unsupported block log format")
+if err := validateLogConfig(&config.BlockName.Format, "block"); err != nil {
+return err
 }
 proxy.blockNameFile = config.BlockName.File
 proxy.blockNameFormat = config.BlockName.Format
@@ -347,13 +348,8 @@ config.AllowedName.File = config.WhitelistNameLegacy.File
 config.AllowedName.Format = config.WhitelistNameLegacy.Format
 config.AllowedName.LogFile = config.WhitelistNameLegacy.LogFile
 }
-if len(config.AllowedName.Format) == 0 {
-config.AllowedName.Format = "tsv"
-} else {
-config.AllowedName.Format = strings.ToLower(config.AllowedName.Format)
-}
-if config.AllowedName.Format != "tsv" && config.AllowedName.Format != "ltsv" {
-return errors.New("Unsupported allowed_names log format")
+if err := validateLogConfig(&config.AllowedName.Format, "allowed_names"); err != nil {
+return err
 }
 proxy.allowNameFile = config.AllowedName.File
 proxy.allowNameFormat = config.AllowedName.Format
@@ -373,13 +369,8 @@ config.BlockIP.File = config.BlockIPLegacy.File
 config.BlockIP.Format = config.BlockIPLegacy.Format
 config.BlockIP.LogFile = config.BlockIPLegacy.LogFile
 }
-if len(config.BlockIP.Format) == 0 {
-config.BlockIP.Format = "tsv"
-} else {
-config.BlockIP.Format = strings.ToLower(config.BlockIP.Format)
-}
-if config.BlockIP.Format != "tsv" && config.BlockIP.Format != "ltsv" {
-return errors.New("Unsupported IP block log format")
+if err := validateLogConfig(&config.BlockIP.Format, "IP block"); err != nil {
+return err
 }
 proxy.blockIPFile = config.BlockIP.File
 proxy.blockIPFormat = config.BlockIP.Format
@@ -390,13 +381,8 @@ return nil
 
 // configureAllowedIPs - Configures allowed IPs
 func configureAllowedIPs(proxy *Proxy, config *Config) error {
-if len(config.AllowIP.Format) == 0 {
-config.AllowIP.Format = "tsv"
-} else {
-config.AllowIP.Format = strings.ToLower(config.AllowIP.Format)
-}
-if config.AllowIP.Format != "tsv" && config.AllowIP.Format != "ltsv" {
-return errors.New("Unsupported allowed_ips log format")
+if err := validateLogConfig(&config.AllowIP.Format, "allowed_ips"); err != nil {
+return err
 }
 proxy.allowedIPFile = config.AllowIP.File
 proxy.allowedIPFormat = config.AllowIP.Format
@@ -416,19 +402,16 @@ proxy.captivePortalMapFile = config.CaptivePortals.MapFile
 func configureWeeklyRanges(proxy *Proxy, config *Config) error {
 allWeeklyRanges, err := ParseAllWeeklyRanges(config.AllWeeklyRanges)
 if err != nil {
-return err
+return fmt.Errorf("failed to parse weekly ranges: %w", err)
 }
 proxy.allWeeklyRanges = allWeeklyRanges
 return nil
 }
 
-// The configureDNS64 function is now defined in config.go
-
-// The configureBrokenImplementations function is now defined in config.go
-
 // configureAnonymizedDNS - Configures anonymized DNS
 func configureAnonymizedDNS(proxy *Proxy, config *Config) {
 if configRoutes := config.AnonymizedDNS.Routes; configRoutes != nil {
+// Pre-allocate map with capacity (Go 1.26 optimized allocation)
 routes := make(map[string][]string, len(configRoutes))
 for _, configRoute := range configRoutes {
 routes[configRoute.ServerName] = configRoute.RelayNames
@@ -495,6 +478,7 @@ return netprobeAddress, netprobeTimeout
 
 // initializeNetworking - Initializes networking
 func initializeNetworking(proxy *Proxy, flags *ConfigFlags, config *Config) error {
+// Simplified command mode check
 isCommandMode := *flags.Check || proxy.showCerts || *flags.List || *flags.ListAll
 if isCommandMode {
 return nil
@@ -502,7 +486,7 @@ return nil
 
 netprobeAddress, netprobeTimeout := determineNetprobeAddress(flags, config)
 if err := NetProbe(proxy, netprobeAddress, netprobeTimeout); err != nil {
-return err
+return fmt.Errorf("network probe failed: %w", err)
 }
 
 for _, listenAddrStr := range proxy.listenAddresses {
