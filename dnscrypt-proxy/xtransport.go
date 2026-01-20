@@ -56,7 +56,7 @@ const (
 )
 
 var resolverBackoffs = [resolverRetryCount]time.Duration{
-    25 * time.Millisecond,  // Optimized backoff
+    resolverRetryInitialBackoff,
     resolverRetryInitialBackoff * 2,
     resolverRetryMaxBackoff,
 }
@@ -116,9 +116,6 @@ type XTransport struct {
     dnsClientPool             sync.Pool
     dnsMessagePool            sync.Pool
     bufferPool                sync.Pool
-smallMsgPool              sync.Pool  // Pool for 512-byte DNS messages
-largeMsgPool              sync.Pool  // Pool for 4096-byte DNS messages
-resolverRTTCache          sync.Map   // Cache resolver RTT for adaptive backoff
     resolveGroup              singleflight.Group
     quicMu                    sync.Mutex
     quicUDP4                  *net.UDPConn
@@ -387,7 +384,7 @@ func (xTransport *XTransport) rebuildTransport() {
     transport := &http.Transport{
         DisableKeepAlives:      false,
         DisableCompression:     true,
-        MaxIdleConns:           5000  // Increased for better connection reuse,
+        MaxIdleConns:           5000,  // Increased for better connection reuse
         MaxIdleConnsPerHost:    100,
         MaxConnsPerHost:        100,
         IdleConnTimeout:        90 * time.Second,
@@ -763,7 +760,6 @@ func (xTransport *XTransport) resolveUsingResolver(
             msg.RecursionDesired = true
             msg.UDPSize = uint16(MaxDNSPacketSize)
             msg.Security = true
-msg.Compress = true  // Enable DNS compression for reduced packet size
 
             var qIPs []net.IP
             var qTTL uint32
