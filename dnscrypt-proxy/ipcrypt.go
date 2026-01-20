@@ -2,167 +2,167 @@
 package main
 
 import (
-  "bytes"
-  "crypto/aes"
-  "crypto/cipher"
-   crand "crypto/rand"
-  "encoding/hex"
-  "errors"
-  "fmt"
-  mrand "math/rand/v2"
-  "net/netip"
-  "strings"
-  "sync"
-  "unsafe"
+    "bytes"
+    "crypto/aes"
+    "crypto/cipher"
+    crand "crypto/rand"
+    "encoding/hex"
+    "errors"
+    "fmt"
+    mrand "math/rand/v2"
+    "net/netip"
+    "strings"
+    "sync"
+    "unsafe"
 
-ipcrypt "github.com/jedisct1/go-ipcrypt"
+    ipcrypt "github.com/jedisct1/go-ipcrypt"
 )
 
 type Algorithm uint8
 
 const (
-\tAlgNone Algorithm = iota
-\tAlgDeterministic
-\tAlgNonDeterministic
-\tAlgNonDeterministicX
-\tAlgPrefixPreserving
+    AlgNone Algorithm = iota
+    AlgDeterministic
+    AlgNonDeterministic
+    AlgNonDeterministicX
+    AlgPrefixPreserving
 )
 
 var (
-\tErrNoKey              = errors.New("IP encryption algorithm set but no key provided")
-\tErrInvalidKeyHex      = errors.New("invalid IP encryption key (must be hex)")
-\tErrInvalidIP          = errors.New("invalid IP address")
-\tErrTweakGen           = errors.New("failed to generate random tweak")
-\tErrUnsupportedAlgo    = errors.New("unsupported IP encryption algorithm")
-\tErrEncryptionDisabled = errors.New("encryption disabled")
+    ErrNoKey              = errors.New("IP encryption algorithm set but no key provided")
+    ErrInvalidKeyHex      = errors.New("invalid IP encryption key (must be hex)")
+    ErrInvalidIP          = errors.New("invalid IP address")
+    ErrTweakGen           = errors.New("failed to generate random tweak")
+    ErrUnsupportedAlgo    = errors.New("unsupported IP encryption algorithm")
+    ErrEncryptionDisabled = errors.New("encryption disabled")
 )
 
 const hextable = "0123456789abcdef"
 
 type IPCryptConfig struct {
-\taesBlock  cipher.Block
-\tKey       []byte
-\trngPool   sync.Pool
-\tAlgorithm Algorithm
-\t_         [7]byte // explicit padding for cache-line alignment
+    aesBlock  cipher.Block
+    Key       []byte
+    rngPool   sync.Pool
+    Algorithm Algorithm
+    _         [7]byte // explicit padding for cache-line alignment
 }
 
 func ParseAlgorithm(s string) (Algorithm, error) {
-\tswitch strings.ToLower(s) {
-\tcase "", "none":
-\t\treturn AlgNone, nil
-\tcase "ipcrypt-deterministic":
-\t\treturn AlgDeterministic, nil
-\tcase "ipcrypt-nd":
-\t\treturn AlgNonDeterministic, nil
-\tcase "ipcrypt-ndx":
-\t\treturn AlgNonDeterministicX, nil
-\tcase "ipcrypt-pfx":
-\t\treturn AlgPrefixPreserving, nil
-\tdefault:
-\t\treturn AlgNone, ErrUnsupportedAlgo
-\t}
+    switch strings.ToLower(s) {
+    case "", "none":
+        return AlgNone, nil
+    case "ipcrypt-deterministic":
+        return AlgDeterministic, nil
+    case "ipcrypt-nd":
+        return AlgNonDeterministic, nil
+    case "ipcrypt-ndx":
+        return AlgNonDeterministicX, nil
+    case "ipcrypt-pfx":
+        return AlgPrefixPreserving, nil
+    default:
+        return AlgNone, ErrUnsupportedAlgo
+    }
 }
 
 func NewIPCryptConfig(keyHex string, algorithm string) (*IPCryptConfig, error) {
-\talgo, err := ParseAlgorithm(algorithm)
-\tif err != nil {
-\t\treturn nil, err
-\t}
-\tif algo == AlgNone {
-\t\treturn nil, nil
-\t}
-\tif keyHex == "" {
-\t\treturn nil, ErrNoKey
-\t}
+    algo, err := ParseAlgorithm(algorithm)
+    if err != nil {
+        return nil, err
+    }
+    if algo == AlgNone {
+        return nil, nil
+    }
+    if keyHex == "" {
+        return nil, ErrNoKey
+    }
 
-\trawKey, err := hex.DecodeString(keyHex)
-\tif err != nil {
-\t\treturn nil, fmt.Errorf("%w: %v", ErrInvalidKeyHex, err)
-\t}
+    rawKey, err := hex.DecodeString(keyHex)
+    if err != nil {
+        return nil, fmt.Errorf("%w: %v", ErrInvalidKeyHex, err)
+    }
 
-\texpectedLen := 16
-\tif algo == AlgNonDeterministicX || algo == AlgPrefixPreserving {
-\t\texpectedLen = 32
-\t}
-\tif len(rawKey) != expectedLen {
-\t\treturn nil, fmt.Errorf("%s requires %d-byte key, got %d", algorithm, expectedLen, len(rawKey))
-\t}
+    expectedLen := 16
+    if algo == AlgNonDeterministicX || algo == AlgPrefixPreserving {
+        expectedLen = 32
+    }
+    if len(rawKey) != expectedLen {
+        return nil, fmt.Errorf("%s requires %d-byte key, got %d", algorithm, expectedLen, len(rawKey))
+    }
 
-\tkey := bytes.Clone(rawKey)
+    key := bytes.Clone(rawKey)
 
-\tconfig := &IPCryptConfig{
-\t\tKey:       key,
-\t\tAlgorithm: algo,
-\t}
+    config := &IPCryptConfig{
+        Key:       key,
+        Algorithm: algo,
+    }
 
-\t// Pre-initialize AES cipher for deterministic IPv6 encryption
-\tif algo == AlgDeterministic && len(key) == 16 {
-\t\tblock, err := aes.NewCipher(key)
-\t\tif err != nil {
-\t\t\treturn nil, err
-\t\t}
-\t\tconfig.aesBlock = block
-\t}
+    // Pre-initialize AES cipher for deterministic IPv6 encryption
+    if algo == AlgDeterministic && len(key) == 16 {
+        block, err := aes.NewCipher(key)
+        if err != nil {
+            return nil, err
+        }
+        config.aesBlock = block
+    }
 
-\t// Type-safe pool initialization (Go 1.26+ improvement)
-\tconfig.rngPool = sync.Pool{
-\t\tNew: func() any {
-\t\t\tvar seed [32]byte
-\t\t\tif _, err := crand.Read(seed[:]); err != nil {
-\t\t\t\tpanic("failed to seed RNG: " + err.Error())
-\t\t\t}
-\t\t\treturn mrand.NewChaCha8(seed)
-\t\t},
-\t}
+    // Type-safe pool initialization (Go 1.26+ improvement)
+    config.rngPool = sync.Pool{
+        New: func() any {
+            var seed [32]byte
+            if _, err := crand.Read(seed[:]); err != nil {
+                panic("failed to seed RNG: " + err.Error())
+            }
+            return mrand.NewChaCha8(seed)
+        },
+    }
 
-\treturn config, nil
+    return config, nil
 }
 
 // AppendEncryptIP encrypts an IP address and appends the result to dst.
 // This is the primary hot-path function; optimizations target Go 1.26 features.
 func (config *IPCryptConfig) AppendEncryptIP(dst []byte, ip netip.Addr) ([]byte, error) {
-\tif config == nil {
-\t\treturn ip.AppendTo(dst), nil
-\t}
+    if config == nil {
+        return ip.AppendTo(dst), nil
+    }
 
-\tswitch config.Algorithm {
-\tcase AlgDeterministic:
-\t\tif ip.Is4() {
-\t\t\treturn config.encryptIPv4Deterministic(dst, ip), nil
-\t\t} else if ip.Is6() {
-\t\t\treturn config.encryptIPv6Deterministic(dst, ip)
-\t\t}
+    switch config.Algorithm {
+    case AlgDeterministic:
+        if ip.Is4() {
+            return config.encryptIPv4Deterministic(dst, ip), nil
+        } else if ip.Is6() {
+            return config.encryptIPv6Deterministic(dst, ip)
+        }
 
-\tcase AlgNonDeterministic:
-\t\trng := config.rngPool.Get().(*mrand.ChaCha8)
-\t\tvar tweak [8]byte
-\t\trng.Read(tweak[:])
-\t\tconfig.rngPool.Put(rng)
+    case AlgNonDeterministic:
+        rng := config.rngPool.Get().(*mrand.ChaCha8)
+        var tweak [8]byte
+        rng.Read(tweak[:])
+        config.rngPool.Put(rng)
 
-\t\tencrypted, err := ipcrypt.EncryptIPNonDeterministic(ip.String(), config.Key, tweak[:])
-\t\tif err != nil {
-\t\t\treturn dst, err
-\t\t}
-\t\treturn hex.AppendEncode(dst, encrypted), nil
+        encrypted, err := ipcrypt.EncryptIPNonDeterministic(ip.String(), config.Key, tweak[:])
+        if err != nil {
+            return dst, err
+        }
+        return hex.AppendEncode(dst, encrypted), nil
 
-\tcase AlgNonDeterministicX:
-\t\trng := config.rngPool.Get().(*mrand.ChaCha8)
-\t\tvar tweak [16]byte
-\t\trng.Read(tweak[:])
-\t\tconfig.rngPool.Put(rng)
+    case AlgNonDeterministicX:
+        rng := config.rngPool.Get().(*mrand.ChaCha8)
+        var tweak [16]byte
+        rng.Read(tweak[:])
+        config.rngPool.Put(rng)
 
-\t\tencrypted, err := ipcrypt.EncryptIPNonDeterministicX(ip.String(), config.Key, tweak[:])
-\t\tif err != nil {
-\t\t\treturn dst, err
-\t\t}
-\t\treturn hex.AppendEncode(dst, encrypted), nil
+        encrypted, err := ipcrypt.EncryptIPNonDeterministicX(ip.String(), config.Key, tweak[:])
+        if err != nil {
+            return dst, err
+        }
+        return hex.AppendEncode(dst, encrypted), nil
 
-\tcase AlgPrefixPreserving:
-\t\treturn config.encryptIPPrefixPreserving(dst, ip)
-\t}
+    case AlgPrefixPreserving:
+        return config.encryptIPPrefixPreserving(dst, ip)
+    }
 
-\treturn dst, ErrUnsupportedAlgo
+    return dst, ErrUnsupportedAlgo
 }
 
 // encryptIPv4Deterministic handles deterministic IPv4 encryption inline.
@@ -170,86 +170,86 @@ func (config *IPCryptConfig) AppendEncryptIP(dst []byte, ip netip.Addr) ([]byte,
 //
 //go:inline
 func (config *IPCryptConfig) encryptIPv4Deterministic(dst []byte, ip netip.Addr) []byte {
-\tstate := ip.As4()
+    state := ip.As4()
 
-\t// Unrolled 4-round cipher with manual key XOR and permutation
-\t// Compiler will optimize with Go 1.26's vectorization on amd64
-\tstate[0] ^= config.Key[0]
-\tstate[1] ^= config.Key[1]
-\tstate[2] ^= config.Key[2]
-\tstate[3] ^= config.Key[3]
-\tpermute(&state)
+    // Unrolled 4-round cipher with manual key XOR and permutation
+    // Compiler will optimize with Go 1.26's vectorization on amd64
+    state[0] ^= config.Key[0]
+    state[1] ^= config.Key[1]
+    state[2] ^= config.Key[2]
+    state[3] ^= config.Key[3]
+    permute(&state)
 
-\tstate[0] ^= config.Key[4]
-\tstate[1] ^= config.Key[5]
-\tstate[2] ^= config.Key[6]
-\tstate[3] ^= config.Key[7]
-\tpermute(&state)
+    state[0] ^= config.Key[4]
+    state[1] ^= config.Key[5]
+    state[2] ^= config.Key[6]
+    state[3] ^= config.Key[7]
+    permute(&state)
 
-\tstate[0] ^= config.Key[8]
-\tstate[1] ^= config.Key[9]
-\tstate[2] ^= config.Key[10]
-\tstate[3] ^= config.Key[11]
-\tpermute(&state)
+    state[0] ^= config.Key[8]
+    state[1] ^= config.Key[9]
+    state[2] ^= config.Key[10]
+    state[3] ^= config.Key[11]
+    permute(&state)
 
-\tstate[0] ^= config.Key[12]
-\tstate[1] ^= config.Key[13]
-\tstate[2] ^= config.Key[14]
-\tstate[3] ^= config.Key[15]
+    state[0] ^= config.Key[12]
+    state[1] ^= config.Key[13]
+    state[2] ^= config.Key[14]
+    state[3] ^= config.Key[15]
 
-\t// Hex encoding with manual bounds-check elimination
-\t// Go 1.26's improved allocation reduces overhead here
-\treturn append(dst,
-\t\thextable[(state[0]>>4)&0x0f], hextable[state[0]&0x0f],
-\t\thextable[(state[1]>>4)&0x0f], hextable[state[1]&0x0f],
-\t\thextable[(state[2]>>4)&0x0f], hextable[state[2]&0x0f],
-\t\thextable[(state[3]>>4)&0x0f], hextable[state[3]&0x0f],
-\t)
+    // Hex encoding with manual bounds-check elimination
+    // Go 1.26's improved allocation reduces overhead here
+    return append(dst,
+        hextable[(state[0]>>4)&0x0f], hextable[state[0]&0x0f],
+        hextable[(state[1]>>4)&0x0f], hextable[state[1]&0x0f],
+        hextable[(state[2]>>4)&0x0f], hextable[state[2]&0x0f],
+        hextable[(state[3]>>4)&0x0f], hextable[state[3]&0x0f],
+    )
 }
 
 // encryptIPv6Deterministic handles deterministic IPv6 encryption.
 //
 //go:inline
 func (config *IPCryptConfig) encryptIPv6Deterministic(dst []byte, ip netip.Addr) ([]byte, error) {
-\tsrc := ip.As16()
-\t
-\t// Fast path: use pre-initialized AES cipher
-\tif config.aesBlock != nil {
-\t\tvar enc [16]byte
-\t\tconfig.aesBlock.Encrypt(enc[:], src[:])
-\t\treturn hex.AppendEncode(dst, enc[:]), nil
-\t}
-\t
-\t// Fallback: use external library
-\tencrypted, err := ipcrypt.EncryptIP(config.Key, src[:])
-\tif err != nil {
-\t\treturn dst, err
-\t}
-\treturn hex.AppendEncode(dst, encrypted), nil
+    src := ip.As16()
+    
+    // Fast path: use pre-initialized AES cipher
+    if config.aesBlock != nil {
+        var enc [16]byte
+        config.aesBlock.Encrypt(enc[:], src[:])
+        return hex.AppendEncode(dst, enc[:]), nil
+    }
+    
+    // Fallback: use external library
+    encrypted, err := ipcrypt.EncryptIP(config.Key, src[:])
+    if err != nil {
+        return dst, err
+    }
+    return hex.AppendEncode(dst, encrypted), nil
 }
 
 // encryptIPPrefixPreserving handles prefix-preserving encryption.
 //
 //go:inline
 func (config *IPCryptConfig) encryptIPPrefixPreserving(dst []byte, ip netip.Addr) ([]byte, error) {
-\tvar buf [16]byte
-\tvar inputSlice []byte
-\t
-\tif ip.Is4() {
-\t\ta4 := ip.As4()
-\t\tcopy(buf[:4], a4[:])
-\t\tinputSlice = buf[:4]
-\t} else {
-\t\ta16 := ip.As16()
-\t\tcopy(buf[:], a16[:])
-\t\tinputSlice = buf[:16]
-\t}
-\t
-\tencrypted, err := ipcrypt.EncryptIPPfx(inputSlice, config.Key)
-\tif err != nil {
-\t\treturn dst, err
-\t}
-\treturn hex.AppendEncode(dst, encrypted), nil
+    var buf [16]byte
+    var inputSlice []byte
+    
+    if ip.Is4() {
+        a4 := ip.As4()
+        copy(buf[:4], a4[:])
+        inputSlice = buf[:4]
+    } else {
+        a16 := ip.As16()
+        copy(buf[:], a16[:])
+        inputSlice = buf[:16]
+    }
+    
+    encrypted, err := ipcrypt.EncryptIPPfx(inputSlice, config.Key)
+    if err != nil {
+        return dst, err
+    }
+    return hex.AppendEncode(dst, encrypted), nil
 }
 
 // permute applies the ipcrypt permutation function.
@@ -257,60 +257,60 @@ func (config *IPCryptConfig) encryptIPPrefixPreserving(dst []byte, ip netip.Addr
 //
 //go:inline
 func permute(s *[4]byte) {
-\ts[0] += s[1]
-\ts[2] += s[3]
-\ts[1] = (s[1] << 2) | (s[1] >> 6)
-\ts[3] = (s[3] << 5) | (s[3] >> 3)
-\ts[1] ^= s[0]
-\ts[3] ^= s[2]
-\ts[0] = (s[0] << 4) | (s[0] >> 4)
-\ts[0] += s[3]
-\ts[2] = (s[2] << 4) | (s[2] >> 4)
-\ts[2] ^= s[1]
-\ts[1] = (s[1] << 3) | (s[1] >> 5)
-\ts[3] = (s[3] << 7) | (s[3] >> 1)
-\ts[3] += s[2]
-\ts[1] ^= s[3]
-\ts[0] ^= s[1]
+    s[0] += s[1]
+    s[2] += s[3]
+    s[1] = (s[1] << 2) | (s[1] >> 6)
+    s[3] = (s[3] << 5) | (s[3] >> 3)
+    s[1] ^= s[0]
+    s[3] ^= s[2]
+    s[0] = (s[0] << 4) | (s[0] >> 4)
+    s[0] += s[3]
+    s[2] = (s[2] << 4) | (s[2] >> 4)
+    s[2] ^= s[1]
+    s[1] = (s[1] << 3) | (s[1] >> 5)
+    s[3] = (s[3] << 7) | (s[3] >> 1)
+    s[3] += s[2]
+    s[1] ^= s[3]
+    s[0] ^= s[1]
 }
 
 // EncryptIP encrypts a net.IP and returns the hex-encoded result as a string.
 // Zero-copy conversion with unsafe benefits from Go 1.26's escape analysis.
 func (config *IPCryptConfig) EncryptIP(ipStr string) (string, error) {
-\tif config == nil {
-\t\treturn ipStr, nil
-\t}
-\t
-\taddr, err := netip.ParseAddr(ipStr)
-\tif err != nil {
-\t\treturn "", fmt.Errorf("%w: %v", ErrInvalidIP, err)
-\t}
-\t
-\tres, err := config.AppendEncryptIP(nil, addr)
-\tif err != nil {
-\t\treturn "", err
-\t}
-\t
-\t// Zero-copy []byte to string conversion (safe in this context)
-\treturn unsafe.String(unsafe.SliceData(res), len(res)), nil
+    if config == nil {
+        return ipStr, nil
+    }
+    
+    addr, err := netip.ParseAddr(ipStr)
+    if err != nil {
+        return "", fmt.Errorf("%w: %v", ErrInvalidIP, err)
+    }
+    
+    res, err := config.AppendEncryptIP(nil, addr)
+    if err != nil {
+        return "", err
+    }
+    
+    // Zero-copy []byte to string conversion (safe in this context)
+    return unsafe.String(unsafe.SliceData(res), len(res)), nil
 }
 
 // EncryptIPString encrypts an IP address string.
 // Returns original string on error for defensive behavior.
 func (config *IPCryptConfig) EncryptIPString(ipStr string) string {
-\tif config == nil {
-\t\treturn ipStr
-\t}
-\t
-\taddr, err := netip.ParseAddr(ipStr)
-\tif err != nil {
-\t\treturn ipStr
-\t}
-\t
-\tres, err := config.AppendEncryptIP(nil, addr)
-\tif err != nil {
-\t\treturn ipStr
-\t}
-\t
-\treturn unsafe.String(unsafe.SliceData(res), len(res))
+    if config == nil {
+        return ipStr
+    }
+    
+    addr, err := netip.ParseAddr(ipStr)
+    if err != nil {
+        return ipStr
+    }
+    
+    res, err := config.AppendEncryptIP(nil, addr)
+    if err != nil {
+        return ipStr
+    }
+    
+    return unsafe.String(unsafe.SliceData(res), len(res))
 }
