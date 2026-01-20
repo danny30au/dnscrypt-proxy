@@ -278,7 +278,6 @@ func (m *Msg) Pack() error {
 			}
 		}
 	}
-	m.offset = 0
 	m.Data = m.Data[:off]
 	return nil
 }
@@ -346,7 +345,9 @@ func unpackRRs(cnt uint16, msg *cryptobyte.String, msgBuf []byte) ([]RR, error) 
 
 func (m *Msg) unpack(dh header, s *cryptobyte.String, msgBuf []byte) (err error) {
 	if m.offset > MsgHeaderSize {
-		s.Skip(int(m.offset - MsgHeaderSize)) // should never fail...?
+		if !s.Skip(int(m.offset - MsgHeaderSize)) {
+			return fmt.Errorf("overflow %s", "MsgHeader")
+		}
 		goto Rest
 	}
 
@@ -359,6 +360,7 @@ func (m *Msg) unpack(dh header, s *cryptobyte.String, msgBuf []byte) (err error)
 	}
 
 Rest:
+	m.offset = 0 // reset offset here, as it has done its purpose
 	if m.Answer, err = unpackRRs(dh.Ancount, s, msgBuf); err != nil {
 		return err
 	}
