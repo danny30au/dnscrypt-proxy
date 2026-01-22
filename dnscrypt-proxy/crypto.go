@@ -13,7 +13,6 @@ import (
     "math/bits"
     "os"
     "runtime"
-    "runtime/secret"  // Go 1.26: Build with GOEXPERIMENT=runtimesecret
     "strconv"
     "sync"
     "sync/atomic"
