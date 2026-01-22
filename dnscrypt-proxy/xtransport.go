@@ -115,7 +115,6 @@ type XTransport struct {
 	keyLogWriter             io.Writer
 	gzipPool                 sync.Pool
 	dnsClientPool            sync.Pool
-	dnsMessagePool           sync.Pool
 	bufferPool               sync.Pool
 	resolveGroup             singleflight.Group
 	quicMu                   sync.Mutex
@@ -146,7 +145,7 @@ func NewXTransport() *XTransport {
 		sessionCache:             tls.NewLRUClientSessionCache(4096),
 	}
 
-	// Initialize object pools with proper constructors
+	// Initialize object pools
 	xTransport.gzipPool.New = func() any {
 		return new(gzip.Reader)
 	}
@@ -155,12 +154,6 @@ func NewXTransport() *XTransport {
 		transport := dns.NewTransport()
 		transport.ReadTimeout = ResolverReadTimeout
 		return &dns.Client{Transport: transport}
-	}
-
-	xTransport.dnsMessagePool.New = func() any {
-		msg := new(dns.Msg)
-		msg.SetEdns0(uint16(MaxDNSPacketSize), true)
-		return msg
 	}
 
 	xTransport.bufferPool.New = func() any {
@@ -768,14 +761,19 @@ func (xTransport *XTransport) resolveUsingResolver(
 
 	for _, qType := range queryTypes {
 		go func(qt uint16) {
-			msg := xTransport.dnsMessagePool.Get().(*dns.Msg)
-			defer func() {
-				msg.Reset()
-				xTransport.dnsMessagePool.Put(msg)
-			}()
+			// Use dns.NewMsg() - creates message with question already set
+			msg := dns.NewMsg(fqdn(host), qt)
+			if msg == nil {
+				select {
+				case results <- queryResult{ips: nil, ttl: 0, err: errors.New("failed to create DNS message")}:
+				case <-ctx.Done():
+				}
+				return
+			}
 
-			msg.SetQuestion(fqdn(host), qt)
 			msg.RecursionDesired = true
+			msg.UDPSize = uint16(MaxDNSPacketSize)
+			msg.Security = true
 
 			var qIPs []net.IP
 			var qTTL uint32
