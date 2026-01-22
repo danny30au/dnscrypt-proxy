@@ -231,8 +231,11 @@ func Name(s string, msg []byte, off int, compression map[string]uint16, compress
 		off += 1 + labelLen
 		begin = i + 1
 	}
+	if off+1 > lenmsg {
+		return lenmsg, &Error{"overflow name"}
+	}
 
-	msg[off] = 0 // length check needed??
+	msg[off] = 0
 	return off + 1, nil
 }
 
