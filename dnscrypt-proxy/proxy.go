@@ -56,8 +56,8 @@ localDoHListenAddresses       []string
 monitoringUI                  MonitoringUIConfig
 monitoringInstance            *MonitoringUI
 xTransport                    *XTransport
-allWeeklyRanges               sync.Map
-routes                        sync.Map
+allWeeklyRanges               *map[string]WeeklyRanges
+routes                        *map[string][]string
 captivePortalMap              *CaptivePortalMap
 nxLogFormat                   string
 localDoHCertFile              string
@@ -125,7 +125,6 @@ SourceODoH                    bool
 listenersMu                   sync.Mutex
 ipCryptConfig                 *IPCryptConfig
 udpConnPool                   *UDPConnPool
-registeredServersAtomic       atomic.Value
 }
 
 func (proxy *Proxy) registerUDPListener(conn *net.UDPConn) {
@@ -344,9 +343,6 @@ runtime.GC()
 }
 
 func (proxy *Proxy) updateRegisteredServers() error {
-estimatedServers := len(proxy.registeredServers) + 10
-newServers := make([]RegisteredServer, 0, estimatedServers)
-
 for _, source := range proxy.sources {
 registeredServers, err := source.Parse()
 if err != nil {
@@ -926,22 +922,4 @@ return &Proxy{
 serversInfo: NewServersInfo(),
 udpConnPool: NewUDPConnPool(),
 }
-}
-
-func includesName(names []string, name string) bool {
-if len(names) <= 8 {
-for _, n := range names {
-if n == name {
-return true
-}
-}
-return false
-}
-
-nameMap := make(map[string]struct{}, len(names))
-for _, n := range names {
-nameMap[n] = struct{}{}
-}
-_, exists := nameMap[name]
-return exists
 }
