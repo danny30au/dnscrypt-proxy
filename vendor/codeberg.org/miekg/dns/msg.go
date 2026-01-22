@@ -151,6 +151,12 @@ func unpackRR(msg *cryptobyte.String, msgBuf []byte) (RR, error) {
 	return rr, nil
 }
 
+// Reset resets the message's answer, ns, extra and pseudo sections to a zero length slice, thereby emptying
+// them, but keeping the capacity.
+func (m *Msg) Reset() {
+	m.Answer, m.Ns, m.Extra, m.Pseudo = m.Answer[:0], m.Ns[:0], m.Extra[:0], m.Pseudo[:0]
+}
+
 func (m *Msg) Pack() error {
 	// Convert convenient Msg into wire-like Header.
 	var dh header
