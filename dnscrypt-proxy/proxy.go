@@ -441,19 +441,16 @@ return nil
 func (proxy *Proxy) udpListener(clientPc *net.UDPConn) {
 defer clientPc.Close()
 
-var clientAddr net.UDPAddr
-
 for {
 bufPtr := packetBufferPool.Get().(*[]byte)
 buffer := *bufPtr
 
-length, addr, err := clientPc.ReadFromUDP(buffer[:MaxDNSPacketSize-1])
+length, clientAddr, err := clientPc.ReadFromUDP(buffer[:MaxDNSPacketSize-1])
 if err != nil {
 packetBufferPool.Put(bufPtr)
 return
 }
 
-clientAddr = *addr
 packet := buffer[:length]
 
 if !proxy.clientsCountInc() {
@@ -464,7 +461,7 @@ proxy.processIncomingQuery(
 "udp",
 proxy.xTransport.mainProto,
 packet,
-&clientAddr,
+clientAddr,
 clientPc,
 time.Now(),
 true,
@@ -478,8 +475,8 @@ go func(bPtr *[]byte, addr net.Addr) {
 defer packetBufferPool.Put(bPtr)
 defer proxy.clientsCountDec()
 
-proxy.processIncomingQuery("udp", proxy.xTransport.mainProto, packet, &addr, clientPc, time.Now(), false)
-}(bufPtr, &clientAddr)
+proxy.processIncomingQuery("udp", proxy.xTransport.mainProto, packet, addr, clientPc, time.Now(), false)
+}(bufPtr, clientAddr)
 }
 }
 
@@ -509,7 +506,7 @@ if err != nil {
 return
 }
 clientAddr := clientPc.RemoteAddr()
-proxy.processIncomingQuery("tcp", "tcp", packet, &clientAddr, clientPc, start, false)
+proxy.processIncomingQuery("tcp", "tcp", packet, clientAddr, clientPc, start, false)
 }()
 }
 }
@@ -795,14 +792,14 @@ func (proxy *Proxy) processIncomingQuery(
 clientProto string,
 serverProto string,
 query []byte,
-clientAddr *net.Addr,
+clientAddr net.Addr,
 clientPc net.Conn,
 start time.Time,
 onlyCached bool,
 ) []byte {
 clientAddrStr := "unknown"
 if clientAddr != nil {
-clientAddrStr = (*clientAddr).String()
+clientAddrStr = clientAddr.String()
 }
 dlog.Debugf("Processing incoming query from %s", clientAddrStr)
 
@@ -811,7 +808,7 @@ if !validateQuery(query) {
 return response
 }
 
-pluginsState := NewPluginsState(proxy, clientProto, clientAddr, serverProto, start)
+pluginsState := NewPluginsState(proxy, clientProto, &clientAddr, serverProto, start)
 
 var serverInfo *ServerInfo
 var serverName string = "-"
@@ -908,7 +905,7 @@ serverInfo.noticeFailure(proxy)
 return response
 }
 
-sendResponse(proxy, &pluginsState, response, clientProto, clientAddr, clientPc)
+sendResponse(proxy, &pluginsState, response, clientProto, &clientAddr, clientPc)
 
 pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
 
