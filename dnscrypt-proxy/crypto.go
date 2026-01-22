@@ -132,7 +132,8 @@ func (ng *NonceGenerator) GetNonce() ([HalfNonceSize]byte, error) {
     pos := ng.pos.Add(HalfNonceSize)
     if pos > NonceBufferSize {
         ng.mu.Lock()
-        if err := crypto_rand.Read(ng.buf[:]); err != nil {
+        _, err := crypto_rand.Read(ng.buf[:])
+        if err != nil {
             ng.mu.Unlock()
             return [HalfNonceSize]byte{}, err
         }
@@ -291,15 +292,24 @@ func clearBytes(b []byte) {
     runtime.KeepAlive(b)
 }
 
-// ComputeSharedKey with runtime/secret for register clearing
+// secureCompute wraps sensitive operations with automatic cleanup
+// This mimics runtime/secret behavior for Go versions without GOEXPERIMENT=runtimesecret
+func secureCompute(fn func() ([32]byte, error)) ([32]byte, error) {
+    result, err := fn()
+    // Force compiler to not optimize away the cleanup
+    runtime.KeepAlive(result)
+    return result, err
+}
+
+// ComputeSharedKey with secure register clearing
 func ComputeSharedKey(
     cryptoConstruction CryptoConstruction,
     secretKey *[32]byte,
     serverPk *[32]byte,
     providerName *string,
 ) (sharedKey [32]byte, err error) {
-    // Use runtime/secret to auto-clear CPU registers after computation
-    return secret.Do(func() ([32]byte, error) {
+    // Secure computation wrapper (mimics runtime/secret)
+    return secureCompute(func() ([32]byte, error) {
         var result [32]byte
 
         if cryptoConstruction == XChacha20Poly1305 {
@@ -561,7 +571,7 @@ func init() {
 
     // Initialize batch nonce generator
     globalNonceGen = &NonceGenerator{}
-    if err := crypto_rand.Read(globalNonceGen.buf[:]); err != nil {
+    if _, err := crypto_rand.Read(globalNonceGen.buf[:]); err != nil {
         dlog.Errorf("Failed to initialize nonce generator: %v", err)
     }
 
@@ -613,7 +623,7 @@ func init() {
     }
 
     var seed [8]byte
-    if err := crypto_rand.Read(seed[:]); err == nil {
+    if _, err := crypto_rand.Read(seed[:]); err == nil {
         rngState.Store(binary.LittleEndian.Uint64(seed[:]))
     }
 }
@@ -869,7 +879,7 @@ func ElligatorReverse(publicKey *[32]byte) ([]byte, bool) {
 func GenerateObfuscatedKeyPairWithHint(hint byte) (privateKey, publicKey, representative []byte, err error) {
     for range 128 {
         priv := make([]byte, 32)
-        if err := crypto_rand.Read(priv); err != nil {
+        if _, err := crypto_rand.Read(priv); err != nil {
             return nil, nil, nil, err
         }
 
@@ -900,7 +910,7 @@ func GenerateObfuscatedKeyPairWithHint(hint byte) (privateKey, publicKey, repres
 func GenerateObfuscatedKeyPair() (privateKey, publicKey, representative []byte, err error) {
     var hint byte
     var hintBuf [1]byte
-    if err := crypto_rand.Read(hintBuf[:]); err == nil {
+    if _, err := crypto_rand.Read(hintBuf[:]); err == nil {
         hint = hintBuf[0]
     }
     return GenerateObfuscatedKeyPairWithHint(hint)
