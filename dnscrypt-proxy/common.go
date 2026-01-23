@@ -137,8 +137,7 @@ func StringTwoFields(str string) (string, string, bool) {
 
 	var i int
 	for i = 0; i < len(str); i++ {
-		if str[i] == ' ' || str[i] == '	' || str[i] == '
-' || str[i] == '' {
+		if str[i] == ' ' || str[i] == '	' || str[i] == '\n' || str[i] == '\r' {
 			break
 		}
 	}
@@ -151,8 +150,7 @@ func StringTwoFields(str string) (string, string, bool) {
 
 	var j int
 	for j = i; j < len(str); j++ {
-		if str[j] != ' ' && str[j] != '	' && str[j] != '
-' && str[j] != '' {
+		if str[j] != ' ' && str[j] != '	' && str[j] != '\n' && str[j] != '\r' {
 			break
 		}
 	}
@@ -162,8 +160,7 @@ func StringTwoFields(str string) (string, string, bool) {
 	}
 
 	k := len(str) - 1
-	for k > j && (str[k] == ' ' || str[k] == '	' || str[k] == '
-' || str[k] == '') {
+	for k > j && (str[k] == ' ' || str[k] == '	' || str[k] == '\n' || str[k] == '\r') {
 		k--
 	}
 
@@ -213,14 +210,12 @@ func TrimAndStripInlineComments(str string) string {
 	}
 
 	start := 0
-	for start < len(str) && (str[start] == ' ' || str[start] == '	' || str[start] == '
-' || str[start] == '') {
+	for start < len(str) && (str[start] == ' ' || str[start] == '	' || str[start] == '\n' || str[start] == '\r') {
 		start++
 	}
 
 	end := len(str)
-	for end > start && (str[end-1] == ' ' || str[end-1] == '	' || str[end-1] == '
-' || str[end-1] == '') {
+	for end > start && (str[end-1] == ' ' || str[end-1] == '	' || str[end-1] == '\n' || str[end-1] == '\r') {
 		end--
 	}
 
@@ -299,8 +294,7 @@ func FormatLogLine(format, clientIP, qName, reason string, additionalFields ...s
 			buf.WriteByte('	')
 			buf.WriteString(StringQuote(field))
 		}
-		buf.WriteByte('
-')
+		buf.WriteByte('\n')
 		return buf.String(), nil
 	} else if format == "ltsv" {
 		var buf strings.Builder
@@ -326,8 +320,7 @@ func FormatLogLine(format, clientIP, qName, reason string, additionalFields ...s
 				buf.WriteString(StringQuote(field))
 			}
 		}
-		buf.WriteByte('
-')
+		buf.WriteByte('\n')
 		return buf.String(), nil
 	}
 	return "", fmt.Errorf("unexpected log format: [%s]", format)
@@ -401,8 +394,7 @@ func ParseIPRule(line string, lineNo int) (cleanLine string, trailingStar bool, 
 
 // ProcessConfigLines processes configuration file lines
 func ProcessConfigLines(lines string, processor func(line string, lineNo int) error) error {
-	for lineNo, line := range strings.Split(lines, "
-") {
+	for lineNo, line := range strings.Split(lines, "\n") {
 		line = TrimAndStripInlineComments(line)
 		if len(line) == 0 {
 			continue
