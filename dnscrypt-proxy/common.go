@@ -68,9 +68,10 @@ func PrefixWithSize(packet []byte) ([]byte, error) {
 }
 
 // ReadPrefixed reads a length-prefixed packet from conn
-func ReadPrefixed(conn net.Conn) ([]byte, error) {
+// Note: Takes *net.Conn for compatibility with existing callers
+func ReadPrefixed(conn *net.Conn) ([]byte, error) {
 	var hdr [2]byte
-	if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+	if _, err := io.ReadFull(*conn, hdr[:]); err != nil {
 		return nil, err
 	}
 
@@ -83,7 +84,7 @@ func ReadPrefixed(conn net.Conn) ([]byte, error) {
 	}
 
 	buf := make([]byte, packetLength)
-	if _, err := io.ReadFull(conn, buf); err != nil {
+	if _, err := io.ReadFull(*conn, buf); err != nil {
 		return nil, err
 	}
 	return buf, nil
@@ -136,7 +137,8 @@ func StringTwoFields(str string) (string, string, bool) {
 
 	var i int
 	for i = 0; i < len(str); i++ {
-		if str[i] == ' ' || str[i] == '\t' || str[i] == '\n' || str[i] == '\r' {
+		if str[i] == ' ' || str[i] == '	' || str[i] == '
+' || str[i] == '' {
 			break
 		}
 	}
@@ -149,7 +151,8 @@ func StringTwoFields(str string) (string, string, bool) {
 
 	var j int
 	for j = i; j < len(str); j++ {
-		if str[j] != ' ' && str[j] != '\t' && str[j] != '\n' && str[j] != '\r' {
+		if str[j] != ' ' && str[j] != '	' && str[j] != '
+' && str[j] != '' {
 			break
 		}
 	}
@@ -159,7 +162,8 @@ func StringTwoFields(str string) (string, string, bool) {
 	}
 
 	k := len(str) - 1
-	for k > j && (str[k] == ' ' || str[k] == '\t' || str[k] == '\n' || str[k] == '\r') {
+	for k > j && (str[k] == ' ' || str[k] == '	' || str[k] == '
+' || str[k] == '') {
 		k--
 	}
 
@@ -197,7 +201,7 @@ func TrimAndStripInlineComments(str string) string {
 			if i == 0 {
 				return ""
 			}
-			if str[i-1] == ' ' || str[i-1] == '\t' {
+			if str[i-1] == ' ' || str[i-1] == '	' {
 				idx = i - 1
 				break
 			}
@@ -209,12 +213,14 @@ func TrimAndStripInlineComments(str string) string {
 	}
 
 	start := 0
-	for start < len(str) && (str[start] == ' ' || str[start] == '\t' || str[start] == '\n' || str[start] == '\r') {
+	for start < len(str) && (str[start] == ' ' || str[start] == '	' || str[start] == '
+' || str[start] == '') {
 		start++
 	}
 
 	end := len(str)
-	for end > start && (str[end-1] == ' ' || str[end-1] == '\t' || str[end-1] == '\n' || str[end-1] == '\r') {
+	for end > start && (str[end-1] == ' ' || str[end-1] == '	' || str[end-1] == '
+' || str[end-1] == '') {
 		end--
 	}
 
@@ -282,18 +288,19 @@ func FormatLogLine(format, clientIP, qName, reason string, additionalFields ...s
 		now := time.Now()
 		buf.WriteByte('[')
 		buf.WriteString(now.Format("2006-01-02 15:04:05"))
-		buf.WriteString("]\t")
+		buf.WriteString("]	")
 		buf.WriteString(clientIP)
-		buf.WriteByte('\t')
+		buf.WriteByte('	')
 		buf.WriteString(StringQuote(qName))
-		buf.WriteByte('\t')
+		buf.WriteByte('	')
 		buf.WriteString(StringQuote(reason))
 
 		for _, field := range additionalFields {
-			buf.WriteByte('\t')
+			buf.WriteByte('	')
 			buf.WriteString(StringQuote(field))
 		}
-		buf.WriteByte('\n')
+		buf.WriteByte('
+')
 		return buf.String(), nil
 	} else if format == "ltsv" {
 		var buf strings.Builder
@@ -301,25 +308,26 @@ func FormatLogLine(format, clientIP, qName, reason string, additionalFields ...s
 
 		buf.WriteString("time:")
 		buf.WriteString(strconv.FormatInt(time.Now().Unix(), 10))
-		buf.WriteString("\thost:")
+		buf.WriteString("	host:")
 		buf.WriteString(clientIP)
-		buf.WriteString("\tqname:")
+		buf.WriteString("	qname:")
 		buf.WriteString(StringQuote(qName))
-		buf.WriteString("\tmessage:")
+		buf.WriteString("	message:")
 		buf.WriteString(StringQuote(reason))
 
 		for i, field := range additionalFields {
 			if i == 0 {
-				buf.WriteString("\tip:")
+				buf.WriteString("	ip:")
 				buf.WriteString(StringQuote(field))
 			} else {
-				buf.WriteString("\tfield")
+				buf.WriteString("	field")
 				buf.WriteString(strconv.Itoa(i))
 				buf.WriteByte(':')
 				buf.WriteString(StringQuote(field))
 			}
 		}
-		buf.WriteByte('\n')
+		buf.WriteByte('
+')
 		return buf.String(), nil
 	}
 	return "", fmt.Errorf("unexpected log format: [%s]", format)
@@ -393,7 +401,8 @@ func ParseIPRule(line string, lineNo int) (cleanLine string, trailingStar bool, 
 
 // ProcessConfigLines processes configuration file lines
 func ProcessConfigLines(lines string, processor func(line string, lineNo int) error) error {
-	for lineNo, line := range strings.Split(lines, "\n") {
+	for lineNo, line := range strings.Split(lines, "
+") {
 		line = TrimAndStripInlineComments(line)
 		if len(line) == 0 {
 			continue
