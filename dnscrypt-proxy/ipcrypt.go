@@ -201,7 +201,6 @@ func (config *IPCryptConfig) encryptNonDeterministic(dst []byte, ip netip.Addr, 
 // Go 1.26's improved vectorization and small object allocation optimizes this.
 //
 //go:inline
-//go:noescape
 func (config *IPCryptConfig) encryptIPv4Deterministic(dst []byte, ip netip.Addr) []byte {
     state := ip.As4()
     key := config.Key
