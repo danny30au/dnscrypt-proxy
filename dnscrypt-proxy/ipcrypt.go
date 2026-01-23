@@ -9,10 +9,13 @@ import (
     "encoding/hex"
     "errors"
     "fmt"
+    "math/bits"
     mrand "math/rand/v2"
     "net/netip"
+    "runtime"
     "strings"
     "sync"
+    "sync/atomic"
     "unsafe"
 
     ipcrypt "github.com/jedisct1/go-ipcrypt"
@@ -37,20 +40,44 @@ var (
     ErrEncryptionDisabled = errors.New("encryption disabled")
 )
 
-const hextable = "0123456789abcdef"
+const (
+    hextable              = "0123456789abcdef"
+    defaultBatchSize      = 100           // Optimal for cache utilization
+    minBatchSize          = 10
+    maxBatchSize          = 1000
+    adaptiveWindowSize    = 1000          // Sample size for adaptive tuning
+    defaultWorkerPoolSize = 0             // 0 = auto-detect based on CPU cores
+)
+
+// Buffer pool for batch operations - reduces allocations
+var bufferPool = sync.Pool{
+    New: func() any {
+        buf := make([]byte, 0, 256)
+        return &buf
+    },
+}
 
 // IPCryptConfig optimized for cache-line alignment (64 bytes)
 type IPCryptConfig struct {
-    aesBlock  cipher.Block // 16 bytes (interface = pointer + type)
-    Key       []byte       // 24 bytes (slice header)
-    Algorithm Algorithm    // 1 byte
-    _         [7]byte      // padding to 48 bytes
-    rngPool   sync.Pool    // 16 bytes
+    aesBlock       cipher.Block // 16 bytes (interface = pointer + type)
+    Key            []byte       // 24 bytes (slice header)
+    Algorithm      Algorithm    // 1 byte
+    _              [7]byte      // padding to 48 bytes
+    rngPool        sync.Pool    // 16 bytes
+    workerPoolSize int          // Number of workers for parallel processing
+    batchSize      atomic.Int32 // Adaptive batch size
+    processedCount atomic.Uint64
+}
+
+// BatchOptions configures batch processing behavior
+type BatchOptions struct {
+    WorkerCount int  // Number of parallel workers (0 = auto)
+    BatchSize   int  // Items per batch (0 = adaptive)
+    Parallel    bool // Enable parallel processing
 }
 
 // ParseAlgorithm uses a more efficient string comparison approach
 func ParseAlgorithm(s string) (Algorithm, error) {
-    // Early return for common cases avoids ToLower allocation
     if s == "" || s == "none" {
         return AlgNone, nil
     }
@@ -66,7 +93,6 @@ func ParseAlgorithm(s string) (Algorithm, error) {
         return AlgPrefixPreserving, nil
     }
     
-    // Fallback to case-insensitive comparison only if needed
     switch strings.ToLower(s) {
     case "none":
         return AlgNone, nil
@@ -100,6 +126,8 @@ func NewIPCryptConfig(keyHex string, algorithm string) (*IPCryptConfig, error) {
         return nil, fmt.Errorf("%w: %v", ErrInvalidKeyHex, err)
     }
 
+    defer clear(rawKey)
+
     expectedLen := 16
     if algo == AlgNonDeterministicX || algo == AlgPrefixPreserving {
         expectedLen = 32
@@ -111,12 +139,13 @@ func NewIPCryptConfig(keyHex string, algorithm string) (*IPCryptConfig, error) {
     key := bytes.Clone(rawKey)
 
     config := &IPCryptConfig{
-        Key:       key,
-        Algorithm: algo,
+        Key:            key,
+        Algorithm:      algo,
+        workerPoolSize: runtime.NumCPU(),
     }
+    
+    config.batchSize.Store(int32(defaultBatchSize))
 
-    // Pre-initialize AES cipher for deterministic IPv6 encryption
-    // Go 1.26 automatically uses AES-NI hardware acceleration on x86
     if algo == AlgDeterministic && len(key) == 16 {
         block, err := aes.NewCipher(key)
         if err != nil {
@@ -125,7 +154,6 @@ func NewIPCryptConfig(keyHex string, algorithm string) (*IPCryptConfig, error) {
         config.aesBlock = block
     }
 
-    // Optimized pool with pre-seeded RNGs (Go 1.26 improves small allocations)
     config.rngPool = sync.Pool{
         New: func() any {
             var seed [32]byte
@@ -139,9 +167,6 @@ func NewIPCryptConfig(keyHex string, algorithm string) (*IPCryptConfig, error) {
     return config, nil
 }
 
-// AppendEncryptIP encrypts an IP address and appends the result to dst.
-// Hot path optimized for Go 1.26's improved small allocation performance.
-//
 //go:inline
 func (config *IPCryptConfig) AppendEncryptIP(dst []byte, ip netip.Addr) ([]byte, error) {
     if config == nil {
@@ -170,14 +195,219 @@ func (config *IPCryptConfig) AppendEncryptIP(dst []byte, ip netip.Addr) ([]byte,
     return dst, ErrUnsupportedAlgo
 }
 
-// encryptNonDeterministic consolidates both NonDeterministic and NonDeterministicX
-// to reduce code duplication and improve instruction cache efficiency
-//
+// EncryptBatch processes multiple IPs with optimal batching strategy
+func (config *IPCryptConfig) EncryptBatch(ips []netip.Addr) []string {
+    return config.EncryptBatchWithOptions(ips, nil)
+}
+
+// EncryptBatchWithOptions provides fine-grained control over batch processing
+func (config *IPCryptConfig) EncryptBatchWithOptions(ips []netip.Addr, opts *BatchOptions) []string {
+    if config == nil || len(ips) == 0 {
+        results := make([]string, len(ips))
+        for i, ip := range ips {
+            results[i] = ip.String()
+        }
+        return results
+    }
+
+    if opts == nil {
+        opts = &BatchOptions{
+            WorkerCount: 0,
+            BatchSize:   0,
+            Parallel:    len(ips) > 100,
+        }
+    }
+
+    if opts.Parallel && len(ips) >= 100 {
+        return config.encryptBatchParallel(ips, opts)
+    }
+
+    return config.encryptBatchSequential(ips)
+}
+
+// encryptBatchSequential handles small batches without parallelization overhead
+func (config *IPCryptConfig) encryptBatchSequential(ips []netip.Addr) []string {
+    buf := bufferPool.Get().(*[]byte)
+    defer func() {
+        *buf = (*buf)[:0]
+        bufferPool.Put(buf)
+    }()
+
+    results := make([]string, len(ips))
+
+    for i, ip := range ips {
+        *buf = (*buf)[:0]
+        encrypted, err := config.AppendEncryptIP(*buf, ip)
+        if err != nil {
+            results[i] = ip.String()
+            continue
+        }
+        results[i] = unsafe.String(unsafe.SliceData(encrypted), len(encrypted))
+    }
+
+    return results
+}
+
+// encryptBatchParallel uses worker pool for high-throughput processing
+func (config *IPCryptConfig) encryptBatchParallel(ips []netip.Addr, opts *BatchOptions) []string {
+    workerCount := opts.WorkerCount
+    if workerCount <= 0 {
+        workerCount = config.workerPoolSize
+    }
+    if workerCount > len(ips) {
+        workerCount = len(ips)
+    }
+
+    batchSize := opts.BatchSize
+    if batchSize <= 0 {
+        batchSize = int(config.batchSize.Load())
+    }
+
+    results := make([]string, len(ips))
+    
+    type job struct {
+        start, end int
+    }
+    
+    jobs := make(chan job, workerCount)
+    var wg sync.WaitGroup
+
+    // Start workers
+    for w := 0; w < workerCount; w++ {
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            
+            buf := bufferPool.Get().(*[]byte)
+            defer func() {
+                *buf = (*buf)[:0]
+                bufferPool.Put(buf)
+            }()
+
+            for j := range jobs {
+                for i := j.start; i < j.end; i++ {
+                    *buf = (*buf)[:0]
+                    encrypted, err := config.AppendEncryptIP(*buf, ips[i])
+                    if err != nil {
+                        results[i] = ips[i].String()
+                        continue
+                    }
+                    results[i] = unsafe.String(unsafe.SliceData(encrypted), len(encrypted))
+                }
+            }
+        }()
+    }
+
+    // Distribute work in cache-friendly batches
+    for start := 0; start < len(ips); start += batchSize {
+        end := start + batchSize
+        if end > len(ips) {
+            end = len(ips)
+        }
+        jobs <- job{start, end}
+    }
+    
+    close(jobs)
+    wg.Wait()
+
+    // Update adaptive batch size
+    config.processedCount.Add(uint64(len(ips)))
+    if config.processedCount.Load()%adaptiveWindowSize == 0 {
+        config.adjustBatchSize()
+    }
+
+    return results
+}
+
+// adjustBatchSize implements adaptive tuning based on processing patterns
+func (config *IPCryptConfig) adjustBatchSize() {
+    current := int(config.batchSize.Load())
+    
+    // Simple heuristic: increase for sustained high throughput
+    // In production, you'd measure actual latency/throughput
+    if config.processedCount.Load() > adaptiveWindowSize*10 {
+        if current < maxBatchSize {
+            config.batchSize.Store(int32(current * 110 / 100)) // Increase by 10%
+        }
+    } else if current > minBatchSize {
+        config.batchSize.Store(int32(current * 90 / 100)) // Decrease by 10%
+    }
+}
+
+// EncryptBatchStrings encrypts IP strings with optimal batching
+func (config *IPCryptConfig) EncryptBatchStrings(ipStrs []string) []string {
+    return config.EncryptBatchStringsWithOptions(ipStrs, nil)
+}
+
+// EncryptBatchStringsWithOptions provides control over string batch processing
+func (config *IPCryptConfig) EncryptBatchStringsWithOptions(ipStrs []string, opts *BatchOptions) []string {
+    if config == nil || len(ipStrs) == 0 {
+        return ipStrs
+    }
+
+    // Pre-parse all IPs (parallel parsing for large batches)
+    ips := make([]netip.Addr, len(ipStrs))
+    validMask := make([]bool, len(ipStrs))
+    
+    if opts != nil && opts.Parallel && len(ipStrs) >= 1000 {
+        // Parallel parsing for very large batches
+        workers := runtime.NumCPU()
+        chunkSize := (len(ipStrs) + workers - 1) / workers
+        var wg sync.WaitGroup
+        
+        for w := 0; w < workers; w++ {
+            start := w * chunkSize
+            if start >= len(ipStrs) {
+                break
+            }
+            end := start + chunkSize
+            if end > len(ipStrs) {
+                end = len(ipStrs)
+            }
+            
+            wg.Add(1)
+            go func(start, end int) {
+                defer wg.Done()
+                for i := start; i < end; i++ {
+                    if addr, err := netip.ParseAddr(ipStrs[i]); err == nil {
+                        ips[i] = addr
+                        validMask[i] = true
+                    }
+                }
+            }(start, end)
+        }
+        wg.Wait()
+    } else {
+        // Sequential parsing for smaller batches
+        for i, ipStr := range ipStrs {
+            if addr, err := netip.ParseAddr(ipStr); err == nil {
+                ips[i] = addr
+                validMask[i] = true
+            }
+        }
+    }
+
+    // Encrypt valid IPs
+    encrypted := config.EncryptBatchWithOptions(ips, opts)
+    
+    // Map back to original strings where parsing failed
+    results := make([]string, len(ipStrs))
+    for i := range ipStrs {
+        if validMask[i] {
+            results[i] = encrypted[i]
+        } else {
+            results[i] = ipStrs[i]
+        }
+    }
+
+    return results
+}
+
 //go:noinline
 func (config *IPCryptConfig) encryptNonDeterministic(dst []byte, ip netip.Addr, tweakSize int, isX bool) ([]byte, error) {
     rng := config.rngPool.Get().(*mrand.ChaCha8)
     
-    var tweak [16]byte // Maximum size needed
+    var tweak [16]byte
     rng.Read(tweak[:tweakSize])
     config.rngPool.Put(rng)
 
@@ -197,19 +427,19 @@ func (config *IPCryptConfig) encryptNonDeterministic(dst []byte, ip netip.Addr, 
     return hex.AppendEncode(dst, encrypted), nil
 }
 
-// encryptIPv4Deterministic handles deterministic IPv4 encryption inline.
-// Go 1.26's improved vectorization and small object allocation optimizes this.
-//
 //go:inline
 func (config *IPCryptConfig) encryptIPv4Deterministic(dst []byte, ip netip.Addr) []byte {
     state := ip.As4()
     key := config.Key
 
-    // Bounds check elimination hint for compiler
     _ = key[15]
     
-    // Unrolled 4-round cipher with manual key XOR and permutation
-    // Go 1.26 vectorization will optimize this on amd64
+    if cap(dst)-len(dst) < 8 {
+        newDst := make([]byte, len(dst), len(dst)+8)
+        copy(newDst, dst)
+        dst = newDst
+    }
+    
     state[0] ^= key[0]
     state[1] ^= key[1]
     state[2] ^= key[2]
@@ -233,8 +463,6 @@ func (config *IPCryptConfig) encryptIPv4Deterministic(dst []byte, ip netip.Addr)
     state[2] ^= key[14]
     state[3] ^= key[15]
 
-    // Optimized hex encoding with manual unrolling
-    // Go 1.26 small allocation optimization helps here
     return append(dst,
         hextable[state[0]>>4], hextable[state[0]&0x0f],
         hextable[state[1]>>4], hextable[state[1]&0x0f],
@@ -243,21 +471,16 @@ func (config *IPCryptConfig) encryptIPv4Deterministic(dst []byte, ip netip.Addr)
     )
 }
 
-// encryptIPv6Deterministic handles deterministic IPv6 encryption.
-// Hardware AES-NI acceleration automatically enabled in Go 1.26+
-//
 //go:inline
 func (config *IPCryptConfig) encryptIPv6Deterministic(dst []byte, ip netip.Addr) ([]byte, error) {
     src := ip.As16()
     
-    // Fast path: use pre-initialized AES cipher with hardware acceleration
     if config.aesBlock != nil {
         var enc [16]byte
         config.aesBlock.Encrypt(enc[:], src[:])
         return hex.AppendEncode(dst, enc[:]), nil
     }
     
-    // Fallback: use external library
     encrypted, err := ipcrypt.EncryptIP(config.Key, src[:])
     if err != nil {
         return dst, err
@@ -265,9 +488,6 @@ func (config *IPCryptConfig) encryptIPv6Deterministic(dst []byte, ip netip.Addr)
     return hex.AppendEncode(dst, encrypted), nil
 }
 
-// encryptIPPrefixPreserving handles prefix-preserving encryption.
-// Optimized to avoid unnecessary allocations
-//
 //go:inline
 func (config *IPCryptConfig) encryptIPPrefixPreserving(dst []byte, ip netip.Addr) ([]byte, error) {
     var buf [16]byte
@@ -290,40 +510,30 @@ func (config *IPCryptConfig) encryptIPPrefixPreserving(dst []byte, ip netip.Addr
     return hex.AppendEncode(dst, encrypted), nil
 }
 
-// permute applies the ipcrypt permutation function.
-// Optimized for Go 1.26's SIMD vectorization on amd64.
-//
 //go:inline
 //go:nosplit
 func permute(s *[4]byte) {
-    // First stage: parallel operations
     s[0] += s[1]
     s[2] += s[3]
-    s[1] = (s[1] << 2) | (s[1] >> 6)
-    s[3] = (s[3] << 5) | (s[3] >> 3)
+    s[1] = bits.RotateLeft8(s[1], 2)
+    s[3] = bits.RotateLeft8(s[3], 5)
     
-    // Second stage: XOR operations
     s[1] ^= s[0]
     s[3] ^= s[2]
     
-    // Third stage: rotations and swaps
-    s[0] = (s[0] << 4) | (s[0] >> 4)
-    s[2] = (s[2] << 4) | (s[2] >> 4)
+    s[0] = bits.RotateLeft8(s[0], 4)
+    s[2] = bits.RotateLeft8(s[2], 4)
     
-    // Fourth stage: final operations
     s[0] += s[3]
     s[2] ^= s[1]
-    s[1] = (s[1] << 3) | (s[1] >> 5)
-    s[3] = (s[3] << 7) | (s[3] >> 1)
+    s[1] = bits.RotateLeft8(s[1], 3)
+    s[3] = bits.RotateLeft8(s[3], 7)
     
-    // Final stage: combine
     s[3] += s[2]
     s[1] ^= s[3]
     s[0] ^= s[1]
 }
 
-// EncryptIP encrypts a net.IP and returns the hex-encoded result as a string.
-// Zero-copy conversion optimized for Go 1.26's escape analysis.
 func (config *IPCryptConfig) EncryptIP(ipStr string) (string, error) {
     if config == nil {
         return ipStr, nil
@@ -339,13 +549,9 @@ func (config *IPCryptConfig) EncryptIP(ipStr string) (string, error) {
         return "", err
     }
     
-    // Zero-copy []byte to string conversion
-    // Safe because res won't be modified after this
     return unsafe.String(unsafe.SliceData(res), len(res)), nil
 }
 
-// EncryptIPString encrypts an IP address string.
-// Returns original string on error for defensive behavior.
 func (config *IPCryptConfig) EncryptIPString(ipStr string) string {
     if config == nil {
         return ipStr
