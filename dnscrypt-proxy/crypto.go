@@ -103,7 +103,7 @@ var (
     // Hardware acceleration flags
     hasAVX2   = false
     hasAESNI  = false
-    hasAVX    = false\
+    hasAVX    = false
     hasSSE42  = false
     hasAVX512 = false
 )
