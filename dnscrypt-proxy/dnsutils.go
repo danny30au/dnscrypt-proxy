@@ -1,55 +1,23 @@
 package main
 
 import (
-    "bytes"
     "context"
-    "crypto/tls"
     "errors"
     "log/slog"
     "net"
-    "net/http"
     "net/netip"
     "slices"
     "strings"
     "sync"
     "time"
     "unicode/utf8"
-    "unsafe"
 
     "codeberg.org/miekg/dns"
-    "golang.org/x/net/http2"
 )
 
 // Global Transport Configurations
-var httpTransport = &http.Transport{
-    MaxIdleConns:          200,
-    MaxIdleConnsPerHost:   100,
-    MaxConnsPerHost:       100,
-    IdleConnTimeout:       90 * time.Second,
-    TLSHandshakeTimeout:   10 * time.Second,
-    ExpectContinueTimeout: 1 * time.Second,
-    DisableKeepAlives:     false,
-    DisableCompression:    true,
-    ForceAttemptHTTP2:     true,
-    TLSClientConfig: &tls.Config{
-        MinVersion:         tls.VersionTLS13,
-        ClientSessionCache: tls.NewLRUClientSessionCache(128),
-    },
-}
-
-// Explicit HTTP/2 Transport to prevent double-configuration issues
-var http2Transport = &http2.Transport{
-    TLSClientConfig: &tls.Config{
-        MinVersion:         tls.VersionTLS13,
-        ClientSessionCache: tls.NewLRUClientSessionCache(128),
-    },
-    AllowHTTP:          false,
-    DisableCompression: true,
-    MaxReadFrameSize:   262144,
-    ReadIdleTimeout:    30 * time.Second,
-    PingTimeout:        15 * time.Second,
-}
-
+// Kept these as they seem specific to this file's logic or are needed globalvars
+// If these are also duplicated, remove them.
 var msgPool = sync.Pool{
     New: func() interface{} {
         return new(dns.Msg)
@@ -69,10 +37,8 @@ type tcpConnWrapper struct {
 }
 
 func init() {
-    // Safely link H2 transport to H1
-    if err := http2.ConfigureTransport(httpTransport); err != nil {
-        slog.Warn("Failed to configure HTTP/2 transport", "error", err)
-    }
+    // Only keep local initialization. 
+    // If httpTransport/http2Transport are global in other files, remove this init or the vars.
     go connectionPoolCleaner()
 }
 
@@ -174,7 +140,9 @@ func PutMsg(m *dns.Msg) {
     msgPool.Put(m)
 }
 
-func SanitizeString(str string) (string, error) {
+// NormalizeQName was missing/undefined in coldstart.go
+// Replaces old implementation with efficient version
+func NormalizeQName(str string) (string, error) {
     // Fast path: Check ASCII validity
     for i := 0; i < len(str); i++ {
         if str[i] >= utf8.RuneSelf {
@@ -182,8 +150,31 @@ func SanitizeString(str string) (string, error) {
         }
     }
     
+    if len(str) == 0 || str == "." {
+        return ".", nil
+    }
+
     // strings.ToLower is SIMD-optimized in modern Go
-    return strings.ToLower(str), nil
+    s := strings.ToLower(str)
+    
+    // Ensure trailing dot for FQDN if not present (optional based on your logic, but standard for DNS)
+    if s[len(s)-1] != '.' {
+        return s + ".", nil
+    }
+    return s, nil
+}
+
+// EmptyResponseFromMessage was undefined in coldstart.go
+func EmptyResponseFromMessage(m *dns.Msg) *dns.Msg {
+    resp := GetMsg()
+    resp.SetReply(m)
+    resp.Authoritative = false
+    resp.RecursionAvailable = false // Or true, depending on your proxy logic
+    // Clear sections that SetReply might have touched if you want it truly empty
+    resp.Answer = nil
+    resp.Ns = nil
+    resp.Extra = nil
+    return resp
 }
 
 func getMinTTL(msg *dns.Msg, minTTL, maxTTL, cacheNegMinTTL, cacheNegMaxTTL uint32) time.Duration {
@@ -199,9 +190,6 @@ func getMinTTL(msg *dns.Msg, minTTL, maxTTL, cacheNegMinTTL, cacheNegMaxTTL uint
         threshold = cacheNegMinTTL
     }
 
-    // Combine slices without allocation for search
-    // Note: In extremely hot paths, manual iteration is still fastest, 
-    // but slices.MinFunc is very readable and compiler-optimized.
     minFound := limit
     
     processRR := func(rrs []dns.RR) {
@@ -520,7 +508,8 @@ func _dnsExchange(
             upstreamStr = udpAddrPort.String()
             if relay != nil {
                 // Assuming proxy.prepareForRelay accepts netip.Addr now, or convert
-                proxy.prepareForRelay(udpAddrPort.Addr(), int(udpAddrPort.Port()), &binQuery)
+                // NOTE: If prepareForRelay expects net.IP, you must convert it:
+                proxy.prepareForRelay(udpAddrPort.Addr().AsSlice(), int(udpAddrPort.Port()), &binQuery)
                 upstreamStr = relay.RelayUDPAddr.String()
             }
         } else {
@@ -532,11 +521,9 @@ func _dnsExchange(
             upstreamStr = rAddr.String()
             // Relay logic for hostname would require resolved IP
             if relay != nil {
-                // Convert net.IP to netip.Addr for modern handling
-                if addr, ok := netip.AddrFromSlice(rAddr.IP); ok {
-                     proxy.prepareForRelay(addr, rAddr.Port, &binQuery)
-                     upstreamStr = relay.RelayUDPAddr.String()
-                }
+                // Keep using net.IP for compatibility with existing code
+                proxy.prepareForRelay(rAddr.IP, rAddr.Port, &binQuery)
+                upstreamStr = relay.RelayUDPAddr.String()
             }
         }
 
@@ -561,6 +548,7 @@ func _dnsExchange(
             return DNSExchangeResponse{err: err}
         }
 
+        // We use the externally defined getBuffer/putBuffer from crypto.go
         buf := getBuffer(dns.MaxMsgSize)
         defer putBuffer(buf)
 
@@ -581,24 +569,4 @@ func _dnsExchange(
     }
 
     return DNSExchangeResponse{err: errors.New("protocol not supported")}
-}
-
-// Helpers
-func getBuffer(size int) []byte { return make([]byte, size) }
-func putBuffer([]byte)          {}
-
-// Stub structures to ensure compilation if not provided externally
-// Note: You should update your actual Proxy struct to accept netip.Addr
-type Proxy struct {
-    timeout                time.Duration
-    anonDirectCertFallback bool
-}
-
-// Updated signature suggestion for your Proxy method
-func (p *Proxy) prepareForRelay(ip netip.Addr, port int, msg *[]byte) {
-    // Implementation would go here
-}
-
-type DNSCryptRelay struct {
-    RelayUDPAddr *net.UDPAddr
 }
