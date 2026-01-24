@@ -4,6 +4,8 @@ import (
     "bytes"
     "container/list"
     "crypto/cipher"
+    "crypto/ecdh"
+    "crypto/mlkem" // Go 1.24+ Post-Quantum
     crypto_rand "crypto/rand"
     "crypto/sha512"
     "crypto/subtle"
@@ -13,12 +15,15 @@ import (
     "math/bits"
     "os"
     "runtime"
+    "slices"
     "strconv"
     "sync"
     "sync/atomic"
     "time"
+    "unique"
 
     "github.com/jedisct1/dlog"
+    "golang.org/x/crypto/chacha20"
     "golang.org/x/crypto/chacha20poly1305"
     "golang.org/x/crypto/curve25519"
     "golang.org/x/crypto/nacl/box"
@@ -98,10 +103,37 @@ var (
     // Hardware acceleration flags
     hasAVX2   = false
     hasAESNI  = false
-    hasAVX    = false
+    hasAVX    = false\
     hasSSE42  = false
     hasAVX512 = false
 )
+
+// HybridKey contains both X25519 and ML-KEM-768 keys
+type HybridKey struct {
+    X25519 *ecdh.PrivateKey
+    MLKEM  *mlkem.DecapsulationKey768
+}
+
+// GenerateHybridKey generates a keypair using both X25519 (classic) and 
+// ML-KEM-768 (post-quantum) for defense-in-depth.
+func GenerateHybridKey() (*HybridKey, error) {
+    // 1. Classic X25519
+    x25519Key, err := ecdh.X25519().GenerateKey(crypto_rand.Reader)
+    if err != nil {
+        return nil, err
+    }
+
+    // 2. Post-Quantum ML-KEM-768 (Go 1.24+)
+    pqKey, err := mlkem.GenerateKey768()
+    if err != nil {
+        return nil, err
+    }
+
+    return &HybridKey{
+        X25519: x25519Key,
+        MLKEM:  pqKey,
+    }, nil
+}
 
 // CryptoMetrics with telemetry
 type CryptoMetrics struct {
@@ -119,31 +151,39 @@ type CryptoMetrics struct {
 
 var globalCryptoMetrics CryptoMetrics
 
-// Batch nonce generator (30-50% faster)
+// NonceGenerator uses a dedicated CSPRNG (ChaCha20) for high-throughput
+// nonce generation without syscall overhead per batch.
 type NonceGenerator struct {
-    buf [NonceBufferSize]byte
-    pos atomic.Int32
-    mu  sync.Mutex
+    cipher *chacha20.Cipher
+    mu     sync.Mutex
 }
 
 var globalNonceGen *NonceGenerator
 
-func (ng *NonceGenerator) GetNonce() ([HalfNonceSize]byte, error) {
-    pos := ng.pos.Add(HalfNonceSize)
-    if pos > NonceBufferSize {
-        ng.mu.Lock()
-        _, err := crypto_rand.Read(ng.buf[:])
-        if err != nil {
-            ng.mu.Unlock()
-            return [HalfNonceSize]byte{}, err
-        }
-        ng.pos.Store(0)
-        ng.mu.Unlock()
-        pos = ng.pos.Add(HalfNonceSize)
+func NewNonceGenerator() *NonceGenerator {
+    var key [32]byte
+    var nonce [12]byte // ChaCha20 default nonce size
+    if _, err := crypto_rand.Read(key[:]); err != nil {
+        panic("failed to seed nonce generator: " + err.Error())
     }
 
+    // ChaCha20 is ideal for fast user-space random stream generation
+    c, err := chacha20.NewUnauthenticatedCipher(key[:], nonce[:])
+    if err != nil {
+        panic(err)
+    }
+
+    return &NonceGenerator{cipher: c}
+}
+
+func (ng *NonceGenerator) GetNonce() ([HalfNonceSize]byte, error) {
+    ng.mu.Lock()
+    defer ng.mu.Unlock()
+
     var nonce [HalfNonceSize]byte
-    copy(nonce[:], ng.buf[pos-HalfNonceSize:pos])
+    // Keystream generation is extremely fast and effectively random
+    ng.cipher.XORKeyStream(nonce[:], nonce[:]) 
+
     globalCryptoMetrics.NonceGenCount.Add(1)
     return nonce, nil
 }
@@ -173,8 +213,9 @@ type batchJob struct {
     idx        int
     packet     []byte
     dst        []byte
-    serverInfo *ServerInfo
-    proto      string
+    // Go 1.25+ Interning: Deduplicates identical strings/pointers globally
+    serverInfo unique.Handle[*ServerInfo]
+    proto      unique.Handle[string]
     proxy      *Proxy
     result     chan encryptResult
     priority   int
@@ -227,13 +268,10 @@ func unpad(packet []byte) ([]byte, error) {
     }
 
     tail := packet[idx+1:]
-    if len(tail) == 0 {
-        return packet[:idx], nil
-    }
-
-    // Go 1.26 auto-vectorizes zero checks
-    for _, b := range tail {
-        if b != 0 {
+    // Go 1.26+ vectorizer handles this efficiently, but 'slices' makes intent clear
+    if len(tail) > 0 {
+        // Check if any byte in tail is non-zero
+        if slices.ContainsFunc(tail, func(b byte) bool { return b != 0 }) {
             return nil, ErrInvalidPadBytes
         }
     }
@@ -517,7 +555,7 @@ func (p *AdaptiveWorkerPool) worker() {
             idleTimer.Reset(p.idleTimeout)
 
             _, enc, nonce, err := job.proxy.EncryptInto(
-                job.dst, nil, job.serverInfo, job.packet, job.proto,
+                job.dst, nil, job.serverInfo.Value(), job.packet, job.proto.Value(),
             )
             job.result <- encryptResult{
                 idx:       job.idx,
@@ -570,10 +608,7 @@ func init() {
     }
 
     // Initialize batch nonce generator
-    globalNonceGen = &NonceGenerator{}
-    if _, err := crypto_rand.Read(globalNonceGen.buf[:]); err != nil {
-        dlog.Errorf("Failed to initialize nonce generator: %v", err)
-    }
+    globalNonceGen = NewNonceGenerator()
 
     // Pre-warm buffer pools
     poolWarmupSize := 20
@@ -582,7 +617,6 @@ func init() {
             poolWarmupSize = min(size, 2000)
         }
     }
-
     for range poolWarmupSize {
         buf256 := make([]byte, 0, 256)
         bufferPoolTiny.Put(&buf256)
@@ -936,8 +970,8 @@ func (proxy *Proxy) EncryptBatch(
             idx:        i,
             packet:     packets[i],
             dst:        dstBufs[i],
-            serverInfo: serverInfo,
-            proto:      proto,
+            serverInfo: unique.Make(serverInfo),
+            proto:      unique.Make(proto),
             proxy:      proxy,
             result:     results,
             priority:   0,
