@@ -55,8 +55,6 @@ ExpiredCachedIPGraceTTL     = 15 * time.Minute
 resolverRetryCount          = 3
 resolverRetryInitialBackoff = 25 * time.Millisecond
 resolverRetryMaxBackoff     = 300 * time.Millisecond
-MaxDNSPacketSize            = 4096
-MaxHTTPBodyLength           = 8 * 1024 * 1024
 )
 
 var resolverBackoffs = [resolverRetryCount]time.Duration{
@@ -91,12 +89,6 @@ type AltSupport struct {
 cache sync.Map // map[string]AltSupportItem
 }
 
-type DOHClientCreds struct {
-clientCert string
-clientKey  string
-rootCA     string
-}
-
 type dnsMessagePool struct {
 pool sync.Pool
 }
@@ -113,7 +105,7 @@ return new(dns.Msg)
 
 func (p *dnsMessagePool) Get() *dns.Msg {
 msg := p.pool.Get().(*dns.Msg)
-msg.Id = 0
+msg.ID = 0
 msg.Question = msg.Question[:0]
 msg.Answer = msg.Answer[:0]
 msg.Ns = msg.Ns[:0]
@@ -829,9 +821,25 @@ go func(qt uint16) {
 msg := xTransport.dnsMessagePool.Get()
 defer xTransport.dnsMessagePool.Put(msg)
 
-msg.SetQuestion(fqdn(host), qt)
+// Manually construct DNS message
+msg.Question = make([]dns.Question, 1)
+msg.Question[0] = dns.Question{
+Name:   fqdn(host),
+Qtype:  qt,
+Qclass: dns.ClassINET,
+}
 msg.RecursionDesired = true
-msg.SetEdns0(MaxDNSPacketSize, true)
+
+// Manually add EDNS0
+opt := &dns.OPT{
+Hdr: dns.RR_Header{
+Name:   ".",
+Rrtype: dns.TypeOPT,
+},
+}
+opt.SetUDPSize(MaxDNSPacketSize)
+opt.SetDo(true)
+msg.Extra = append(msg.Extra, opt)
 
 var qIPs []net.IP
 var qTTL uint32
@@ -1377,40 +1385,4 @@ dlog.Warnf("Failed to pre-warm DNS for [%s]: %v", host, err)
 }
 
 wg.Wait()
-}
-
-// Helper functions that need to be defined
-
-func isIPAndPort(s string) error {
-host, portStr, err := net.SplitHostPort(s)
-if err != nil {
-return err
-}
-if net.ParseIP(host) == nil {
-return fmt.Errorf("invalid IP address: %s", host)
-}
-port, err := strconv.Atoi(portStr)
-if err != nil || port < 1 || port > 65535 {
-return fmt.Errorf("invalid port: %s", portStr)
-}
-return nil
-}
-
-func ExtractHostAndPort(s string, defaultPort int) (string, int) {
-host, portStr, err := net.SplitHostPort(s)
-if err != nil {
-return s, defaultPort
-}
-port, err := strconv.Atoi(portStr)
-if err != nil {
-return host, defaultPort
-}
-return host, port
-}
-
-func fqdn(name string) string {
-if !strings.HasSuffix(name, ".") {
-return name + "."
-}
-return name
 }
