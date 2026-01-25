@@ -7,7 +7,6 @@ import (
     "sync"
     "sync/atomic"
     "time"
-    "math/rand/v2"
 
     "codeberg.org/miekg/dns"
     "github.com/jedisct1/dlog"
@@ -130,7 +129,6 @@ func processDNSCryptQuery(
         if staleData, ok := getStaleResponse(pluginsState); ok {
             return staleData, nil
         }
-
         if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
             pluginsState.returnCode = PluginsReturnCodeServerTimeout
         } else {
@@ -230,7 +228,7 @@ func processODoHQuery(
         dlog.Infof("Forcing key update for [%v]", serverInfo.Name)
 
         // Optimization: Use slices.IndexFunc (Go 1.21+) for cleaner lookup
-        idx := slices.IndexFunc(proxy.serversInfo.registeredServers, func(s *RegisteredServer) bool {
+        idx := slices.IndexFunc(proxy.serversInfo.registeredServers, func(s RegisteredServer) bool {
             return s.name == serverInfo.Name
         })
         if idx != -1 {
@@ -369,7 +367,7 @@ func sendResponse(
         if HasTCFlag(response) {
             proxy.questionSizeEstimator.blindAdjust()
         } else {
-            proxy.questionSizeEstimator.adjust(ResponseOverhead + len(response))
+            proxy.questionSizeEstimator.adjustResponseOverhead(len(response))
         }
     } else if clientProto == "tcp" {
         // Optimization: Use net.Buffers for zero-copy vectored I/O
