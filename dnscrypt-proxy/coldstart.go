@@ -7,8 +7,10 @@ import (
 "net"
 "net/netip"
 "os"
+"runtime"
 "strings"
 "sync"
+"sync/atomic"
 
 "codeberg.org/miekg/dns"
 "codeberg.org/miekg/dns/rdata"
@@ -18,18 +20,33 @@ import (
 const DNSBufferSize = 4096
 
 var (
-ErrSyntaxError = errors.New("syntax error for a captive portal rule")
+ErrSyntaxError        = errors.New("syntax error for a captive portal rule")
 ErrWildcardNotAllowed = errors.New("captive portal rule must use an exact host name")
 )
+
+var msgPool = sync.Pool{
+New: func() interface{} {
+return &dns.Msg{}
+},
+}
+
+var bufferPool = sync.Pool{
+New: func() interface{} {
+buf := make([]byte, DNSBufferSize)
+return &buf
+},
+}
 
 type CaptivePortalEntryIPs []netip.Addr
 
 type CaptivePortalMap map[string]CaptivePortalEntryIPs
 
 type CaptivePortalHandler struct {
-wg    sync.WaitGroup
-mu    sync.Mutex
-conns []*net.UDPConn
+wg         sync.WaitGroup
+mu         sync.Mutex
+conns      []*net.UDPConn
+queryCount atomic.Uint64
+errorCount atomic.Uint64
 }
 
 func (h *CaptivePortalHandler) Stop() {
@@ -65,53 +82,83 @@ return question, ips, ok
 }
 
 func HandleCaptivePortalQuery(msg *dns.Msg, question dns.RR, ips CaptivePortalEntryIPs) *dns.Msg {
-respMsg := EmptyResponseFromMessage(msg)
 hdr := question.Header()
 qtype := dns.RRToType(question)
 
-isA := qtype == dns.TypeA
-isAAAA := qtype == dns.TypeAAAA
-
-if !isA && !isAAAA {
+if qtype != dns.TypeA && qtype != dns.TypeAAAA {
 return nil
 }
 
-// Go 1.26: Create header template once and reuse
+respMsg := EmptyResponseFromMessage(msg)
 hdrTemplate := dns.Header{
 Name:  hdr.Name,
 Class: dns.ClassINET,
 TTL:   1,
 }
 
-respMsg.Answer = make([]dns.RR, 0, len(ips))
-
+matchCount := 0
 for _, ip := range ips {
-if (isA && ip.Is4()) || (isAAAA && ip.Is6()) {
-// Go 1.26: Use new(expr) syntax for cleaner pointer initialization
-if isA {
-respMsg.Answer = append(respMsg.Answer, new(dns.A{
-Hdr: hdrTemplate,
-A:   rdata.A{Addr: ip},
-}))
-} else {
-respMsg.Answer = append(respMsg.Answer, new(dns.AAAA{
-Hdr: hdrTemplate,
-AAAA: rdata.AAAA{Addr: ip},
-}))
-}
+if (qtype == dns.TypeA && ip.Is4()) || (qtype == dns.TypeAAAA && ip.Is6()) {
+matchCount++
 }
 }
 
-if len(respMsg.Answer) == 0 {
+if matchCount == 0 {
 return nil
 }
 
+respMsg.Answer = make([]dns.RR, 0, matchCount)
+
+for _, ip := range ips {
+if qtype == dns.TypeA && ip.Is4() {
+respMsg.Answer = append(respMsg.Answer, &dns.A{
+Hdr: hdrTemplate,
+A:   rdata.A{Addr: ip},
+})
+} else if qtype == dns.TypeAAAA && ip.Is6() {
+respMsg.Answer = append(respMsg.Answer, &dns.AAAA{
+Hdr: hdrTemplate,
+AAAA: rdata.AAAA{Addr: ip},
+})
+}
+}
+
+if dlog.ShouldLog(dlog.SeverityDebug) {
 qTypeStr, ok := dns.TypeToString[qtype]
 if !ok {
 qTypeStr = fmt.Sprint(qtype)
 }
 dlog.Debugf("Query for captive portal detection: [%v] (%v)", hdr.Name, qTypeStr)
+}
+
 return respMsg
+}
+
+func handlePacket(packet []byte, clientAddr *net.UDPAddr, conn *net.UDPConn, ipsMap *CaptivePortalMap, h *CaptivePortalHandler) {
+msg := msgPool.Get().(*dns.Msg)
+defer msgPool.Put(msg)
+
+msg.Data = packet
+if err := msg.Unpack(); err != nil {
+h.errorCount.Add(1)
+return
+}
+
+question, ips, ok := ipsMap.GetEntry(msg)
+if !ok {
+return
+}
+
+h.queryCount.Add(1)
+
+respMsg := HandleCaptivePortalQuery(msg, question, ips)
+if respMsg == nil {
+return
+}
+
+if err := respMsg.Pack(); err == nil {
+conn.WriteToUDP(respMsg.Data, clientAddr)
+}
 }
 
 func addColdStartListener(
@@ -132,54 +179,49 @@ if err != nil {
 return err
 }
 
+if err := clientPc.SetReadBuffer(2 * 1024 * 1024); err != nil {
+dlog.Warnf("Failed to set read buffer: %v", err)
+}
+if err := clientPc.SetWriteBuffer(2 * 1024 * 1024); err != nil {
+dlog.Warnf("Failed to set write buffer: %v", err)
+}
+
 h.mu.Lock()
 h.conns = append(h.conns, clientPc)
 h.mu.Unlock()
 
-// Start goroutine and track it in WaitGroup
+numReaders := runtime.NumCPU()
+if numReaders > 4 {
+numReaders = 4
+}
+
+for i := 0; i < numReaders; i++ {
 h.wg.Add(1)
 go func() {
 defer h.wg.Done()
 
-// Go 1.26: Faster small allocations (automatic optimization)
-buffer := make([]byte, DNSBufferSize)
+bufPtr := bufferPool.Get().(*[]byte)
+buffer := *bufPtr
+defer bufferPool.Put(bufPtr)
 
 for {
 length, clientAddr, err := clientPc.ReadFromUDP(buffer)
 if err != nil {
-// Go 1.26: Use errors.AsType for type-safe error checking
-if netErr, ok := errors.AsType[*net.OpError](err); ok && netErr.Err.Error() == "use of closed network connection" {
+var netErr *net.OpError
+if errors.As(err, &netErr) || errors.Is(err, net.ErrClosed) {
 return
 }
-if errors.Is(err, net.ErrClosed) {
-return
-}
-dlog.Warn(err)
+h.errorCount.Add(1)
 continue
 }
 
-packet := buffer[:length]
-msg := &dns.Msg{}
-msg.Data = packet
-if err := msg.Unpack(); err != nil {
-continue
-}
-
-question, ips, ok := ipsMap.GetEntry(msg)
-if !ok {
-continue
-}
-
-respMsg := HandleCaptivePortalQuery(msg, question, ips)
-if respMsg == nil {
-continue
-}
-
-if err := respMsg.Pack(); err == nil {
-clientPc.WriteToUDP(respMsg.Data, clientAddr)
-}
+packetCopy := make([]byte, length)
+copy(packetCopy, buffer[:length])
+handlePacket(packetCopy, clientAddr, clientPc, ipsMap, h)
 }
 }()
+}
+
 return nil
 }
 
@@ -195,11 +237,16 @@ return nil, err
 }
 defer file.Close()
 
-// Pre-allocate map capacity for better performance
+fileInfo, _ := file.Stat()
 estimatedRules := 100
+if fileInfo != nil && fileInfo.Size() > 0 {
+estimatedRules = int(fileInfo.Size() / 40)
+}
+
 ipsMap := make(CaptivePortalMap, estimatedRules)
 scanner := bufio.NewScanner(file)
-scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+buf := make([]byte, 128*1024)
+scanner.Buffer(buf, 1024*1024)
 lineNo := 0
 
 for scanner.Scan() {
@@ -221,32 +268,24 @@ if strings.Contains(ipsStr, "*") {
 return nil, fmt.Errorf("%w at line %d", ErrWildcardNotAllowed, lineNo)
 }
 
-// Go 1.23+: Using strings.Cut for better performance
-var ips []netip.Addr
-remaining := ipsStr
-for {
+ips := make([]netip.Addr, 0, 4)
+for len(ipsStr) > 0 {
 var ipStr string
-ipStr, remaining, _ = strings.Cut(remaining, ",")
+ipStr, ipsStr, _ = strings.Cut(ipsStr, ",")
 ipStr = strings.TrimSpace(ipStr)
 
-if ipStr == "" && remaining == "" {
-break
-}
-if ipStr == "" {
-return nil, fmt.Errorf("%w at line %d", ErrSyntaxError, lineNo)
-}
-
+if ipStr != "" {
 ip, err := netip.ParseAddr(ipStr)
 if err != nil {
 return nil, fmt.Errorf("%w at line %d", ErrSyntaxError, lineNo)
 }
 ips = append(ips, ip)
+}
+}
 
-if remaining == "" {
-break
-}
-}
+if len(ips) > 0 {
 ipsMap[name] = ips
+}
 }
 
 if err := scanner.Err(); err != nil {
