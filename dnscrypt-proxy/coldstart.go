@@ -24,19 +24,6 @@ ErrSyntaxError        = errors.New("syntax error for a captive portal rule")
 ErrWildcardNotAllowed = errors.New("captive portal rule must use an exact host name")
 )
 
-var msgPool = sync.Pool{
-New: func() interface{} {
-return &dns.Msg{}
-},
-}
-
-var bufferPool = sync.Pool{
-New: func() interface{} {
-buf := make([]byte, DNSBufferSize)
-return &buf
-},
-}
-
 type CaptivePortalEntryIPs []netip.Addr
 
 type CaptivePortalMap map[string]CaptivePortalEntryIPs
@@ -123,13 +110,11 @@ AAAA: rdata.AAAA{Addr: ip},
 }
 }
 
-if dlog.ShouldLog(dlog.SeverityDebug) {
 qTypeStr, ok := dns.TypeToString[qtype]
 if !ok {
 qTypeStr = fmt.Sprint(qtype)
 }
 dlog.Debugf("Query for captive portal detection: [%v] (%v)", hdr.Name, qTypeStr)
-}
 
 return respMsg
 }
