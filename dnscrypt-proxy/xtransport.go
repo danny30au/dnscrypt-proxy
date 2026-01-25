@@ -818,28 +818,19 @@ defer xTransport.dnsClientPool.Put(dnsClient)
 
 for _, qType := range queryTypes {
 go func(qt uint16) {
-msg := xTransport.dnsMessagePool.Get()
-defer xTransport.dnsMessagePool.Put(msg)
-
-// Manually construct DNS message
-msg.Question = make([]dns.Question, 1)
-msg.Question[0] = dns.Question{
-Name:   fqdn(host),
-Qtype:  qt,
-Qclass: dns.ClassINET,
+// Use dns.NewMsg() - creates message with question already set
+msg := dns.NewMsg(fqdn(host), qt)
+if msg == nil {
+select {
+case results <- queryResult{ips: nil, ttl: 0, err: errors.New("failed to create DNS message")}:
+case <-ctx.Done():
 }
+return
+}
+
 msg.RecursionDesired = true
-
-// Manually add EDNS0
-opt := &dns.OPT{
-Hdr: dns.RR_Header{
-Name:   ".",
-Rrtype: dns.TypeOPT,
-},
-}
-opt.SetUDPSize(MaxDNSPacketSize)
-opt.SetDo(true)
-msg.Extra = append(msg.Extra, opt)
+msg.UDPSize = uint16(MaxDNSPacketSize)
+msg.Security = true
 
 var qIPs []net.IP
 var qTTL uint32
