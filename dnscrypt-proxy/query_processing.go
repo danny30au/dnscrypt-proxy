@@ -367,7 +367,7 @@ func sendResponse(
         if HasTCFlag(response) {
             proxy.questionSizeEstimator.blindAdjust()
         } else {
-            proxy.questionSizeEstimator.adjustResponseOverhead(len(response))
+            proxy.questionSizeEstimator.adjust(ResponseOverhead + len(response))
         }
     } else if clientProto == "tcp" {
         // Optimization: Use net.Buffers for zero-copy vectored I/O
