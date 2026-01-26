@@ -55,8 +55,6 @@ const (
     resolverRetryCount          = 3
     resolverRetryInitialBackoff = 25 * time.Millisecond
     resolverRetryMaxBackoff     = 300 * time.Millisecond
-    MaxDNSPacketSize            = 4096
-    MaxHTTPBodyLength           = 4 * 1024 * 1024
 )
 
 var resolverBackoffs = [resolverRetryCount]time.Duration{
@@ -128,12 +126,6 @@ func (p *dnsMessagePool) Put(msg *dns.Msg) {
     if msg != nil {
         p.pool.Put(msg)
     }
-}
-
-type DOHClientCreds struct {
-    clientCert string
-    clientKey  string
-    rootCA     string
 }
 
 type XTransport struct {
@@ -824,13 +816,6 @@ func (xTransport *XTransport) resolveUsingSystem(host string, returnIPv4, return
     return ips, SystemResolverIPTTL, nil
 }
 
-func fqdn(name string) string {
-    if !strings.HasSuffix(name, ".") {
-        return name + "."
-    }
-    return name
-}
-
 func (xTransport *XTransport) resolveUsingResolver(
     proto, host string,
     resolver string,
@@ -863,10 +848,11 @@ func (xTransport *XTransport) resolveUsingResolver(
 
     for _, qType := range queryTypes {
         go func(qt uint16) {
+            // Use proper DNS message construction
             msg := new(dns.Msg)
             msg.SetQuestion(fqdn(host), qt)
             msg.RecursionDesired = true
-            msg.SetEdns0(MaxDNSPacketSize, true)
+            msg.SetEdns0(uint16(MaxDNSPacketSize), true)
 
             var qIPs []net.IP
             var qTTL uint32
@@ -878,12 +864,12 @@ func (xTransport *XTransport) resolveUsingResolver(
                     case dns.TypeA:
                         if a, ok := answer.(*dns.A); ok {
                             qIPs = append(qIPs, a.A)
-                            qTTL = a.Header().Ttl
+                            qTTL = a.Header().TTL
                         }
                     case dns.TypeAAAA:
                         if aaaa, ok := answer.(*dns.AAAA); ok {
                             qIPs = append(qIPs, aaaa.AAAA)
-                            qTTL = aaaa.Header().Ttl
+                            qTTL = aaaa.Header().TTL
                         }
                     }
                 }
@@ -1404,33 +1390,4 @@ func (xTransport *XTransport) PrewarmDNSCache(dohResolvers []string) {
     }
 
     wg.Wait()
-}
-
-// ExtractHostAndPort extracts host and port from address string
-func ExtractHostAndPort(addrStr string, defaultPort int) (string, int) {
-    host, portStr, err := net.SplitHostPort(addrStr)
-    if err != nil {
-        return addrStr, defaultPort
-    }
-    port, err := strconv.Atoi(portStr)
-    if err != nil {
-        return host, defaultPort
-    }
-    return host, port
-}
-
-// isIPAndPort validates an IP:port string
-func isIPAndPort(addr string) error {
-    host, portStr, err := net.SplitHostPort(addr)
-    if err != nil {
-        return err
-    }
-    if net.ParseIP(host) == nil {
-        return fmt.Errorf("invalid IP address: %s", host)
-    }
-    port, err := strconv.Atoi(portStr)
-    if err != nil || port < 1 || port > 65535 {
-        return fmt.Errorf("invalid port: %s", portStr)
-    }
-    return nil
 }
