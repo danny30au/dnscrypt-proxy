@@ -1,10 +1,4 @@
-pa
-
-    // New: CachedIPItem pool for reduced allocations
-    xTransport.cachedIPItemPool.New = func() any {
-        return &CachedIPItem{}
-    }
-ckage main
+package main
 
 import (
 "bytes"
@@ -278,15 +272,6 @@ func formatEndpoint(ip net.IP, port int) string {
 if ip == nil {
 return ""
 }
-
-// Improved: hashBody using maphash for better performance (Go 1.23+)
-func hashBody(body []byte) string {
-    var h maphash.Hash
-    h.SetSeed(hashSeed)
-    h.Write(body)
-    return strconv.FormatUint(h.Sum64(), 16)
-}
-
 return net.JoinHostPort(ip.String(), strconv.Itoa(port))
 }
 
@@ -1401,4 +1386,3 @@ dlog.Warnf("Failed to pre-warm DNS for [%s]: %v", host, err)
 
 wg.Wait()
 }
-    cachedIPItemPool         sync.Pool
