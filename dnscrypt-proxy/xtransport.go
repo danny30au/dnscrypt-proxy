@@ -1,66 +1,72 @@
-package main
+pa
+
+    // New: CachedIPItem pool for reduced allocations
+    xTransport.cachedIPItemPool.New = func() any {
+        return &CachedIPItem{}
+    }
+ckage main
 
 import (
-    "bytes"
-    "compress/gzip"
-    "context"
-    "crypto/tls"
-    "crypto/x509"
-    "encoding/base64"
-    "errors"
-    "fmt"
-    "hash/maphash"
-    "io"
-    "math/rand/v2"
-    "net"
-    "net/http"
-    "net/url"
-    "os"
-    "slices"
-    "strconv"
-    "strings"
-    "sync"
-    "sync/atomic"
-    "time"
+"bytes"
+"compress/gzip"
+"context"
+"crypto/tls"
+"crypto/x509"
+"encoding/base64"
+"errors"
+"fmt"
+"hash/maphash"
+"io"
+"math/rand/v2"
+"net"
+"net/http"
+"net/url"
+"os"
+"slices"
+"strconv"
+"strings"
+"sync"
+"sync/atomic"
+"time"
 
-    "codeberg.org/miekg/dns"
-    "github.com/jedisct1/dlog"
-    stamps "github.com/jedisct1/go-dnsstamps"
-    "github.com/quic-go/quic-go"
-    "github.com/quic-go/quic-go/http3"
-    "golang.org/x/net/http2"
-    netproxy "golang.org/x/net/proxy"
-    "golang.org/x/sync/singleflight"
-    "golang.org/x/sys/cpu"
+"codeberg.org/miekg/dns"
+"github.com/jedisct1/dlog"
+stamps "github.com/jedisct1/go-dnsstamps"
+"github.com/quic-go/quic-go"
+"github.com/quic-go/quic-go/http3"
+"golang.org/x/net/http2"
+netproxy "golang.org/x/net/proxy"
+"golang.org/x/sync/singleflight"
+"golang.org/x/sys/cpu"
 )
 
 var (
-    protoTCPFirst = []string{"tcp", "udp"}
-    protoUDPFirst = []string{"udp", "tcp"}
+protoTCPFirst = []string{"tcp", "udp"}
+protoUDPFirst = []string{"udp", "tcp"}
 )
 
 var hasAESGCMHardwareSupport = cpu.X86.HasAES && cpu.X86.HasPCLMULQDQ ||
-    cpu.ARM64.HasAES && cpu.ARM64.HasPMULL ||
-    cpu.S390X.HasAES && cpu.S390X.HasAESGCM
+cpu.ARM64.HasAES && cpu.ARM64.HasPMULL ||
+cpu.S390X.HasAES && cpu.S390X.HasAESGCM
 
 const (
-    DefaultBootstrapResolver    = "9.9.9.9:53"
-    DefaultKeepAlive            = 360 * time.Second
-    DefaultTimeout              = 10 * time.Second
-    ResolverReadTimeout         = 2 * time.Second
-    SystemResolverIPTTL         = 12 * time.Hour
-    MinResolverIPTTL            = 30 * time.Minute
-    ResolverIPTTLMaxJitter      = 15 * time.Minute
-    ExpiredCachedIPGraceTTL     = 15 * time.Minute
-    resolverRetryCount          = 3
-    resolverRetryInitialBackoff = 25 * time.Millisecond
-    resolverRetryMaxBackoff     = 300 * time.Millisecond
+DefaultBootstrapResolver    = "9.9.9.9:53"
+DefaultKeepAlive            = 360 * time.Second
+DefaultTimeout              = 10 * time.Second
+ResolverReadTimeout         = 2 * time.Second
+SystemResolverIPTTL         = 12 * time.Hour
+MinResolverIPTTL            = 30 * time.Minute
+ResolverIPTTLMaxJitter      = 15 * time.Minute
+ExpiredCachedIPGraceTTL     = 15 * time.Minute
+resolverRetryCount          = 3
+resolverRetryInitialBackoff = 25 * time.Millisecond
+resolverRetryMaxBackoff     = 300 * time.Millisecond
 )
 
 var resolverBackoffs = [resolverRetryCount]time.Duration{
-    resolverRetryInitialBackoff,
-    resolverRetryInitialBackoff * 2,
-    resolverRetryMaxBackoff,
+resolverRetryInitialBackoff,
+resolverRetryInitialBackoff * 2,
+resolverRetryMaxBackoff,
 }
 
 var bgCtx = context.Background()
@@ -75,210 +81,202 @@ var commonHeaders = map[string]string{
 }
 
 type CachedIPItem struct {
-    ips           []net.IP
-    expiration    *time.Time
-    updatingUntil *time.Time
+ips           []net.IP
+expiration    *time.Time
+updatingUntil *time.Time
 }
 
 // CachedIPs uses sync.Map for better concurrent read performance
 type CachedIPs struct {
-    cache  sync.Map // map[string]*CachedIPItem
-    hits   atomic.Uint64
-    misses atomic.Uint64
+cache  sync.Map // map[string]*CachedIPItem
+hits   atomic.Uint64
+misses atomic.Uint64
 }
 
 type AltSupportItem struct {
-    port      uint16
-    nextProbe time.Time
-    valid     bool
+port      uint16
+nextProbe time.Time
+valid     bool
 }
 
 // AltSupport uses sync.Map for better concurrent read performance
 type AltSupport struct {
-    cache sync.Map // map[string]AltSupportItem
+cache sync.Map // map[string]AltSupportItem
 }
 
 type dnsMessagePool struct {
-    pool sync.Pool
+pool sync.Pool
 }
 
 func newDNSMessagePool() *dnsMessagePool {
-    return &dnsMessagePool{
-        pool: sync.Pool{
-            New: func() any {
-                return new(dns.Msg)
-            },
-        },
-    }
+return &dnsMessagePool{
+pool: sync.Pool{
+New: func() any {
+return new(dns.Msg)
+},
+},
+}
 }
 
 func (p *dnsMessagePool) Get() *dns.Msg {
-    msg := p.pool.Get().(*dns.Msg)
-    msg.ID = 0
-    msg.Question = msg.Question[:0]
-    msg.Answer = msg.Answer[:0]
-    msg.Ns = msg.Ns[:0]
-    msg.Extra = msg.Extra[:0]
-    return msg
+msg := p.pool.Get().(*dns.Msg)
+msg.ID = 0
+msg.Question = msg.Question[:0]
+msg.Answer = msg.Answer[:0]
+msg.Ns = msg.Ns[:0]
+msg.Extra = msg.Extra[:0]
+return msg
 }
 
 func (p *dnsMessagePool) Put(msg *dns.Msg) {
-    if msg != nil {
-        p.pool.Put(msg)
-    }
+if msg != nil {
+p.pool.Put(msg)
+}
 }
 
 type XTransport struct {
-    sessionCache             tls.ClientSessionCache
-    transport                *http.Transport
-    h3Transport              *http3.Transport
-    httpClient               *http.Client
-    h3Client                 *http.Client
-    keepAlive                time.Duration
-    timeout                  time.Duration
-    cachedIPs                CachedIPs
-    altSupport               AltSupport
-    internalResolvers        []string
-    bootstrapResolvers       []string
-    mainProto                string
-    resolveProtos            []string
-    ignoreSystemDNS          bool
-    internalResolverReady    bool
-    useIPv4                  bool
-    useIPv6                  bool
-    http3                    bool
-    http3Probe               bool
-    tlsDisableSessionTickets bool
-    tlsPreferRSA             bool
-    proxyDialer              *netproxy.Dialer
-    httpProxyFunction        func(*http.Request) (*url.URL, error)
-    tlsClientCreds           DOHClientCreds
-    keyLogWriter             io.Writer
-    gzipPool                 sync.Pool
-    dnsClientPool            sync.Pool
-    dnsMessagePool           *dnsMessagePool
-    bufferPool               sync.Pool
-    cachedIPItemPool         sync.Pool
-    resolveGroup             singleflight.Group
-    quicMu                   sync.Mutex
-    quicUDP4                 *net.UDPConn
-    quicUDP6                 *net.UDPConn
-    quicTr4                  *quic.Transport
-    quicTr6                  *quic.Transport
+sessionCache             tls.ClientSessionCache
+transport                *http.Transport
+h3Transport              *http3.Transport
+httpClient               *http.Client
+h3Client                 *http.Client
+keepAlive                time.Duration
+timeout                  time.Duration
+cachedIPs                CachedIPs
+altSupport               AltSupport
+internalResolvers        []string
+bootstrapResolvers       []string
+mainProto                string
+resolveProtos            []string
+ignoreSystemDNS          bool
+internalResolverReady    bool
+useIPv4                  bool
+useIPv6                  bool
+http3                    bool
+http3Probe               bool
+tlsDisableSessionTickets bool
+tlsPreferRSA             bool
+proxyDialer              *netproxy.Dialer
+httpProxyFunction        func(*http.Request) (*url.URL, error)
+tlsClientCreds           DOHClientCreds
+keyLogWriter             io.Writer
+gzipPool                 sync.Pool
+dnsClientPool            sync.Pool
+dnsMessagePool           *dnsMessagePool
+bufferPool               sync.Pool
+resolveGroup             singleflight.Group
+quicMu                   sync.Mutex
+quicUDP4                 *net.UDPConn
+quicUDP6                 *net.UDPConn
+quicTr4                  *quic.Transport
+quicTr6                  *quic.Transport
 }
 
 func NewXTransport() *XTransport {
-    if err := isIPAndPort(DefaultBootstrapResolver); err != nil {
-        panic("DefaultBootstrapResolver does not parse")
-    }
+if err := isIPAndPort(DefaultBootstrapResolver); err != nil {
+panic("DefaultBootstrapResolver does not parse")
+}
 
-    xTransport := &XTransport{
-        keepAlive:                DefaultKeepAlive,
-        timeout:                  DefaultTimeout,
-        bootstrapResolvers:       []string{DefaultBootstrapResolver},
-        mainProto:                "",
-        resolveProtos:            protoUDPFirst,
-        ignoreSystemDNS:          true,
-        useIPv4:                  true,
-        useIPv6:                  false,
-        http3Probe:               false,
-        tlsDisableSessionTickets: false,
-        tlsPreferRSA:             false,
-        keyLogWriter:             nil,
-        sessionCache:             tls.NewLRUClientSessionCache(4096),
-        dnsMessagePool:           newDNSMessagePool(),
-    }
+xTransport := &XTransport{
+keepAlive:                DefaultKeepAlive,
+timeout:                  DefaultTimeout,
+bootstrapResolvers:       []string{DefaultBootstrapResolver},
+mainProto:                "",
+resolveProtos:            protoUDPFirst,
+ignoreSystemDNS:          true,
+useIPv4:                  true,
+useIPv6:                  false,
+http3Probe:               false,
+tlsDisableSessionTickets: false,
+tlsPreferRSA:             false,
+keyLogWriter:             nil,
+sessionCache:             tls.NewLRUClientSessionCache(4096),
+dnsMessagePool:           newDNSMessagePool(),
+}
 
-    // Initialize object pools
-    xTransport.gzipPool.New = func() any {
-        return new(gzip.Reader)
-    }
+// Initialize object pools
+xTransport.gzipPool.New = func() any {
+return new(gzip.Reader)
+}
 
-    xTransport.dnsClientPool.New = func() any {
-        transport := dns.NewTransport()
-        transport.ReadTimeout = ResolverReadTimeout
-        return &dns.Client{Transport: transport}
-    }
+xTransport.dnsClientPool.New = func() any {
+transport := dns.NewTransport()
+transport.ReadTimeout = ResolverReadTimeout
+return &dns.Client{Transport: transport}
+}
 
-    xTransport.bufferPool.New = func() any {
-        buf := new(bytes.Buffer)
-        buf.Grow(4096) // Pre-allocate common size
-        return buf
-    }
+xTransport.bufferPool.New = func() any {
+buf := new(bytes.Buffer)
+buf.Grow(4096) // Pre-allocate common size
+return buf
+}
 
-    // New: CachedIPItem pool for reduced allocations
-    xTransport.cachedIPItemPool.New = func() any {
-        return &CachedIPItem{}
-    }
-
-    return xTransport
+return xTransport
 }
 
 // ParseIP parses an IP address, handling bracketed IPv6 addresses
 func ParseIP(ipStr string) net.IP {
-    s := strings.TrimPrefix(ipStr, "[")
-    s = strings.TrimSuffix(s, "]")
-    return net.ParseIP(s)
+s := strings.TrimPrefix(ipStr, "[")
+s = strings.TrimSuffix(s, "]")
+return net.ParseIP(s)
 }
 
 // uniqueNormalizedIPs deduplicates IPs using optimized stack allocation for common cases
 func uniqueNormalizedIPs(ips []net.IP) []net.IP {
-    if len(ips) == 0 {
-        return nil
-    }
+if len(ips) == 0 {
+return nil
+}
 
-    // Use stack-allocated array for common case (up to 4 IPs)
-    if len(ips) <= 4 {
-        var seenStack [4][16]byte
-        seen := seenStack[:0:4]
-        unique := make([]net.IP, 0, len(ips))
+// Use stack-allocated array for common case (up to 4 IPs)
+if len(ips) <= 4 {
+var seenStack [4][16]byte
+seen := seenStack[:0:4]
+unique := make([]net.IP, 0, len(ips))
 
-        for _, ip := range ips {
-            if ip == nil {
-                continue
-            }
-            var key [16]byte
-            copy(key[:], ip.To16())
+for _, ip := range ips {
+if ip == nil {
+continue
+}
+var key [16]byte
+copy(key[:], ip.To16())
 
-            found := false
-            for i := range seen {
-                if seen[i] == key {
-                    found = true
-                    break
-                }
-            }
-            if !found {
-                seen = append(seen, key)
-                unique = append(unique, append(net.IP(nil), ip...))
-            }
-        }
-        return unique
-    }
+found := false
+for i := range seen {
+if seen[i] == key {
+found = true
+break
+}
+}
+if !found {
+seen = append(seen, key)
+unique = append(unique, append(net.IP(nil), ip...))
+}
+}
+return unique
+}
 
-    // Heap path for many IPs
-    seen := make(map[[16]byte]struct{}, len(ips))
-    unique := make([]net.IP, 0, len(ips))
+// Heap path for many IPs
+seen := make(map[[16]byte]struct{}, len(ips))
+unique := make([]net.IP, 0, len(ips))
 
-    for _, ip := range ips {
-        if ip == nil {
-            continue
-        }
-        var key [16]byte
-        copy(key[:], ip.To16())
-        if _, exists := seen[key]; !exists {
-            seen[key] = struct{}{}
-            unique = append(unique, append(net.IP(nil), ip...))
-        }
-    }
-    return unique
+for _, ip := range ips {
+if ip == nil {
+continue
+}
+var key [16]byte
+copy(key[:], ip.To16())
+if _, exists := seen[key]; !exists {
+seen[key] = struct{}{}
+unique = append(unique, append(net.IP(nil), ip...))
+}
+}
+return unique
 }
 
 // formatEndpoint uses net.JoinHostPort for standard formatting
 func formatEndpoint(ip net.IP, port int) string {
-    if ip == nil {
-        return ""
-    }
-    return net.JoinHostPort(ip.String(), strconv.Itoa(port))
+if ip == nil {
+return ""
 }
 
 // Improved: hashBody using maphash for better performance (Go 1.23+)
@@ -289,144 +287,142 @@ func hashBody(body []byte) string {
     return strconv.FormatUint(h.Sum64(), 16)
 }
 
+return net.JoinHostPort(ip.String(), strconv.Itoa(port))
+}
+
 func (xTransport *XTransport) saveCachedIPs(host string, ips []net.IP, ttl time.Duration) {
-    normalized := uniqueNormalizedIPs(ips)
-    if len(normalized) == 0 {
-        return
-    }
+normalized := uniqueNormalizedIPs(ips)
+if len(normalized) == 0 {
+return
+}
 
-    // Improved: Use pool for CachedIPItem
-    item := xTransport.cachedIPItemPool.Get().(*CachedIPItem)
-    item.ips = normalized
-    item.updatingUntil = nil
+item := &CachedIPItem{ips: normalized}
+now := time.Now()
+if ttl >= 0 {
+if ttl < MinResolverIPTTL {
+ttl = MinResolverIPTTL
+}
+// Use math/rand/v2 for better performance
+ttl += time.Duration(rand.Int64N(int64(ResolverIPTTLMaxJitter)))
+expiration := now.Add(ttl)
+item.expiration = &expiration
+}
 
-    now := time.Now()
-    if ttl >= 0 {
-        if ttl < MinResolverIPTTL {
-            ttl = MinResolverIPTTL
-        }
-        // Use math/rand/v2 for better performance
-        ttl += time.Duration(rand.Int64N(int64(ResolverIPTTLMaxJitter)))
-        expiration := now.Add(ttl)
-        item.expiration = &expiration
-    } else {
-        item.expiration = nil
-    }
+item.updatingUntil = nil
+xTransport.cachedIPs.cache.Store(host, item)
 
-    xTransport.cachedIPs.cache.Store(host, item)
-
-    if len(normalized) == 1 {
-        dlog.Debugf("[%s] cached IP [%s], valid for %v", host, normalized[0], ttl)
-    } else {
-        dlog.Debugf("[%s] cached %d IP addresses (first: %s), valid for %v", host, len(normalized), normalized[0], ttl)
-    }
+if len(normalized) == 1 {
+dlog.Debugf("[%s] cached IP [%s], valid for %v", host, normalized[0], ttl)
+} else {
+dlog.Debugf("[%s] cached %d IP addresses (first: %s), valid for %v", host, len(normalized), normalized[0], ttl)
+}
 }
 
 func (xTransport *XTransport) saveCachedIP(host string, ip net.IP, ttl time.Duration) {
-    if ip == nil {
-        return
-    }
-    xTransport.saveCachedIPs(host, []net.IP{ip}, ttl)
+if ip == nil {
+return
+}
+xTransport.saveCachedIPs(host, []net.IP{ip}, ttl)
 }
 
 func (xTransport *XTransport) markUpdatingCachedIP(host string) {
-    val, ok := xTransport.cachedIPs.cache.Load(host)
-    if !ok {
-        return
-    }
+val, ok := xTransport.cachedIPs.cache.Load(host)
+if !ok {
+return
+}
 
-    item := val.(*CachedIPItem)
-    now := time.Now()
-    until := now.Add(xTransport.timeout)
+item := val.(*CachedIPItem)
+now := time.Now()
+until := now.Add(xTransport.timeout)
 
-    // Create new item to avoid race conditions
-    newItem := xTransport.cachedIPItemPool.Get().(*CachedIPItem)
-    newItem.ips = item.ips
-    newItem.expiration = item.expiration
-    newItem.updatingUntil = &until
-
-    xTransport.cachedIPs.cache.Store(host, newItem)
-    dlog.Debugf("[%s] IP address marked as updating", host)
+// Create new item to avoid race conditions
+newItem := &CachedIPItem{
+ips:           item.ips,
+expiration:    item.expiration,
+updatingUntil: &until,
+}
+xTransport.cachedIPs.cache.Store(host, newItem)
+dlog.Debugf("[%s] IP address marked as updating", host)
 }
 
 func (xTransport *XTransport) loadCachedIPs(host string) (ips []net.IP, expired bool, updating bool) {
-    val, ok := xTransport.cachedIPs.cache.Load(host)
-    if !ok {
-        xTransport.cachedIPs.misses.Add(1)
-        dlog.Debugf("[%s] IP address not found in the cache", host)
-        return nil, false, false
-    }
+val, ok := xTransport.cachedIPs.cache.Load(host)
+if !ok {
+xTransport.cachedIPs.misses.Add(1)
+dlog.Debugf("[%s] IP address not found in the cache", host)
+return nil, false, false
+}
 
-    xTransport.cachedIPs.hits.Add(1)
-    item := val.(*CachedIPItem)
-    ips = item.ips
-    expiration := item.expiration
-    updatingUntil := item.updatingUntil
+xTransport.cachedIPs.hits.Add(1)
+item := val.(*CachedIPItem)
+ips = item.ips
+expiration := item.expiration
+updatingUntil := item.updatingUntil
 
-    if expiration != nil && time.Until(*expiration) < 5*time.Minute {
-        expired = true
-        if updatingUntil != nil && time.Until(*updatingUntil) > 0 {
-            updating = true
-            dlog.Debugf("[%s] cached IP addresses are being updated", host)
-        } else {
-            dlog.Debugf("[%s] cached IP addresses expired, not being updated yet", host)
-        }
-    }
-    return ips, expired, updating
+if expiration != nil && time.Until(*expiration) < 5*time.Minute {
+expired = true
+if updatingUntil != nil && time.Until(*updatingUntil) > 0 {
+updating = true
+dlog.Debugf("[%s] cached IP addresses are being updated", host)
+} else {
+dlog.Debugf("[%s] cached IP addresses expired, not being updated yet", host)
+}
+}
+return ips, expired, updating
 }
 
 func (xTransport *XTransport) getGzipReader(r io.Reader) (*gzip.Reader, error) {
-    gr := xTransport.gzipPool.Get().(*gzip.Reader)
-    if err := gr.Reset(r); err != nil {
-        xTransport.gzipPool.Put(gr)
-        return nil, err
-    }
-    return gr, nil
+gr := xTransport.gzipPool.Get().(*gzip.Reader)
+if err := gr.Reset(r); err != nil {
+xTransport.gzipPool.Put(gr)
+return nil, err
+}
+return gr, nil
 }
 
 func (xTransport *XTransport) putGzipReader(gr *gzip.Reader) {
-    _ = gr.Close()
-    xTransport.gzipPool.Put(gr)
+_ = gr.Close()
+xTransport.gzipPool.Put(gr)
 }
 
 func (xTransport *XTransport) getQUICTransport(network string) (*quic.Transport, error) {
-    xTransport.quicMu.Lock()
-    defer xTransport.quicMu.Unlock()
+xTransport.quicMu.Lock()
+defer xTransport.quicMu.Unlock()
 
-    const sockBuf = 8 << 20 // 8MB for better performance
+const sockBuf = 8 << 20 // 8MB for better performance
 
-    switch network {
-    case "udp4":
-        if xTransport.quicTr4 != nil {
-            return xTransport.quicTr4, nil
-        }
-        c, err := net.ListenUDP("udp4", nil)
-        if err != nil {
-            return nil, fmt.Errorf("failed to listen UDP4: %w", err)
-        }
-        _ = c.SetReadBuffer(sockBuf)
-        _ = c.SetWriteBuffer(sockBuf)
-        xTransport.quicUDP4 = c
-        xTransport.quicTr4 = &quic.Transport{Conn: c}
-        return xTransport.quicTr4, nil
+switch network {
+case "udp4":
+if xTransport.quicTr4 != nil {
+return xTransport.quicTr4, nil
+}
+c, err := net.ListenUDP("udp4", nil)
+if err != nil {
+return nil, fmt.Errorf("failed to listen UDP4: %w", err)
+}
+_ = c.SetReadBuffer(sockBuf)
+_ = c.SetWriteBuffer(sockBuf)
+xTransport.quicUDP4 = c
+xTransport.quicTr4 = &quic.Transport{Conn: c}
+return xTransport.quicTr4, nil
 
-    case "udp6":
-        if xTransport.quicTr6 != nil {
-            return xTransport.quicTr6, nil
-        }
-        c, err := net.ListenUDP("udp6", nil)
-        if err != nil {
-            return nil, fmt.Errorf("failed to listen UDP6: %w", err)
-        }
-        _ = c.SetReadBuffer(sockBuf)
-        _ = c.SetWriteBuffer(sockBuf)
-        xTransport.quicUDP6 = c
-        xTransport.quicTr6 = &quic.Transport{Conn: c}
-        return xTransport.quicTr6, nil
+case "udp6":
+if xTransport.quicTr6 != nil {
+return xTransport.quicTr6, nil
+}
+c, err := net.ListenUDP("udp6", nil)
+if err != nil {
+return nil, fmt.Errorf("failed to listen UDP6: %w", err)
+}
+_ = c.SetReadBuffer(sockBuf)
+_ = c.SetWriteBuffer(sockBuf)
+xTransport.quicUDP6 = c
+xTransport.quicTr6 = &quic.Transport{Conn: c}
+return xTransport.quicTr6, nil
 
-    default:
-        return nil, fmt.Errorf("unsupported quic network: %s", network)
-    }
+default:
+return nil, fmt.Errorf("unsupported quic network: %s", network)
+}
 }
 
 func (xTransport *XTransport) rebuildTransport() {
@@ -1405,3 +1401,4 @@ dlog.Warnf("Failed to pre-warm DNS for [%s]: %v", host, err)
 
 wg.Wait()
 }
+    cachedIPItemPool         sync.Pool
