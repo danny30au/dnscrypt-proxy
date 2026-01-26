@@ -9,7 +9,7 @@ import (
 "encoding/base64"
 "errors"
 "fmt"
-"hash/maphash"
+"hash/fnv"
 "io"
 "math/rand/v2"
 "net"
@@ -65,17 +65,8 @@ resolverRetryMaxBackoff,
 
 var bgCtx = context.Background()
 
-// Global hash seed for better performance (Go 1.23+)
-var hashSeed = maphash.MakeSeed()
-
-// Pre-computed common headers to reduce allocations
-var commonHeaders = map[string]string{
-    "User-Agent":    "dnscrypt-proxy",
-    "Cache-Control": "max-stale",
-}
-
 type CachedIPItem struct {
-ips           []net.IP
+ips           []netip.Addr
 expiration    *time.Time
 updatingUntil *time.Time
 }
@@ -209,14 +200,14 @@ return xTransport
 }
 
 // ParseIP parses an IP address, handling bracketed IPv6 addresses
-func ParseIP(ipStr string) net.IP {
+func ParseIP(ipStr string) netip.Addr {
 s := strings.TrimPrefix(ipStr, "[")
 s = strings.TrimSuffix(s, "]")
-return net.ParseIP(s)
+return netip.ParseAddr(s)
 }
 
 // uniqueNormalizedIPs deduplicates IPs using optimized stack allocation for common cases
-func uniqueNormalizedIPs(ips []net.IP) []net.IP {
+func uniqueNormalizedIPs(ips []netip.Addr) []netip.Addr {
 if len(ips) == 0 {
 return nil
 }
@@ -225,7 +216,7 @@ return nil
 if len(ips) <= 4 {
 var seenStack [4][16]byte
 seen := seenStack[:0:4]
-unique := make([]net.IP, 0, len(ips))
+unique := make([]netip.Addr, 0, len(ips))
 
 for _, ip := range ips {
 if ip == nil {
@@ -243,7 +234,7 @@ break
 }
 if !found {
 seen = append(seen, key)
-unique = append(unique, append(net.IP(nil), ip...))
+unique = append(unique, append(netip.Addr(nil), ip...))
 }
 }
 return unique
@@ -251,7 +242,7 @@ return unique
 
 // Heap path for many IPs
 seen := make(map[[16]byte]struct{}, len(ips))
-unique := make([]net.IP, 0, len(ips))
+unique := make([]netip.Addr, 0, len(ips))
 
 for _, ip := range ips {
 if ip == nil {
@@ -261,21 +252,21 @@ var key [16]byte
 copy(key[:], ip.To16())
 if _, exists := seen[key]; !exists {
 seen[key] = struct{}{}
-unique = append(unique, append(net.IP(nil), ip...))
+unique = append(unique, append(netip.Addr(nil), ip...))
 }
 }
 return unique
 }
 
 // formatEndpoint uses net.JoinHostPort for standard formatting
-func formatEndpoint(ip net.IP, port int) string {
+func formatEndpoint(ip netip.Addr, port int) string {
 if ip == nil {
 return ""
 }
 return net.JoinHostPort(ip.String(), strconv.Itoa(port))
 }
 
-func (xTransport *XTransport) saveCachedIPs(host string, ips []net.IP, ttl time.Duration) {
+func (xTransport *XTransport) saveCachedIPs(host string, ips []netip.Addr, ttl time.Duration) {
 normalized := uniqueNormalizedIPs(ips)
 if len(normalized) == 0 {
 return
@@ -289,12 +280,11 @@ ttl = MinResolverIPTTL
 }
 // Use math/rand/v2 for better performance
 ttl += time.Duration(rand.Int64N(int64(ResolverIPTTLMaxJitter)))
-expiration := now.Add(ttl)
-item.expiration = &expiration
+item.expiration = new(now.Add(ttl))
 }
 
 item.updatingUntil = nil
-xTransport.cachedIPs.cache.Store(host, item)
+xTransport.cachedIPs.cache.Store(unique.Make(host), item)
 
 if len(normalized) == 1 {
 dlog.Debugf("[%s] cached IP [%s], valid for %v", host, normalized[0], ttl)
@@ -303,22 +293,22 @@ dlog.Debugf("[%s] cached %d IP addresses (first: %s), valid for %v", host, len(n
 }
 }
 
-func (xTransport *XTransport) saveCachedIP(host string, ip net.IP, ttl time.Duration) {
+func (xTransport *XTransport) saveCachedIP(host string, ip netip.Addr, ttl time.Duration) {
 if ip == nil {
 return
 }
-xTransport.saveCachedIPs(host, []net.IP{ip}, ttl)
+xTransport.saveCachedIPs(host, []netip.Addr{ip}, ttl)
 }
 
 func (xTransport *XTransport) markUpdatingCachedIP(host string) {
-val, ok := xTransport.cachedIPs.cache.Load(host)
+val, ok := xTransport.cachedIPs.cache.Load(unique.Make(host)
 if !ok {
 return
 }
 
 item := val.(*CachedIPItem)
 now := time.Now()
-until := now.Add(xTransport.timeout)
+until := now.Add(xTransport.timeout))
 
 // Create new item to avoid race conditions
 newItem := &CachedIPItem{
@@ -326,14 +316,14 @@ ips:           item.ips,
 expiration:    item.expiration,
 updatingUntil: &until,
 }
-xTransport.cachedIPs.cache.Store(host, newItem)
+xTransport.cachedIPs.cache.Store(unique.Make(host), newItem)
 dlog.Debugf("[%s] IP address marked as updating", host)
 }
 
-func (xTransport *XTransport) loadCachedIPs(host string) (ips []net.IP, expired bool, updating bool) {
-val, ok := xTransport.cachedIPs.cache.Load(host)
+func (xTransport *XTransport) loadCachedIPs(host string) (ips []netip.Addr, expired bool, updating bool) {
+val, ok := xTransport.cachedIPs.cache.Load(unique.Make(host)
 if !ok {
-xTransport.cachedIPs.misses.Add(1)
+xTransport.cachedIPs.misses.Add(1))
 dlog.Debugf("[%s] IP address not found in the cache", host)
 return nil, false, false
 }
@@ -671,7 +661,7 @@ addr    string
 network string
 }
 
-buildAddr := func(ip net.IP) udpTarget {
+buildAddr := func(ip netip.Addr) udpTarget {
 if ip != nil {
 if ipv4 := ip.To4(); ipv4 != nil {
 return udpTarget{
@@ -772,7 +762,7 @@ xTransport.h3Client = &http.Client{Transport: xTransport.h3Transport}
 }
 }
 
-func (xTransport *XTransport) resolveUsingSystem(host string, returnIPv4, returnIPv6 bool) ([]net.IP, time.Duration, error) {
+func (xTransport *XTransport) resolveUsingSystem(host string, returnIPv4, returnIPv6 bool) ([]netip.Addr, time.Duration, error) {
 ipa, err := net.LookupIP(host)
 if err != nil {
 return nil, SystemResolverIPTTL, fmt.Errorf("system DNS lookup failed: %w", err)
@@ -782,7 +772,7 @@ if returnIPv4 && returnIPv6 {
 return ipa, SystemResolverIPTTL, nil
 }
 
-ips := make([]net.IP, 0, len(ipa))
+ips := make([]netip.Addr, 0, len(ipa))
 for _, ip := range ipa {
 ipv4 := ip.To4()
 if returnIPv4 && ipv4 != nil {
@@ -799,9 +789,9 @@ func (xTransport *XTransport) resolveUsingResolver(
 proto, host string,
 resolver string,
 returnIPv4, returnIPv6 bool,
-) (ips []net.IP, ttl time.Duration, err error) {
+) (ips []netip.Addr, ttl time.Duration, err error) {
 type queryResult struct {
-ips []net.IP
+ips []netip.Addr
 ttl time.Duration
 err error
 }
@@ -826,7 +816,7 @@ dnsClient := xTransport.dnsClientPool.Get().(*dns.Client)
 defer xTransport.dnsClientPool.Put(dnsClient)
 
 for _, qType := range queryTypes {
-go func(qt uint16) {
+wg.Go(func() {
 // Use dns.NewMsg() - creates message with question already set
 msg := dns.NewMsg(fqdn(host), qt)
 if msg == nil {
@@ -841,7 +831,7 @@ msg.RecursionDesired = true
 msg.UDPSize = uint16(MaxDNSPacketSize)
 msg.Security = true
 
-var qIPs []net.IP
+var qIPs []netip.Addr
 var qTTL uint32
 
 in, _, err := dnsClient.Exchange(ctx, msg, proto, resolver)
@@ -872,7 +862,7 @@ case <-ctx.Done():
 }
 
 // Pre-grow slice with expected capacity
-collectedIPs := make([]net.IP, 0, len(queryTypes)*2)
+collectedIPs := make([]netip.Addr, 0, len(queryTypes)*2)
 collectedIPs = slices.Grow(collectedIPs, len(queryTypes)*2)
 var minTTL time.Duration
 var lastErr error
@@ -913,7 +903,7 @@ func (xTransport *XTransport) resolveUsingServers(
 proto, host string,
 resolvers []string,
 returnIPv4, returnIPv6 bool,
-) (ips []net.IP, ttl time.Duration, err error) {
+) (ips []netip.Addr, ttl time.Duration, err error) {
 if len(resolvers) == 0 {
 return nil, 0, errors.New("empty resolvers")
 }
@@ -952,7 +942,7 @@ lastErr = errors.New("no IP addresses returned")
 return nil, 0, lastErr
 }
 
-func (xTransport *XTransport) resolve(host string, returnIPv4, returnIPv6 bool) (ips []net.IP, ttl time.Duration, err error) {
+func (xTransport *XTransport) resolve(host string, returnIPv4, returnIPv6 bool) (ips []netip.Addr, ttl time.Duration, err error) {
 if xTransport.ignoreSystemDNS {
 if xTransport.internalResolverReady {
 for _, proto := range xTransport.resolveProtos {
@@ -1006,7 +996,7 @@ cachedIPs, expired, updating := xTransport.loadCachedIPs(host)
 if len(cachedIPs) > 0 {
 if expired && !updating {
 xTransport.markUpdatingCachedIP(host)
-go func(stale []net.IP) {
+go func(stale []netip.Addr) {
 _ = xTransport.resolveAndUpdateCacheBlocking(host, stale)
 }(cachedIPs)
 }
@@ -1019,7 +1009,7 @@ return nil, xTransport.resolveAndUpdateCacheBlocking(host, nil)
 return err
 }
 
-func (xTransport *XTransport) resolveAndUpdateCacheBlocking(host string, cachedIPs []net.IP) error {
+func (xTransport *XTransport) resolveAndUpdateCacheBlocking(host string, cachedIPs []netip.Addr) error {
 ips, ttl, err := xTransport.resolve(host, xTransport.useIPv4, xTransport.useIPv6)
 if ttl < MinResolverIPTTL {
 ttl = MinResolverIPTTL
@@ -1083,13 +1073,13 @@ client = xTransport.h3Client
 }
 dlog.Debugf("Probing HTTP/3 transport for [%s]", url.Host)
 } else {
-val, ok := xTransport.altSupport.cache.Load(url.Host)
+val, ok := xTransport.altSupport.cache.Load(unique.Make(url.Host)
 hasAltSupport = ok
 if ok {
 item := val.(AltSupportItem)
 altPort := item.port
 if altPort > 0 {
-if int(altPort) == port {
+if int(altPort)) == port {
 if xTransport.h3Client != nil {
 client = xTransport.h3Client
 }
@@ -1164,7 +1154,7 @@ dlog.Debugf("HTTP/3 probe failed for [%s]: [%s] - falling back to HTTP/2", url.H
 dlog.Debugf("HTTP/3 connection failed for [%s]: [%s] - falling back to HTTP/2", url.Host, err)
 }
 
-xTransport.altSupport.cache.Store(url.Host, AltSupportItem{
+xTransport.altSupport.cache.Store(unique.Make(url.Host), AltSupportItem{
 port:      0,
 nextProbe: time.Now().Add(5 * time.Minute),
 valid:     true,
@@ -1209,11 +1199,11 @@ if xTransport.h3Transport != nil && !hasAltSupport {
 skipAltSvcParsing := false
 
 if xTransport.http3Probe {
-val, inCache := xTransport.altSupport.cache.Load(url.Host)
+val, inCache := xTransport.altSupport.cache.Load(unique.Make(url.Host)
 if inCache {
 item := val.(AltSupportItem)
 if item.port == 0 {
-if item.valid && time.Now().Before(item.nextProbe) {
+if item.valid && time.Now().Before(item.nextProbe)) {
 dlog.Debugf("Skipping Alt-Svc parsing for [%s] - previously failed HTTP/3 probe", url.Host)
 skipAltSvcParsing = true
 }
@@ -1227,7 +1217,7 @@ dlog.Debugf("Alt-Svc [%s]: [%s]", url.Host, alt)
 altPort := uint16(port & 0xffff)
 
 for i, xalt := range alt {
-for j, v := range strings.Split(xalt, ";") {
+for v := range strings.SplitSeq(xalt, ";") {
 if i >= 8 || j >= 16 {
 break
 }
@@ -1245,7 +1235,7 @@ break
 }
 }
 
-xTransport.altSupport.cache.Store(url.Host, AltSupportItem{port: altPort, valid: true})
+xTransport.altSupport.cache.Store(unique.Make(url.Host), AltSupportItem{port: altPort, valid: true})
 dlog.Debugf("Caching altPort for [%v]", url.Host)
 }
 }
