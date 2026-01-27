@@ -45,11 +45,19 @@ const (
     adaptiveWindowSize = 2000 // Sample size for adaptive tuning
 )
 
+// Global buffer pool restored for backward compatibility with coldstart.go
+var bufferPool = sync.Pool{
+    New: func() any {
+        buf := make([]byte, 0, 256)
+        return &buf
+    },
+}
+
 // IPCryptConfig optimized for cache-line isolation to prevent false sharing.
 // Aligns to 64-byte cache lines.
 type IPCryptConfig struct {
     // --- Read-Mostly Zone (Shared across cores) ---
-    aesBlock  cipher.Block // 16 bytes (if/ace)
+    aesBlock  cipher.Block // 16 bytes (interface)
     Key       []byte       // 24 bytes
     Algorithm Algorithm    // 1 byte
     _         [23]byte     // Padding to fill cache line (64 bytes total)
@@ -215,8 +223,6 @@ func (config *IPCryptConfig) encryptBatchSequential(ips []netip.Addr) []string {
         // The 'arena' slice is kept alive by the 'results' references? 
         // No, standard Go GC handles this. We just need to create a string 
         // that points to the arena memory.
-        // NOTE: unsafe.String returns a string header pointing to the bytes.
-        // Since 'arena' is not reused/reset for *other* batches, this is safe.
         results[i] = unsafe.String(unsafe.SliceData(arena[start:]), len(encrypted))
     }
 
@@ -297,6 +303,46 @@ func (config *IPCryptConfig) EncryptIter(ips iter.Seq[netip.Addr]) iter.Seq[stri
             }
         }
     }
+}
+
+// Restored method for API compatibility
+func (config *IPCryptConfig) EncryptIPString(ipStr string) string {
+    if config == nil {
+        return ipStr
+    }
+    
+    addr, err := netip.ParseAddr(ipStr)
+    if err != nil {
+        return ipStr
+    }
+    
+    var buf [64]byte
+    res, err := config.AppendEncryptIP(buf[:0], addr)
+    if err != nil {
+        return ipStr
+    }
+    
+    return string(res)
+}
+
+// Restored method for API compatibility
+func (config *IPCryptConfig) EncryptIP(ipStr string) (string, error) {
+    if config == nil {
+        return ipStr, nil
+    }
+    
+    addr, err := netip.ParseAddr(ipStr)
+    if err != nil {
+        return "", fmt.Errorf("%w: %v", ErrInvalidIP, err)
+    }
+    
+    var buf [64]byte
+    res, err := config.AppendEncryptIP(buf[:0], addr)
+    if err != nil {
+        return "", err
+    }
+    
+    return string(res), nil
 }
 
 // AppendEncryptIP optimized for inlining
