@@ -1,6 +1,7 @@
 package main
 
 import (
+
 "bytes"
 "compress/gzip"
 "context"
@@ -11,9 +12,11 @@ import (
 "fmt"
 "hash/fnv"
 "io"
+"iter"
 "math/rand/v2"
 "net"
 "net/http"
+"net/netip"
 "net/url"
 "os"
 "slices"
@@ -21,17 +24,11 @@ import (
 "strings"
 "sync"
 "sync/atomic"
+"syscall"
 "time"
+"unique"
+"unsafe"
 
-"codeberg.org/miekg/dns"
-"github.com/jedisct1/dlog"
-stamps "github.com/jedisct1/go-dnsstamps"
-"github.com/quic-go/quic-go"
-"github.com/quic-go/quic-go/http3"
-"golang.org/x/net/http2"
-netproxy "golang.org/x/net/proxy"
-"golang.org/x/sync/singleflight"
-"golang.org/x/sys/cpu"
 )
 
 var (
@@ -65,18 +62,35 @@ resolverRetryMaxBackoff,
 
 var bgCtx = context.Background()
 
+// God Mode: Zero-copy string casting
+func strToBytes(s string) []byte {
+return unsafe.Slice(unsafe.StringData(s), len(s))
+}
+func bytesToStr(b []byte) string {
+return unsafe.String(unsafe.SliceData(b), len(b))
+}
+
+// God Mode: Cache line padding to prevent false sharing (64-byte cache lines)
+type pad [56]byte
+
+
 type CachedIPItem struct {
-ips           []net.IP
+ips           []netip.Addr
 expiration    *time.Time
 updatingUntil *time.Time
 }
 
 // CachedIPs uses sync.Map for better concurrent read performance
+
 type CachedIPs struct {
-cache  sync.Map // map[string]*CachedIPItem
+cache  sync.Map // map[unique.Handle]*CachedIPItem
+_      pad      // Prevent false sharing
 hits   atomic.Uint64
+_      pad
 misses atomic.Uint64
+_      pad
 }
+
 
 type AltSupportItem struct {
 port      uint16
@@ -200,49 +214,34 @@ return xTransport
 }
 
 // ParseIP parses an IP address, handling bracketed IPv6 addresses
-func ParseIP(ipStr string) net.IP {
+func ParseIP(ipStr string) netip.Addr {
 s := strings.TrimPrefix(ipStr, "[")
 s = strings.TrimSuffix(s, "]")
-return net.ParseIP(s)
+return netip.ParseAddr(s)
 }
 
 // uniqueNormalizedIPs deduplicates IPs using optimized stack allocation for common cases
-func uniqueNormalizedIPs(ips []net.IP) []net.IP {
-if len(ips) == 0 {
-return nil
-}
 
-// Use stack-allocated array for common case (up to 4 IPs)
-if len(ips) <= 4 {
-var seenStack [4][16]byte
-seen := seenStack[:0:4]
-unique := make([]net.IP, 0, len(ips))
+func uniqueNormalizedIPs(ips []netip.Addr) []netip.Addr {
+if len(ips) <= 1 { return ips }
 
+// God Mode: Stack allocation for small sets skipped, explicit Swiss Map usage
+seen := make(map[netip.Addr]struct{}, len(ips))
+unique := make([]netip.Addr, 0, len(ips))
 for _, ip := range ips {
-if ip == nil {
-continue
-}
-var key [16]byte
-copy(key[:], ip.To16())
-
-found := false
-for i := range seen {
-if seen[i] == key {
-found = true
-break
-}
-}
-if !found {
-seen = append(seen, key)
-unique = append(unique, append(net.IP(nil), ip...))
+if !ip.IsValid() { continue }
+if _, exists := seen[ip]; !exists {
+seen[ip] = struct{}{}
+unique = append(unique, ip)
 }
 }
 return unique
 }
 
+
 // Heap path for many IPs
 seen := make(map[[16]byte]struct{}, len(ips))
-unique := make([]net.IP, 0, len(ips))
+unique := make([]netip.Addr, 0, len(ips))
 
 for _, ip := range ips {
 if ip == nil {
@@ -252,21 +251,21 @@ var key [16]byte
 copy(key[:], ip.To16())
 if _, exists := seen[key]; !exists {
 seen[key] = struct{}{}
-unique = append(unique, append(net.IP(nil), ip...))
+unique = append(unique, append(netip.Addr(nil), ip...))
 }
 }
 return unique
 }
 
 // formatEndpoint uses net.JoinHostPort for standard formatting
-func formatEndpoint(ip net.IP, port int) string {
+func formatEndpoint(ip netip.Addr, port int) string {
 if ip == nil {
 return ""
 }
 return net.JoinHostPort(ip.String(), strconv.Itoa(port))
 }
 
-func (xTransport *XTransport) saveCachedIPs(host string, ips []net.IP, ttl time.Duration) {
+func (xTransport *XTransport) saveCachedIPs(host string, ips []netip.Addr, ttl time.Duration) {
 normalized := uniqueNormalizedIPs(ips)
 if len(normalized) == 0 {
 return
@@ -280,12 +279,11 @@ ttl = MinResolverIPTTL
 }
 // Use math/rand/v2 for better performance
 ttl += time.Duration(rand.Int64N(int64(ResolverIPTTLMaxJitter)))
-expiration := now.Add(ttl)
-item.expiration = &expiration
+item.expiration = new(time.Now().Add(ttl))
 }
 
 item.updatingUntil = nil
-xTransport.cachedIPs.cache.Store(host, item)
+xTransport.cachedIPs.cache.Store(unique.Make(host), item)
 
 if len(normalized) == 1 {
 dlog.Debugf("[%s] cached IP [%s], valid for %v", host, normalized[0], ttl)
@@ -294,22 +292,22 @@ dlog.Debugf("[%s] cached %d IP addresses (first: %s), valid for %v", host, len(n
 }
 }
 
-func (xTransport *XTransport) saveCachedIP(host string, ip net.IP, ttl time.Duration) {
+func (xTransport *XTransport) saveCachedIP(host string, ip netip.Addr, ttl time.Duration) {
 if ip == nil {
 return
 }
-xTransport.saveCachedIPs(host, []net.IP{ip}, ttl)
+xTransport.saveCachedIPs(host, []netip.Addr{ip}, ttl)
 }
 
 func (xTransport *XTransport) markUpdatingCachedIP(host string) {
-val, ok := xTransport.cachedIPs.cache.Load(host)
+val, ok := xTransport.cachedIPs.cache.Load(unique.Make(host)
 if !ok {
 return
 }
 
 item := val.(*CachedIPItem)
 now := time.Now()
-until := now.Add(xTransport.timeout)
+until := now.Add(xTransport.timeout))
 
 // Create new item to avoid race conditions
 newItem := &CachedIPItem{
@@ -317,14 +315,14 @@ ips:           item.ips,
 expiration:    item.expiration,
 updatingUntil: &until,
 }
-xTransport.cachedIPs.cache.Store(host, newItem)
+xTransport.cachedIPs.cache.Store(unique.Make(host), newItem)
 dlog.Debugf("[%s] IP address marked as updating", host)
 }
 
-func (xTransport *XTransport) loadCachedIPs(host string) (ips []net.IP, expired bool, updating bool) {
-val, ok := xTransport.cachedIPs.cache.Load(host)
+func (xTransport *XTransport) loadCachedIPs(host string) (ips []netip.Addr, expired bool, updating bool) {
+val, ok := xTransport.cachedIPs.cache.Load(unique.Make(host)
 if !ok {
-xTransport.cachedIPs.misses.Add(1)
+xTransport.cachedIPs.misses.Add(1))
 dlog.Debugf("[%s] IP address not found in the cache", host)
 return nil, false, false
 }
@@ -471,11 +469,21 @@ targets = append(targets, net.JoinHostPort(host, strconv.Itoa(port)))
 
 dial := func(address string) (net.Conn, error) {
 if xTransport.proxyDialer == nil {
+
 dialer := &net.Dialer{
 Timeout:   timeout,
 KeepAlive: 15 * time.Second,
 DualStack: true,
+Control: func(network, address string, c syscall.RawConn) error {
+return c.Control(func(fd uintptr) {
+// God Mode: Low level socket optimization
+syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, 0x0F, 1) // SO_REUSEPORT
+syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, 30, 1)  // TCP_FASTOPEN_CONNECT
+})
+},
 }
+
 return dialer.DialContext(ctx, network, address)
 }
 return (*xTransport.proxyDialer).Dial(network, address)
@@ -662,7 +670,7 @@ addr    string
 network string
 }
 
-buildAddr := func(ip net.IP) udpTarget {
+buildAddr := func(ip netip.Addr) udpTarget {
 if ip != nil {
 if ipv4 := ip.To4(); ipv4 != nil {
 return udpTarget{
@@ -763,7 +771,7 @@ xTransport.h3Client = &http.Client{Transport: xTransport.h3Transport}
 }
 }
 
-func (xTransport *XTransport) resolveUsingSystem(host string, returnIPv4, returnIPv6 bool) ([]net.IP, time.Duration, error) {
+func (xTransport *XTransport) resolveUsingSystem(host string, returnIPv4, returnIPv6 bool) ([]netip.Addr, time.Duration, error) {
 ipa, err := net.LookupIP(host)
 if err != nil {
 return nil, SystemResolverIPTTL, fmt.Errorf("system DNS lookup failed: %w", err)
@@ -773,7 +781,7 @@ if returnIPv4 && returnIPv6 {
 return ipa, SystemResolverIPTTL, nil
 }
 
-ips := make([]net.IP, 0, len(ipa))
+ips := make([]netip.Addr, 0, len(ipa))
 for _, ip := range ipa {
 ipv4 := ip.To4()
 if returnIPv4 && ipv4 != nil {
@@ -790,9 +798,9 @@ func (xTransport *XTransport) resolveUsingResolver(
 proto, host string,
 resolver string,
 returnIPv4, returnIPv6 bool,
-) (ips []net.IP, ttl time.Duration, err error) {
+) (ips []netip.Addr, ttl time.Duration, err error) {
 type queryResult struct {
-ips []net.IP
+ips []netip.Addr
 ttl time.Duration
 err error
 }
@@ -817,7 +825,8 @@ dnsClient := xTransport.dnsClientPool.Get().(*dns.Client)
 defer xTransport.dnsClientPool.Put(dnsClient)
 
 for _, qType := range queryTypes {
-go func(qt uint16) {
+wg.Go(func() {
+qt := qType
 // Use dns.NewMsg() - creates message with question already set
 msg := dns.NewMsg(fqdn(host), qt)
 if msg == nil {
@@ -832,7 +841,7 @@ msg.RecursionDesired = true
 msg.UDPSize = uint16(MaxDNSPacketSize)
 msg.Security = true
 
-var qIPs []net.IP
+var qIPs []netip.Addr
 var qTTL uint32
 
 in, _, err := dnsClient.Exchange(ctx, msg, proto, resolver)
@@ -863,7 +872,7 @@ case <-ctx.Done():
 }
 
 // Pre-grow slice with expected capacity
-collectedIPs := make([]net.IP, 0, len(queryTypes)*2)
+collectedIPs := make([]netip.Addr, 0, len(queryTypes)*2)
 collectedIPs = slices.Grow(collectedIPs, len(queryTypes)*2)
 var minTTL time.Duration
 var lastErr error
@@ -904,7 +913,7 @@ func (xTransport *XTransport) resolveUsingServers(
 proto, host string,
 resolvers []string,
 returnIPv4, returnIPv6 bool,
-) (ips []net.IP, ttl time.Duration, err error) {
+) (ips []netip.Addr, ttl time.Duration, err error) {
 if len(resolvers) == 0 {
 return nil, 0, errors.New("empty resolvers")
 }
@@ -943,7 +952,7 @@ lastErr = errors.New("no IP addresses returned")
 return nil, 0, lastErr
 }
 
-func (xTransport *XTransport) resolve(host string, returnIPv4, returnIPv6 bool) (ips []net.IP, ttl time.Duration, err error) {
+func (xTransport *XTransport) resolve(host string, returnIPv4, returnIPv6 bool) (ips []netip.Addr, ttl time.Duration, err error) {
 if xTransport.ignoreSystemDNS {
 if xTransport.internalResolverReady {
 for _, proto := range xTransport.resolveProtos {
@@ -997,7 +1006,7 @@ cachedIPs, expired, updating := xTransport.loadCachedIPs(host)
 if len(cachedIPs) > 0 {
 if expired && !updating {
 xTransport.markUpdatingCachedIP(host)
-go func(stale []net.IP) {
+go func(stale []netip.Addr) {
 _ = xTransport.resolveAndUpdateCacheBlocking(host, stale)
 }(cachedIPs)
 }
@@ -1010,7 +1019,7 @@ return nil, xTransport.resolveAndUpdateCacheBlocking(host, nil)
 return err
 }
 
-func (xTransport *XTransport) resolveAndUpdateCacheBlocking(host string, cachedIPs []net.IP) error {
+func (xTransport *XTransport) resolveAndUpdateCacheBlocking(host string, cachedIPs []netip.Addr) error {
 ips, ttl, err := xTransport.resolve(host, xTransport.useIPv4, xTransport.useIPv6)
 if ttl < MinResolverIPTTL {
 ttl = MinResolverIPTTL
