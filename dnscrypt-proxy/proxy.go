@@ -43,7 +43,6 @@ type Proxy struct {
     queryLogIgnoredQtypes         []string
     localDoHListeners             []*net.TCPListener
     queryMeta                     []string
-    enableHotReload               bool
     udpListeners                  []*net.UDPConn
     sources                       []*Source
     tcpListeners                  []*net.TCPListener
@@ -103,6 +102,10 @@ type Proxy struct {
     cacheMinTTL                   uint32
     cacheNegMaxTTL                uint32
     cloakTTL                      uint32
+    listenersMu                   sync.Mutex
+    ipCryptConfig                 *IPCryptConfig
+    udpConnPool                   *UDPConnPool
+    enableHotReload               bool
     cloakedPTR                    bool
     cache                         bool
     pluginBlockIPv6               bool
@@ -119,9 +122,6 @@ type Proxy struct {
     SourceDNSCrypt                bool
     SourceDoH                     bool
     SourceODoH                    bool
-    listenersMu                   sync.Mutex
-    ipCryptConfig                 *IPCryptConfig
-    udpConnPool                   *UDPConnPool
 }
 
 func (proxy *Proxy) registerUDPListener(conn *net.UDPConn) {
@@ -139,7 +139,7 @@ func (proxy *Proxy) registerLocalDoHListener(listener *net.TCPListener) {
 func (proxy *Proxy) addDNSListener(listenAddrStr string) {
     udp := "udp"
     tcp := "tcp"
-    isIPv4 := len(listenAddrStr) > 0 && isDigit(listenAddrStr[0])
+    isIPv4 := len(listenAddrStr) > 0 && (listenAddrStr[0] >= \'0\' && listenAddrStr[0] <= \'9\')
     if isIPv4 {
         udp = "udp4"
         tcp = "tcp4"
@@ -219,7 +219,7 @@ func (proxy *Proxy) addDNSListener(listenAddrStr string) {
 
 func (proxy *Proxy) addLocalDoHListener(listenAddrStr string) {
     network := "tcp"
-    isIPv4 := len(listenAddrStr) > 0 && isDigit(listenAddrStr[0])
+    isIPv4 := len(listenAddrStr) > 0 && (listenAddrStr[0] >= \'0\' && listenAddrStr[0] <= \'9\')
     if isIPv4 {
         network = "tcp4"
     }
@@ -509,8 +509,8 @@ func (proxy *Proxy) tcpListener(acceptPc *net.TCPListener) {
             if err := clientPc.SetDeadline(time.Now().Add(dynamicTimeout)); err != nil {
                 return
             }
-            start := time.Now()
             packet, err := ReadPrefixed(&clientPc)
+            start := time.Now()
             if err != nil {
                 return
             }
@@ -527,7 +527,7 @@ func (proxy *Proxy) udpListenerFromAddr(listenAddr *net.UDPAddr) error {
     }
     listenAddrStr := listenAddr.String()
     network := "udp"
-    isIPv4 := isDigit(listenAddrStr[0])
+    isIPv4 := (listenAddrStr[0] >= \'0\' && listenAddrStr[0] <= \'9\')
     if isIPv4 {
         network = "udp4"
     }
@@ -547,7 +547,7 @@ func (proxy *Proxy) tcpListenerFromAddr(listenAddr *net.TCPAddr) error {
     }
     listenAddrStr := listenAddr.String()
     network := "tcp"
-    isIPv4 := isDigit(listenAddrStr[0])
+    isIPv4 := (listenAddrStr[0] >= \'0\' && listenAddrStr[0] <= \'9\')
     if isIPv4 {
         network = "tcp4"
     }
@@ -567,7 +567,7 @@ func (proxy *Proxy) localDoHListenerFromAddr(listenAddr *net.TCPAddr) error {
     }
     listenAddrStr := listenAddr.String()
     network := "tcp"
-    isIPv4 := isDigit(listenAddrStr[0])
+    isIPv4 := (listenAddrStr[0] >= \'0\' && listenAddrStr[0] <= \'9\')
     if isIPv4 {
         network = "tcp4"
     }
@@ -611,9 +611,7 @@ func (proxy *Proxy) prepareForRelay(ip net.IP, port int, encryptedQuery *[]byte)
     }
 
     // Construct Header
-    copy(newQ[0:8], []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff})
-    newQ[8] = 0x00
-    newQ[9] = 0x00
+    copy(newQ[0:10], relayMagicHeader[:])
     copy(newQ[10:26], ip.To16())
     binary.BigEndian.PutUint16(newQ[26:28], uint16(port))
 
