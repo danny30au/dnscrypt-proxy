@@ -139,7 +139,7 @@ func (proxy *Proxy) registerLocalDoHListener(listener *net.TCPListener) {
 func (proxy *Proxy) addDNSListener(listenAddrStr string) {
     udp := "udp"
     tcp := "tcp"
-    isIPv4 := len(listenAddrStr) > 0 && (listenAddrStr[0] >= \'0\' && listenAddrStr[0] <= \'9\')
+    isIPv4 := len(listenAddrStr) > 0 && isDigit(listenAddrStr[0])
     if isIPv4 {
         udp = "udp4"
         tcp = "tcp4"
@@ -219,7 +219,7 @@ func (proxy *Proxy) addDNSListener(listenAddrStr string) {
 
 func (proxy *Proxy) addLocalDoHListener(listenAddrStr string) {
     network := "tcp"
-    isIPv4 := len(listenAddrStr) > 0 && (listenAddrStr[0] >= \'0\' && listenAddrStr[0] <= \'9\')
+    isIPv4 := len(listenAddrStr) > 0 && isDigit(listenAddrStr[0])
     if isIPv4 {
         network = "tcp4"
     }
@@ -527,7 +527,7 @@ func (proxy *Proxy) udpListenerFromAddr(listenAddr *net.UDPAddr) error {
     }
     listenAddrStr := listenAddr.String()
     network := "udp"
-    isIPv4 := (listenAddrStr[0] >= \'0\' && listenAddrStr[0] <= \'9\')
+    isIPv4 := isDigit(listenAddrStr[0])
     if isIPv4 {
         network = "udp4"
     }
@@ -547,7 +547,7 @@ func (proxy *Proxy) tcpListenerFromAddr(listenAddr *net.TCPAddr) error {
     }
     listenAddrStr := listenAddr.String()
     network := "tcp"
-    isIPv4 := (listenAddrStr[0] >= \'0\' && listenAddrStr[0] <= \'9\')
+    isIPv4 := isDigit(listenAddrStr[0])
     if isIPv4 {
         network = "tcp4"
     }
@@ -567,7 +567,7 @@ func (proxy *Proxy) localDoHListenerFromAddr(listenAddr *net.TCPAddr) error {
     }
     listenAddrStr := listenAddr.String()
     network := "tcp"
-    isIPv4 := (listenAddrStr[0] >= \'0\' && listenAddrStr[0] <= \'9\')
+    isIPv4 := isDigit(listenAddrStr[0])
     if isIPv4 {
         network = "tcp4"
     }
@@ -611,7 +611,9 @@ func (proxy *Proxy) prepareForRelay(ip net.IP, port int, encryptedQuery *[]byte)
     }
 
     // Construct Header
-    copy(newQ[0:10], relayMagicHeader[:])
+    copy(newQ[0:8], []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff})
+    newQ[8] = 0x00
+    newQ[9] = 0x00
     copy(newQ[10:26], ip.To16())
     binary.BigEndian.PutUint16(newQ[26:28], uint16(port))
 
