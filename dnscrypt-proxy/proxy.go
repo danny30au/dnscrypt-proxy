@@ -7,6 +7,7 @@ import (
     "net"
     "os"
     "runtime"
+    "slices"
     "strings"
     "sync"
     "sync/atomic"
@@ -363,14 +364,14 @@ func (proxy *Proxy) updateRegisteredServers() error {
             if registeredServer.stamp.Proto != stamps.StampProtoTypeDNSCryptRelay &&
                 registeredServer.stamp.Proto != stamps.StampProtoTypeODoHRelay {
                 if len(proxy.ServerNames) > 0 {
-                    if !includesName(proxy.ServerNames, registeredServer.name) {
+                    if !slices.Contains(proxy.ServerNames, registeredServer.name) {
                         continue
                     }
                 } else if registeredServer.stamp.Props&proxy.requiredProps != proxy.requiredProps {
                     continue
                 }
             }
-            if includesName(proxy.DisabledServerNames, registeredServer.name) {
+            if slices.Contains(proxy.DisabledServerNames, registeredServer.name) {
                 continue
             }
             if proxy.SourceIPv4 || proxy.SourceIPv6 {
