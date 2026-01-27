@@ -96,7 +96,7 @@ type Proxy struct {
     cacheNegMinTTL                uint32
     rejectTTL                     uint32
     cacheMaxTTL                   uint32
-    clientsCount                  uint32
+    clientsCount atomic.Uint32
     maxClients                    uint32
     timeoutLoadReduction          float64
     cacheMinTTL                   uint32
@@ -764,11 +764,11 @@ func (proxy *Proxy) exchangeWithTCPServer(
 }
 
 func (proxy *Proxy) clientsCountInc() bool {
-    newCount := atomic.AddUint32(&proxy.clientsCount, 1)
+    newCount := proxy.clientsCount.Add(1)
 
     if newCount > proxy.maxClients {
         // Rollback - we exceeded limit
-        atomic.AddUint32(&proxy.clientsCount, ^uint32(0))
+        proxy.clientsCount.Add(^uint32(0))
         return false
     }
 
@@ -780,7 +780,7 @@ func (proxy *Proxy) clientsCountDec() {
     if proxy.clientsCount == 0 {
         return
     }
-    count := atomic.AddUint32(&proxy.clientsCount, ^uint32(0))
+    count := proxy.clientsCount.Add(^uint32(0))
     dlog.Debugf("clients count: %d", count)
 }
 
@@ -789,7 +789,7 @@ func (proxy *Proxy) getDynamicTimeout() time.Duration {
         return proxy.timeout
     }
 
-    currentClients := atomic.LoadUint32(&proxy.clientsCount)
+    currentClients := proxy.clientsCount.Load()
     utilization := float64(currentClients) / float64(proxy.maxClients)
 
     // Use quartic (power 4) curve for slow decrease at low load, sharp decrease near limit
