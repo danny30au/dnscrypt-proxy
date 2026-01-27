@@ -96,7 +96,7 @@ type Proxy struct {
     cacheNegMinTTL                uint32
     rejectTTL                     uint32
     cacheMaxTTL                   uint32
-    clientsCount atomic.Uint32
+    clientsCount                  atomic.Uint32
     maxClients                    uint32
     timeoutLoadReduction          float64
     cacheMinTTL                   uint32
@@ -777,7 +777,7 @@ func (proxy *Proxy) clientsCountInc() bool {
 }
 
 func (proxy *Proxy) clientsCountDec() {
-    if proxy.clientsCount == 0 {
+    if proxy.clientsCount.Load() == 0 {
         return
     }
     count := proxy.clientsCount.Add(^uint32(0))
