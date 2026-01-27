@@ -42,15 +42,6 @@ clientProto string
 serverProto string
 }
 
-// Inflight query for coalescing
-type inflightQuery struct {
-mu       sync.Mutex
-response []byte
-err      error
-done     chan struct{}
-waiting  int32
-}
-
 // Stats update for batching
 type statsUpdate struct {
 serverName string
@@ -136,7 +127,6 @@ ipCryptConfig *IPCryptConfig
 udpConnPool *UDPConnPool
 workerPool chan *queryJob
 numWorkers int
-inflightQueries sync.Map
 statsBatchChan chan statsUpdate
 enableHotReload bool
 cloakedPTR bool
@@ -345,8 +335,11 @@ batch[update.serverName] = stats
 
 case <-ticker.C:
 for name, stats := range batch {
-if stats.success > 0 || stats.failures > 0 {
-proxy.serversInfo.updateServerStatsBatch(name, stats.success, stats.failures)
+for i := 0; i < stats.success; i++ {
+proxy.serversInfo.updateServerStats(name, true)
+}
+for i := 0; i < stats.failures; i++ {
+proxy.serversInfo.updateServerStats(name, false)
 }
 }
 for k := range batch {
@@ -742,13 +735,6 @@ copy(newQ[10:26], ip.To16())
 
 binary.BigEndian.PutUint16(newQ[26:28], uint16(port))
 *encryptedQuery = newQ
-}
-
-func (proxy *Proxy) makeQueryKey(query []byte) string {
-if len(query) < 32 {
-return string(query)
-}
-return string(query[:32])
 }
 
 func (proxy *Proxy) exchangeWithUDPServer(
