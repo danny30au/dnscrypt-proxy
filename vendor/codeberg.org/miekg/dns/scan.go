@@ -149,8 +149,8 @@ func readRR(r io.Reader, file string) (RR, error) {
 
 // ZoneParser is a parser for an RFC 1035 style zone file.
 //
-// Each parsed RR in the zone is returned sequentially from Next. An
-// optional comment can be retrieved with Comment.
+// Each parsed RR in the zone is returned sequentially from [ZoneParser.Next]. An
+// optional comment can be retrieved with Comment. Also see [ZoneParser.RRs] which is an iterator.
 //
 // The directives $INCLUDE, $ORIGIN, $TTL and $GENERATE are all
 // supported. Although $INCLUDE is disabled by default.
