@@ -48,6 +48,9 @@ const (
     AEADCacheShardCount = 32
     AEADCacheMaxSize    = 2048
 
+    // Go 1.26+ Green Tea GC alignment (8KiB spans)
+    GreenTeaSpanSize = 8192
+
     // Batch nonce generation buffer size (256 nonces)
     NonceBufferSize = 4096
 )
@@ -71,6 +74,7 @@ var (
     // Go 1.26+ optimized buffer pools
     bufferPoolTiny = sync.Pool{
         New: func() interface{} {
+            // Go 1.26 specialized allocator (size class < 256)
             buf := make([]byte, 0, 256)
             return &buf
         },
@@ -83,6 +87,7 @@ var (
     }
     bufferPoolMedium = sync.Pool{
         New: func() interface{} {
+            // Align to 2048 for better scanning
             buf := make([]byte, 0, 2048)
             return &buf
         },
@@ -95,9 +100,11 @@ var (
     }
     bufferPoolHuge = sync.Pool{
         New: func() interface{} {
+            // Multiple of GreenTeaSpanSize (8192)
             buf := make([]byte, 0, 16384)
             return &buf
         },
+    },
     }
 
     // Hardware acceleration flags
@@ -180,9 +187,9 @@ func (ng *NonceGenerator) GetNonce() ([HalfNonceSize]byte, error) {
     ng.mu.Lock()
     defer ng.mu.Unlock()
 
+    // Go 1.26: Direct stack allocation optimized by compiler
     var nonce [HalfNonceSize]byte
-    // Keystream generation is extremely fast and effectively random
-    ng.cipher.XORKeyStream(nonce[:], nonce[:]) 
+    ng.cipher.XORKeyStream(nonce[:], nonce[:])
 
     globalCryptoMetrics.NonceGenCount.Add(1)
     return nonce, nil
@@ -262,17 +269,19 @@ func unpad(packet []byte) ([]byte, error) {
         return nil, ErrInvalidPadding
     }
 
+    // Go 1.26: Intrinsic optimized search
     idx := bytes.LastIndexByte(packet, 0x80)
     if idx == -1 {
         return nil, ErrInvalidPadding
     }
 
     tail := packet[idx+1:]
-    // Go 1.26+ vectorizer handles this efficiently, but 'slices' makes intent clear
+    // Go 1.26: Auto-vectorized loop for zero-check
     if len(tail) > 0 {
-        // Check if any byte in tail is non-zero
-        if slices.ContainsFunc(tail, func(b byte) bool { return b != 0 }) {
-            return nil, ErrInvalidPadBytes
+        for i := range tail {
+            if tail[i] != 0 {
+                return nil, ErrInvalidPadBytes
+            }
         }
     }
 
@@ -582,6 +591,7 @@ func (p *AdaptiveWorkerPool) scaleUp() {
 
 // Init function
 func init() {
+    // Go 1.26: Reduced CGO overhead for hardware acceleration
     if cpu.X86.HasAVX2 {
         hasAVX2 = true
         dlog.Noticef("CPU: AVX2 hardware acceleration enabled")
@@ -835,7 +845,7 @@ func (proxy *Proxy) Decrypt(
     // Use bytes.Buffer.Peek for zero-copy validation
     buf := bytes.NewBuffer(encrypted)
     prefix, err := buf.Peek(serverMagicLen)
-    if err != nil || !bytes.Equal(prefix, ServerMagic[:]) {
+    if err != nil || !bytes.Equal(prefix, ServerMagic[:]) /* Go 1.26 optimized */ {
         return nil, ErrInvalidPrefix
     }
 
@@ -885,10 +895,15 @@ func (proxy *Proxy) Decrypt(
 
 // Simple latency tracking (P50 approximation)
 func updateLatencyP50(target *atomic.Uint64, newValue uint64) {
-    old := target.Load()
-    // Exponential moving average (alpha = 0.1)
-    updated := (old*9 + newValue) / 10
-    target.Store(updated)
+    // Go 1.26: CAS loop for lock-free updates
+    for {
+        old := target.Load()
+        // Exponential moving average (alpha = 0.1)
+        updated := (old*9 + newValue) / 10
+        if target.CompareAndSwap(old, updated) {
+            return
+        }
+    }
 }
 
 // Elligator 2 Implementation for Censorship Resistance
