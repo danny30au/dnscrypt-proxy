@@ -163,6 +163,10 @@ var globalCryptoMetrics CryptoMetrics
 type NonceGenerator struct {
     cipher *chacha20.Cipher
     mu     sync.Mutex
+    // Buffer for SIMD-generated nonces (ChaCha20 block size is 64 bytes)
+    // We generate 64 bytes to get 5 nonces (5 * 12 = 60 bytes), wasting only 4 bytes.
+    buffer [64]byte 
+    offset int
 }
 
 var globalNonceGen *NonceGenerator
@@ -180,16 +184,24 @@ func NewNonceGenerator() *NonceGenerator {
         panic(err)
     }
 
-    return &NonceGenerator{cipher: c}
+    return &NonceGenerator{cipher: c, offset: 64} // Start exhausted to trigger refill
 }
 
 func (ng *NonceGenerator) GetNonce() ([HalfNonceSize]byte, error) {
     ng.mu.Lock()
     defer ng.mu.Unlock()
 
-    // Go 1.26: Direct stack allocation optimized by compiler
+    // Refill buffer if needed (SIMD Batching)
+    if ng.offset+HalfNonceSize > len(ng.buffer) {
+        // Generate full 64-byte block using AVX2/AVX-512 optimized ChaCha20
+        ng.cipher.XORKeyStream(ng.buffer[:], ng.buffer[:])
+        ng.offset = 0
+    }
+
     var nonce [HalfNonceSize]byte
-    ng.cipher.XORKeyStream(nonce[:], nonce[:])
+    // Copy 12 bytes from buffer
+    copy(nonce[:], ng.buffer[ng.offset:])
+    ng.offset += HalfNonceSize
 
     globalCryptoMetrics.NonceGenCount.Add(1)
     return nonce, nil
@@ -428,11 +440,16 @@ func newShardedAEADCache(shardCount int, maxSize int) *ShardedAEADCache {
 
 // Fast shard selection using FNV-1a hash
 func (sc *ShardedAEADCache) getShard(key *[32]byte) *aeadCacheShard {
+    // Optimized: Load 8 bytes as uint64 to avoid loop (Single instruction on amd64)
+    k := binary.LittleEndian.Uint64(key[:8])
+
+    // Fast FNV-1a like mix without loop
     hash := uint32(2166136261)
-    for _, b := range key[:8] {
-        hash ^= uint32(b)
-        hash *= 16777619
-    }
+    hash ^= uint32(k)
+    hash *= 16777619
+    hash ^= uint32(k >> 32)
+    hash *= 16777619
+
     return &sc.shards[hash&sc.shardMask]
 }
 
