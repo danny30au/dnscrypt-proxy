@@ -104,7 +104,6 @@ var (
             buf := make([]byte, 0, 16384)
             return &buf
         },
-    },
     }
 
     // Hardware acceleration flags
