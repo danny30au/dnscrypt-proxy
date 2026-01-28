@@ -1,7 +1,6 @@
 package main
 
 import (
-
 "bytes"
 "compress/gzip"
 "context"
@@ -15,7 +14,7 @@ import (
 "math/rand/v2"
 "net"
 "net/http"
-"net/netip" // Elite: netip
+"net/netip"
 "net/url"
 "os"
 "slices"
@@ -23,11 +22,10 @@ import (
 "strings"
 "sync"
 "sync/atomic"
-"syscall" // God Mode: syscall
+"syscall"
 "time"
-"unique" // Elite: unique
-"unsafe" // God Mode: unsafe
-
+"unique"
+"unsafe"
 "codeberg.org/miekg/dns"
 "github.com/jedisct1/dlog"
 stamps "github.com/jedisct1/go-dnsstamps"
@@ -37,7 +35,6 @@ stamps "github.com/jedisct1/go-dnsstamps"
 netproxy "golang.org/x/net/proxy"
 "golang.org/x/sync/singleflight"
 "golang.org/x/sys/cpu"
-
 )
 
 var (
@@ -69,21 +66,17 @@ resolverRetryInitialBackoff * 2,
 resolverRetryMaxBackoff,
 }
 
-
 var bgCtx = context.Background()
 
-// God Mode: Zero-copy string casting
-func strToBytes(s string) []byte {
-return unsafe.Slice(unsafe.StringData(s), len(s))
-}
-func bytesToStr(b []byte) string {
-return unsafe.String(unsafe.SliceData(b), len(b))
-}
+// God Mode: Zero-copy casting
+func strToBytes(s string) []byte { return unsafe.Slice(unsafe.StringData(s), len(s)) }
+func bytesToStr(b []byte) string { return unsafe.String(unsafe.SliceData(b), len(b)) }
 
-// God Mode: Cache line padding
-type pad [56]byte
-
+// God Mode: Generic pointer helper for Go 1.26+ compatible 1-line allocations
 func ptr[T any](v T) *T { return &v }
+
+// God Mode: 64-byte cache line padding
+type pad [56]byte
 
 
 type CachedIPItem struct {
@@ -229,7 +222,7 @@ return xTransport
 func ParseIP(ipStr string) netip.Addr {
 s := strings.TrimPrefix(ipStr, "[")
 s = strings.TrimSuffix(s, "]")
-return net.ParseIP(s)
+return netip.ParseAddr(s)
 }
 
 // uniqueNormalizedIPs deduplicates IPs using optimized stack allocation for common cases
@@ -292,6 +285,7 @@ return ""
 return net.JoinHostPort(ip.String(), strconv.Itoa(port))
 }
 
+
 func (xTransport *XTransport) saveCachedIPs(host string, ips []netip.Addr, ttl time.Duration) {
 normalized := uniqueNormalizedIPs(ips)
 if len(normalized) == 0 {
@@ -304,7 +298,7 @@ if ttl >= 0 {
 if ttl < MinResolverIPTTL {
 ttl = MinResolverIPTTL
 }
-// Use math/rand/v2 for better performance
+// math/rand/v2 for elite entropy
 ttl += time.Duration(rand.Int64N(int64(ResolverIPTTLMaxJitter)))
 item.expiration = ptr(now.Add(ttl))
 }
@@ -315,26 +309,25 @@ xTransport.cachedIPs.cache.Store(unique.Make(host), item)
 if len(normalized) == 1 {
 dlog.Debugf("[%s] cached IP [%s], valid for %v", host, normalized[0], ttl)
 } else {
-dlog.Debugf("[%s] cached %d IP addresses (first: %s), valid for %v", host, len(normalized), normalized[0], ttl)
+dlog.Debugf("[%s] cached %d IPs (first: %s), valid for %v", host, len(normalized), normalized[0], ttl)
 }
 }
 
 func (xTransport *XTransport) saveCachedIP(host string, ip netip.Addr, ttl time.Duration) {
-if ip == nil {
+if !ip.IsValid() {
 return
 }
 xTransport.saveCachedIPs(host, []netip.Addr{ip}, ttl)
 }
 
 func (xTransport *XTransport) markUpdatingCachedIP(host string) {
-val, ok := xTransport.cachedIPs.cache.Load(unique.Make(host)
+val, ok := xTransport.cachedIPs.cache.Load(unique.Make(unique.Make(host)
 if !ok {
 return
 }
 
 item := val.(*CachedIPItem)
 now := time.Now()
-// Optimized allocation
 updatingUntil: ptr(now.Add(xTransport.timeout)),
 }
 xTransport.cachedIPs.cache.Store(unique.Make(host), newItem)
@@ -342,9 +335,9 @@ dlog.Debugf("[%s] IP address marked as updating", host)
 }
 
 func (xTransport *XTransport) loadCachedIPs(host string) (ips []netip.Addr, expired bool, updating bool) {
-val, ok := xTransport.cachedIPs.cache.Load(unique.Make(host)
+val, ok := xTransport.cachedIPs.cache.Load(unique.Make(unique.Make(host)
 if !ok {
-xTransport.cachedIPs.misses.Add(1))
+xTransport.cachedIPs.misses.Add(1)))
 dlog.Debugf("[%s] IP address not found in the cache", host)
 return nil, false, false
 }
@@ -495,13 +488,6 @@ dialer := &net.Dialer{
 Timeout:   timeout,
 KeepAlive: 15 * time.Second,
 DualStack: true,
-Control: func(network, address string, c syscall.RawConn) error {
-return c.Control(func(fd uintptr) {
-// God Mode: TCP Fast Open + ReusePort
-syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, 0x0F, 1) // SO_REUSEPORT
-syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, 30, 1)  // TCP_FASTOPEN_CONNECT
-})
-},
 }
 return dialer.DialContext(ctx, network, address)
 }
