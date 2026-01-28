@@ -72,9 +72,8 @@ expiration    *time.Time
 updatingUntil *time.Time
 }
 
-// CachedIPs uses sync.Map for better concurrent read performance with generation-based cleanup
 type CachedIPs struct {
-cache      sync.Map // map[string]*CachedIPItem
+cache      sync.Map
 hits       atomic.Uint64
 misses     atomic.Uint64
 generation atomic.Uint64
@@ -86,9 +85,8 @@ nextProbe time.Time
 valid     bool
 }
 
-// AltSupport uses sync.Map for better concurrent read performance
 type AltSupport struct {
-cache sync.Map // map[string]AltSupportItem
+cache sync.Map
 }
 
 type dnsMessagePool struct {
@@ -121,7 +119,6 @@ p.pool.Put(msg)
 }
 }
 
-// Batch allocation for high-performance scenarios
 func (p *dnsMessagePool) GetBatch(n int) []*dns.Msg {
 msgs := make([]*dns.Msg, n)
 for i := 0; i < n; i++ {
@@ -130,7 +127,6 @@ msgs[i] = p.Get()
 return msgs
 }
 
-// String builder pool for efficient string concatenation
 type stringBuilderPool struct {
 pool sync.Pool
 }
@@ -155,9 +151,8 @@ func (p *stringBuilderPool) Put(sb *strings.Builder) {
 p.pool.Put(sb)
 }
 
-// QUIC connection cache for connection reuse
 type quicConnCache struct {
-conns sync.Map // map[string]*quic.Conn
+conns sync.Map
 }
 
 type XTransport struct {
@@ -222,7 +217,6 @@ dnsMessagePool:           newDNSMessagePool(),
 stringBuilderPool:        newStringBuilderPool(),
 }
 
-// Initialize object pools
 xTransport.gzipPool.New = func() any {
 return new(gzip.Reader)
 }
@@ -235,27 +229,24 @@ return &dns.Client{Transport: transport}
 
 xTransport.bufferPool.New = func() any {
 buf := new(bytes.Buffer)
-buf.Grow(4096) // Pre-allocate common size
+buf.Grow(4096)
 return buf
 }
 
 return xTransport
 }
 
-// ParseIP parses an IP address, handling bracketed IPv6 addresses
 func ParseIP(ipStr string) net.IP {
 s := strings.TrimPrefix(ipStr, "[")
 s = strings.TrimSuffix(s, "]")
 return net.ParseIP(s)
 }
 
-// uniqueNormalizedIPs deduplicates IPs using optimized stack allocation for common cases
 func uniqueNormalizedIPs(ips []net.IP) []net.IP {
 if len(ips) == 0 {
 return nil
 }
 
-// Use stack-allocated array for common case (up to 4 IPs)
 if len(ips) <= 4 {
 var seenStack [4][16]byte
 seen := seenStack[:0:4]
@@ -283,7 +274,6 @@ unique = append(unique, append(net.IP(nil), ip...))
 return unique
 }
 
-// Heap path for many IPs
 seen := make(map[[16]byte]struct{}, len(ips))
 unique := make([]net.IP, 0, len(ips))
 
@@ -301,7 +291,6 @@ unique = append(unique, append(net.IP(nil), ip...))
 return unique
 }
 
-// formatEndpoint uses net.JoinHostPort for standard formatting
 func formatEndpoint(ip net.IP, port int) string {
 if ip == nil {
 return ""
@@ -321,7 +310,6 @@ if ttl >= 0 {
 if ttl < MinResolverIPTTL {
 ttl = MinResolverIPTTL
 }
-// Use math/rand/v2 for better performance
 ttl += time.Duration(rand.Int64N(int64(ResolverIPTTLMaxJitter)))
 expiration := now.Add(ttl)
 item.expiration = &expiration
@@ -354,7 +342,6 @@ item := val.(*CachedIPItem)
 now := time.Now()
 until := now.Add(xTransport.timeout)
 
-// Create new item to avoid race conditions
 newItem := &CachedIPItem{
 ips:           item.ips,
 expiration:    item.expiration,
@@ -364,7 +351,6 @@ xTransport.cachedIPs.cache.Store(host, newItem)
 dlog.Debugf("[%s] IP address marked as updating", host)
 }
 
-// Predictive prefetching with adaptive window
 func (xTransport *XTransport) loadCachedIPs(host string) (ips []net.IP, expired bool, updating bool) {
 val, ok := xTransport.cachedIPs.cache.Load(host)
 if !ok {
@@ -379,7 +365,6 @@ ips = item.ips
 expiration := item.expiration
 updatingUntil := item.updatingUntil
 
-// Predictive prefetch before actual expiration
 if expiration != nil {
 timeUntilExpiry := time.Until(*expiration)
 if timeUntilExpiry < prefetchWindow && timeUntilExpiry > 0 {
@@ -401,7 +386,6 @@ dlog.Debugf("[%s] cached IP addresses expired, not being updated yet", host)
 return ips, expired, updating
 }
 
-// Periodic cache cleanup without holding locks
 func (xTransport *XTransport) cleanupExpiredCache() {
 gen := xTransport.cachedIPs.generation.Add(1)
 dlog.Debugf("Cache cleanup cycle %d started", gen)
@@ -428,9 +412,8 @@ _ = gr.Close()
 xTransport.gzipPool.Put(gr)
 }
 
-// Lock-free QUIC transport with atomic pointers
 func (xTransport *XTransport) getQUICTransport(network string) (*quic.Transport, error) {
-const sockBuf = 8 << 20 // 8MB for better performance
+const sockBuf = 8 << 20
 
 switch network {
 case "udp4":
@@ -451,7 +434,6 @@ xTransport.quicUDP4.Store(c)
 return tr, nil
 }
 
-// Another goroutine created transport, close ours and use theirs
 _ = c.Close()
 return xTransport.quicTr4.Load(), nil
 
@@ -473,7 +455,6 @@ xTransport.quicUDP6.Store(c)
 return tr, nil
 }
 
-// Another goroutine created transport, close ours and use theirs
 _ = c.Close()
 return xTransport.quicTr6.Load(), nil
 
@@ -482,7 +463,6 @@ return nil, fmt.Errorf("unsupported quic network: %s", network)
 }
 }
 
-// Adaptive timeout based on RTT
 func (xTransport *XTransport) adaptiveTimeout(rtt time.Duration) time.Duration {
 adaptiveTO := rtt * 3
 if adaptiveTO < xTransport.timeout {
@@ -505,7 +485,6 @@ xTransport.h3Transport.Close()
 xTransport.h3Transport = nil
 }
 
-// Clean up QUIC transports using atomic pointers
 if tr4 := xTransport.quicTr4.Load(); tr4 != nil {
 _ = tr4.Close()
 xTransport.quicTr4.Store(nil)
@@ -534,8 +513,8 @@ transport := &http.Transport{
 DisableKeepAlives:      false,
 DisableCompression:     true,
 MaxIdleConns:           5000,
-MaxIdleConnsPerHost:    200, // Increased from 100
-MaxConnsPerHost:        200, // Increased from 100
+MaxIdleConnsPerHost:    200,
+MaxConnsPerHost:        200,
 IdleConnTimeout:        90 * time.Second,
 ExpectContinueTimeout:  0,
 ForceAttemptHTTP2:      true,
@@ -569,7 +548,6 @@ DualStack: true,
 }
 conn, err := dialer.DialContext(ctx, network, address)
 if err == nil {
-// TCP socket tuning for lower latency
 if tcpConn, ok := conn.(*net.TCPConn); ok {
 _ = tcpConn.SetNoDelay(true)
 _ = tcpConn.SetKeepAlive(true)
@@ -592,7 +570,6 @@ dialCtx, cancelDial := context.WithCancel(ctx)
 defer cancelDial()
 defer close(done)
 
-// Happy Eyeballs algorithm for parallel connection attempts
 for i, target := range targets {
 go func(i int, target string) {
 if i > 0 {
@@ -909,7 +886,6 @@ if len(queryTypes) == 0 {
 return nil, 0, errors.New("no query types requested")
 }
 
-// Optimized channel capacity
 results := make(chan queryResult, 2)
 ctx, cancel := context.WithTimeout(bgCtx, ResolverReadTimeout)
 defer cancel()
@@ -962,7 +938,6 @@ case <-ctx.Done():
 }(qType)
 }
 
-// Pre-grow slice with expected capacity
 collectedIPs := make([]net.IP, 0, len(queryTypes)*2)
 collectedIPs = slices.Grow(collectedIPs, len(queryTypes)*2)
 var minTTL time.Duration
@@ -1014,7 +989,6 @@ for i, resolver := range resolvers {
 for attempt := 0; attempt < resolverRetryCount; attempt++ {
 ips, ttl, err = xTransport.resolveUsingResolver(proto, host, resolver, returnIPv4, returnIPv6)
 if err == nil && len(ips) > 0 {
-// Move successful resolver to front for next time
 if i > 0 {
 dlog.Infof("Resolution succeeded with resolver %s[%s]", proto, resolver)
 resolvers[0], resolvers[i] = resolvers[i], resolvers[0]
@@ -1166,7 +1140,6 @@ if client == nil {
 client = &http.Client{Transport: xTransport.transport}
 }
 
-// Check HTTP/3 support
 if xTransport.h3Transport != nil {
 if xTransport.http3Probe {
 if xTransport.h3Client != nil {
@@ -1247,7 +1220,6 @@ start := time.Now()
 resp, err := client.Do(req)
 rtt := time.Since(start)
 
-// Handle HTTP/3 fallback
 if err != nil && xTransport.h3Client != nil && client == xTransport.h3Client {
 if xTransport.http3Probe {
 dlog.Debugf("HTTP/3 probe failed for [%s]: [%s] - falling back to HTTP/2", url.Host, err)
@@ -1295,7 +1267,6 @@ dlog.Debugf("[%s]: [%s]", req.URL, err)
 return nil, statusCode, nil, rtt, err
 }
 
-// Parse Alt-Svc header for HTTP/3 discovery
 if xTransport.h3Transport != nil && !hasAltSupport {
 skipAltSvcParsing := false
 
@@ -1324,7 +1295,7 @@ break
 }
 
 v = strings.TrimSpace(v)
-if strings.HasPrefix(v, `h3=":`{
+if strings.HasPrefix(v, `h3=":`) {
 v = strings.TrimPrefix(v, `h3=":`)
 v = strings.TrimSuffix(v, `"`)
 if xAltPort, err := strconv.ParseUint(v, 10, 16); err == nil && xAltPort <= 65535 {
@@ -1356,7 +1327,6 @@ defer xTransport.putGzipReader(gr)
 bodyReader = gr
 }
 
-// Optimized read using buffer pool
 buf := xTransport.bufferPool.Get().(*bytes.Buffer)
 buf.Reset()
 defer xTransport.bufferPool.Put(buf)
