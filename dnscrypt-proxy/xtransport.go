@@ -12,11 +12,10 @@ import (
 "fmt"
 "hash/fnv"
 "io"
-"iter"
 "math/rand/v2"
 "net"
 "net/http"
-"net/netip"
+"net/netip" // Elite: netip
 "net/url"
 "os"
 "slices"
@@ -24,10 +23,20 @@ import (
 "strings"
 "sync"
 "sync/atomic"
-"syscall"
+"syscall" // God Mode: syscall
 "time"
-"unique"
-"unsafe"
+"unique" // Elite: unique
+"unsafe" // God Mode: unsafe
+
+"codeberg.org/miekg/dns"
+"github.com/jedisct1/dlog"
+stamps "github.com/jedisct1/go-dnsstamps"
+"github.com/quic-go/quic-go"
+"github.com/quic-go/quic-go/http3"
+"golang.org/x/net/http2"
+netproxy "golang.org/x/net/proxy"
+"golang.org/x/sync/singleflight"
+"golang.org/x/sys/cpu"
 
 )
 
@@ -60,6 +69,7 @@ resolverRetryInitialBackoff * 2,
 resolverRetryMaxBackoff,
 }
 
+
 var bgCtx = context.Background()
 
 // God Mode: Zero-copy string casting
@@ -70,8 +80,10 @@ func bytesToStr(b []byte) string {
 return unsafe.String(unsafe.SliceData(b), len(b))
 }
 
-// God Mode: Cache line padding to prevent false sharing (64-byte cache lines)
+// God Mode: Cache line padding
 type pad [56]byte
+
+func ptr[T any](v T) *T { return &v }
 
 
 type CachedIPItem struct {
@@ -84,7 +96,7 @@ updatingUntil *time.Time
 
 type CachedIPs struct {
 cache  sync.Map // map[unique.Handle]*CachedIPItem
-_      pad      // Prevent false sharing
+_      pad
 hits   atomic.Uint64
 _      pad
 misses atomic.Uint64
@@ -217,27 +229,42 @@ return xTransport
 func ParseIP(ipStr string) netip.Addr {
 s := strings.TrimPrefix(ipStr, "[")
 s = strings.TrimSuffix(s, "]")
-return netip.ParseAddr(s)
+return net.ParseIP(s)
 }
 
 // uniqueNormalizedIPs deduplicates IPs using optimized stack allocation for common cases
-
 func uniqueNormalizedIPs(ips []netip.Addr) []netip.Addr {
-if len(ips) <= 1 { return ips }
+if len(ips) == 0 {
+return nil
+}
 
-// God Mode: Stack allocation for small sets skipped, explicit Swiss Map usage
-seen := make(map[netip.Addr]struct{}, len(ips))
+// Use stack-allocated array for common case (up to 4 IPs)
+if len(ips) <= 4 {
+var seenStack [4][16]byte
+seen := seenStack[:0:4]
 unique := make([]netip.Addr, 0, len(ips))
+
 for _, ip := range ips {
-if !ip.IsValid() { continue }
-if _, exists := seen[ip]; !exists {
-seen[ip] = struct{}{}
-unique = append(unique, ip)
+if ip == nil {
+continue
+}
+var key [16]byte
+copy(key[:], ip.To16())
+
+found := false
+for i := range seen {
+if seen[i] == key {
+found = true
+break
+}
+}
+if !found {
+seen = append(seen, key)
+unique = append(unique, append(netip.Addr(nil), ip...))
 }
 }
 return unique
 }
-
 
 // Heap path for many IPs
 seen := make(map[[16]byte]struct{}, len(ips))
@@ -279,7 +306,7 @@ ttl = MinResolverIPTTL
 }
 // Use math/rand/v2 for better performance
 ttl += time.Duration(rand.Int64N(int64(ResolverIPTTLMaxJitter)))
-item.expiration = new(time.Now().Add(ttl))
+item.expiration = ptr(now.Add(ttl))
 }
 
 item.updatingUntil = nil
@@ -307,13 +334,8 @@ return
 
 item := val.(*CachedIPItem)
 now := time.Now()
-until := now.Add(xTransport.timeout))
-
-// Create new item to avoid race conditions
-newItem := &CachedIPItem{
-ips:           item.ips,
-expiration:    item.expiration,
-updatingUntil: &until,
+// Optimized allocation
+updatingUntil: ptr(now.Add(xTransport.timeout)),
 }
 xTransport.cachedIPs.cache.Store(unique.Make(host), newItem)
 dlog.Debugf("[%s] IP address marked as updating", host)
@@ -469,21 +491,18 @@ targets = append(targets, net.JoinHostPort(host, strconv.Itoa(port)))
 
 dial := func(address string) (net.Conn, error) {
 if xTransport.proxyDialer == nil {
-
 dialer := &net.Dialer{
 Timeout:   timeout,
 KeepAlive: 15 * time.Second,
 DualStack: true,
 Control: func(network, address string, c syscall.RawConn) error {
 return c.Control(func(fd uintptr) {
-// God Mode: Low level socket optimization
-syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+// God Mode: TCP Fast Open + ReusePort
 syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, 0x0F, 1) // SO_REUSEPORT
 syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, 30, 1)  // TCP_FASTOPEN_CONNECT
 })
 },
 }
-
 return dialer.DialContext(ctx, network, address)
 }
 return (*xTransport.proxyDialer).Dial(network, address)
@@ -825,8 +844,7 @@ dnsClient := xTransport.dnsClientPool.Get().(*dns.Client)
 defer xTransport.dnsClientPool.Put(dnsClient)
 
 for _, qType := range queryTypes {
-wg.Go(func() {
-qt := qType
+go func(qt uint16) {
 // Use dns.NewMsg() - creates message with question already set
 msg := dns.NewMsg(fqdn(host), qt)
 if msg == nil {
