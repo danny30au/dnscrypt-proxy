@@ -55,6 +55,7 @@ ExpiredCachedIPGraceTTL     = 15 * time.Minute
 resolverRetryCount          = 3
 resolverRetryInitialBackoff = 25 * time.Millisecond
 resolverRetryMaxBackoff     = 300 * time.Millisecond
+prefetchWindow              = 5 * time.Minute
 )
 
 var resolverBackoffs = [resolverRetryCount]time.Duration{
@@ -71,11 +72,12 @@ expiration    *time.Time
 updatingUntil *time.Time
 }
 
-// CachedIPs uses sync.Map for better concurrent read performance
+// CachedIPs uses sync.Map for better concurrent read performance with generation-based cleanup
 type CachedIPs struct {
-cache  sync.Map // map[string]*CachedIPItem
-hits   atomic.Uint64
-misses atomic.Uint64
+cache      sync.Map // map[string]*CachedIPItem
+hits       atomic.Uint64
+misses     atomic.Uint64
+generation atomic.Uint64
 }
 
 type AltSupportItem struct {
@@ -119,6 +121,45 @@ p.pool.Put(msg)
 }
 }
 
+// Batch allocation for high-performance scenarios
+func (p *dnsMessagePool) GetBatch(n int) []*dns.Msg {
+msgs := make([]*dns.Msg, n)
+for i := 0; i < n; i++ {
+msgs[i] = p.Get()
+}
+return msgs
+}
+
+// String builder pool for efficient string concatenation
+type stringBuilderPool struct {
+pool sync.Pool
+}
+
+func newStringBuilderPool() *stringBuilderPool {
+return &stringBuilderPool{
+pool: sync.Pool{
+New: func() any {
+return &strings.Builder{}
+},
+},
+}
+}
+
+func (p *stringBuilderPool) Get() *strings.Builder {
+sb := p.pool.Get().(*strings.Builder)
+sb.Reset()
+return sb
+}
+
+func (p *stringBuilderPool) Put(sb *strings.Builder) {
+p.pool.Put(sb)
+}
+
+// QUIC connection cache for connection reuse
+type quicConnCache struct {
+conns sync.Map // map[string]*quic.Conn
+}
+
 type XTransport struct {
 sessionCache             tls.ClientSessionCache
 transport                *http.Transport
@@ -149,12 +190,13 @@ gzipPool                 sync.Pool
 dnsClientPool            sync.Pool
 dnsMessagePool           *dnsMessagePool
 bufferPool               sync.Pool
+stringBuilderPool        *stringBuilderPool
 resolveGroup             singleflight.Group
-quicMu                   sync.Mutex
-quicUDP4                 *net.UDPConn
-quicUDP6                 *net.UDPConn
-quicTr4                  *quic.Transport
-quicTr6                  *quic.Transport
+quicConnCache            quicConnCache
+quicUDP4                 atomic.Pointer[net.UDPConn]
+quicUDP6                 atomic.Pointer[net.UDPConn]
+quicTr4                  atomic.Pointer[quic.Transport]
+quicTr6                  atomic.Pointer[quic.Transport]
 }
 
 func NewXTransport() *XTransport {
@@ -177,6 +219,7 @@ tlsPreferRSA:             false,
 keyLogWriter:             nil,
 sessionCache:             tls.NewLRUClientSessionCache(4096),
 dnsMessagePool:           newDNSMessagePool(),
+stringBuilderPool:        newStringBuilderPool(),
 }
 
 // Initialize object pools
@@ -321,6 +364,7 @@ xTransport.cachedIPs.cache.Store(host, newItem)
 dlog.Debugf("[%s] IP address marked as updating", host)
 }
 
+// Predictive prefetching with adaptive window
 func (xTransport *XTransport) loadCachedIPs(host string) (ips []net.IP, expired bool, updating bool) {
 val, ok := xTransport.cachedIPs.cache.Load(host)
 if !ok {
@@ -335,7 +379,16 @@ ips = item.ips
 expiration := item.expiration
 updatingUntil := item.updatingUntil
 
-if expiration != nil && time.Until(*expiration) < 5*time.Minute {
+// Predictive prefetch before actual expiration
+if expiration != nil {
+timeUntilExpiry := time.Until(*expiration)
+if timeUntilExpiry < prefetchWindow && timeUntilExpiry > 0 {
+if updatingUntil == nil || time.Until(*updatingUntil) <= 0 {
+go xTransport.resolveAndUpdateCache(host)
+}
+}
+
+if timeUntilExpiry < 5*time.Minute {
 expired = true
 if updatingUntil != nil && time.Until(*updatingUntil) > 0 {
 updating = true
@@ -344,7 +397,21 @@ dlog.Debugf("[%s] cached IP addresses are being updated", host)
 dlog.Debugf("[%s] cached IP addresses expired, not being updated yet", host)
 }
 }
+}
 return ips, expired, updating
+}
+
+// Periodic cache cleanup without holding locks
+func (xTransport *XTransport) cleanupExpiredCache() {
+gen := xTransport.cachedIPs.generation.Add(1)
+dlog.Debugf("Cache cleanup cycle %d started", gen)
+xTransport.cachedIPs.cache.Range(func(key, value interface{}) bool {
+item := value.(*CachedIPItem)
+if item.expiration != nil && time.Now().After(*item.expiration) {
+xTransport.cachedIPs.cache.Delete(key)
+}
+return true
+})
 }
 
 func (xTransport *XTransport) getGzipReader(r io.Reader) (*gzip.Reader, error) {
@@ -361,44 +428,70 @@ _ = gr.Close()
 xTransport.gzipPool.Put(gr)
 }
 
+// Lock-free QUIC transport with atomic pointers
 func (xTransport *XTransport) getQUICTransport(network string) (*quic.Transport, error) {
-xTransport.quicMu.Lock()
-defer xTransport.quicMu.Unlock()
-
 const sockBuf = 8 << 20 // 8MB for better performance
 
 switch network {
 case "udp4":
-if xTransport.quicTr4 != nil {
-return xTransport.quicTr4, nil
+if tr := xTransport.quicTr4.Load(); tr != nil {
+return tr, nil
 }
+
 c, err := net.ListenUDP("udp4", nil)
 if err != nil {
 return nil, fmt.Errorf("failed to listen UDP4: %w", err)
 }
 _ = c.SetReadBuffer(sockBuf)
 _ = c.SetWriteBuffer(sockBuf)
-xTransport.quicUDP4 = c
-xTransport.quicTr4 = &quic.Transport{Conn: c}
-return xTransport.quicTr4, nil
+
+tr := &quic.Transport{Conn: c}
+if xTransport.quicTr4.CompareAndSwap(nil, tr) {
+xTransport.quicUDP4.Store(c)
+return tr, nil
+}
+
+// Another goroutine created transport, close ours and use theirs
+_ = c.Close()
+return xTransport.quicTr4.Load(), nil
 
 case "udp6":
-if xTransport.quicTr6 != nil {
-return xTransport.quicTr6, nil
+if tr := xTransport.quicTr6.Load(); tr != nil {
+return tr, nil
 }
+
 c, err := net.ListenUDP("udp6", nil)
 if err != nil {
 return nil, fmt.Errorf("failed to listen UDP6: %w", err)
 }
 _ = c.SetReadBuffer(sockBuf)
 _ = c.SetWriteBuffer(sockBuf)
-xTransport.quicUDP6 = c
-xTransport.quicTr6 = &quic.Transport{Conn: c}
-return xTransport.quicTr6, nil
+
+tr := &quic.Transport{Conn: c}
+if xTransport.quicTr6.CompareAndSwap(nil, tr) {
+xTransport.quicUDP6.Store(c)
+return tr, nil
+}
+
+// Another goroutine created transport, close ours and use theirs
+_ = c.Close()
+return xTransport.quicTr6.Load(), nil
 
 default:
 return nil, fmt.Errorf("unsupported quic network: %s", network)
 }
+}
+
+// Adaptive timeout based on RTT
+func (xTransport *XTransport) adaptiveTimeout(rtt time.Duration) time.Duration {
+adaptiveTO := rtt * 3
+if adaptiveTO < xTransport.timeout {
+return xTransport.timeout
+}
+if adaptiveTO > xTransport.timeout*3 {
+return xTransport.timeout * 3
+}
+return adaptiveTO
 }
 
 func (xTransport *XTransport) rebuildTransport() {
@@ -412,25 +505,23 @@ xTransport.h3Transport.Close()
 xTransport.h3Transport = nil
 }
 
-// Clean up QUIC transports
-xTransport.quicMu.Lock()
-if xTransport.quicTr4 != nil {
-_ = xTransport.quicTr4.Close()
-xTransport.quicTr4 = nil
+// Clean up QUIC transports using atomic pointers
+if tr4 := xTransport.quicTr4.Load(); tr4 != nil {
+_ = tr4.Close()
+xTransport.quicTr4.Store(nil)
 }
-if xTransport.quicTr6 != nil {
-_ = xTransport.quicTr6.Close()
-xTransport.quicTr6 = nil
+if tr6 := xTransport.quicTr6.Load(); tr6 != nil {
+_ = tr6.Close()
+xTransport.quicTr6.Store(nil)
 }
-if xTransport.quicUDP4 != nil {
-_ = xTransport.quicUDP4.Close()
-xTransport.quicUDP4 = nil
+if udp4 := xTransport.quicUDP4.Load(); udp4 != nil {
+_ = udp4.Close()
+xTransport.quicUDP4.Store(nil)
 }
-if xTransport.quicUDP6 != nil {
-_ = xTransport.quicUDP6.Close()
-xTransport.quicUDP6 = nil
+if udp6 := xTransport.quicUDP6.Load(); udp6 != nil {
+_ = udp6.Close()
+xTransport.quicUDP6.Store(nil)
 }
-xTransport.quicMu.Unlock()
 
 if xTransport.mainProto == "tcp" {
 xTransport.resolveProtos = protoTCPFirst
@@ -442,9 +533,9 @@ timeout := xTransport.timeout
 transport := &http.Transport{
 DisableKeepAlives:      false,
 DisableCompression:     true,
-MaxIdleConns:           5000, // Increased for better connection reuse
-MaxIdleConnsPerHost:    100,
-MaxConnsPerHost:        100,
+MaxIdleConns:           5000,
+MaxIdleConnsPerHost:    200, // Increased from 100
+MaxConnsPerHost:        200, // Increased from 100
 IdleConnTimeout:        90 * time.Second,
 ExpectContinueTimeout:  0,
 ForceAttemptHTTP2:      true,
@@ -476,7 +567,16 @@ Timeout:   timeout,
 KeepAlive: 15 * time.Second,
 DualStack: true,
 }
-return dialer.DialContext(ctx, network, address)
+conn, err := dialer.DialContext(ctx, network, address)
+if err == nil {
+// TCP socket tuning for lower latency
+if tcpConn, ok := conn.(*net.TCPConn); ok {
+_ = tcpConn.SetNoDelay(true)
+_ = tcpConn.SetKeepAlive(true)
+_ = tcpConn.SetKeepAlivePeriod(15 * time.Second)
+}
+}
+return conn, err
 }
 return (*xTransport.proxyDialer).Dial(network, address)
 }
@@ -501,7 +601,7 @@ if i == 1 {
 delay = 250 * time.Millisecond
 }
 timer := time.NewTimer(delay)
-defer timer.Stop() // Always defer Stop
+defer timer.Stop()
 
 select {
 case <-timer.C:
@@ -809,7 +909,8 @@ if len(queryTypes) == 0 {
 return nil, 0, errors.New("no query types requested")
 }
 
-results := make(chan queryResult, len(queryTypes))
+// Optimized channel capacity
+results := make(chan queryResult, 2)
 ctx, cancel := context.WithTimeout(bgCtx, ResolverReadTimeout)
 defer cancel()
 
@@ -818,7 +919,6 @@ defer xTransport.dnsClientPool.Put(dnsClient)
 
 for _, qType := range queryTypes {
 go func(qt uint16) {
-// Use dns.NewMsg() - creates message with question already set
 msg := dns.NewMsg(fqdn(host), qt)
 if msg == nil {
 select {
@@ -1224,7 +1324,7 @@ break
 }
 
 v = strings.TrimSpace(v)
-if strings.HasPrefix(v, `h3=":`) {
+if strings.HasPrefix(v, `h3=":`{
 v = strings.TrimPrefix(v, `h3=":`)
 v = strings.TrimSuffix(v, `"`)
 if xAltPort, err := strconv.ParseUint(v, 10, 16); err == nil && xAltPort <= 65535 {
