@@ -46,7 +46,7 @@ For developers please read the
 # Goals
 
 - KISS.
-- Everything is an resource record.
+- Everything is a resource record, EDNS0 pseudo RRs included.
   - Easy way to access RR's header and resource data (rdata).
 - Small API.
   - Package _dnsutil_ contains functions that help programmers, but are not nessecarily in scope the the

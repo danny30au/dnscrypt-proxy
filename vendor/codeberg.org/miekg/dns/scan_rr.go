@@ -1465,7 +1465,7 @@ func (rr *RFC3597) parse(c *zlexer, o string) *ParseError {
 	if int(rdlength)*2 != len(s) {
 		return &ParseError{err: "bad RFC3597 Rdata", lex: l}
 	}
-	rr.Data = s
+	rr.RFC3597.Data = s
 	return nil
 }
 

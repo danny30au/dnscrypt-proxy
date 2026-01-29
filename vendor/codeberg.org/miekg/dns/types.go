@@ -977,6 +977,8 @@ type RFC3597 struct {
 	rdata.RFC3597
 }
 
+func (rr *RFC3597) Data() RDATA { return rr.RFC3597 }
+
 func (rr *RFC3597) String() string {
 	sb := builderPool.Get()
 
@@ -1294,6 +1296,7 @@ type OPT struct {
 
 // See opt.go for other methods.
 
+func (rr *OPT) Data() RDATA    { return nil }
 func (rr *OPT) String() string { return "" }
 
 func (rr *OPT) Len() int {

@@ -129,6 +129,9 @@ type ttlState struct {
 // In this library EDNS0 option codes have a presentation format, which you see when you print them. This
 // presentation format is also parsed back to EDNS0. In other words you can get an ENDS0 option code just from
 // a string.
+//
+// Note because this invokes the full [ZoneParser] it will be much faster to construct a new [RR] via struct
+// literals.
 func New(s string) (RR, error) {
 	if len(s) > 0 && s[len(s)-1] != '\n' { // We need a closing newline
 		return readRR(strings.NewReader(s+"\n"), "")
