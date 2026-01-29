@@ -6,7 +6,7 @@
 //
 //	 mx := &dns.MX{Hdr: dns.Header{Name: "miek.nl.", Class: dns.ClassINET, TTL: 3600},
 //			       MX: rdata.MX{Preference: 10, Mx: "mx.miek.nl."}}
-//	 fmt.Printf("%s %s\t%s", mx.Header(), dnsutil.TypeToString(dns.RRToType(mx)), mx.MX)
+//	 fmt.Printf("%s %s\t%s", mx.Header(), dnsutil.TypeToString(dns.RRToType(mx)), mx.Data())
 package rdata
 
 import (
