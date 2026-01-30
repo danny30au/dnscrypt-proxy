@@ -1461,8 +1461,15 @@ func (xTransport *XTransport) FetchECHConfig(host string) error {
     msg := xTransport.dnsMessagePool.Get()
     defer xTransport.dnsMessagePool.Put(msg)
 
-    msg.SetQuestion(fqdn(host), dns.TypeHTTPS)
+    // Manually construct the question
+    msg.Id = dns.Id()
     msg.RecursionDesired = true
+    msg.Question = make([]dns.Question, 1)
+    msg.Question[0] = dns.Question{
+        Name:   fqdn(host),
+        Qtype:  dns.TypeHTTPS,
+        Qclass: dns.ClassINET,
+    }
 
     dnsClient := xTransport.dnsClientPool.Get().(*dns.Client)
     defer xTransport.dnsClientPool.Put(dnsClient)
@@ -1484,14 +1491,18 @@ func (xTransport *XTransport) FetchECHConfig(host string) error {
 
         for _, answer := range in.Answer {
             if https, ok := answer.(*dns.HTTPS); ok {
-                for _, param := range https.Value {
-                    if echConfig, ok := param.(*dns.SVCBECHConfig); ok {
-                        if len(echConfig.ECH) > 0 {
-                            xTransport.echConfigList = echConfig.ECH
-                            xTransport.enableECH = true
-                            dlog.Infof("ECH config retrieved for %s (length: %d bytes)", host, len(echConfig.ECH))
-                            xTransport.rebuildTransport()
-                            return nil
+                // Iterate through SVCB parameters
+                for _, kv := range https.Value {
+                    // Check if this is the ECH parameter (key 5)
+                    if kv.Key() == dns.SVCB_ECHCONFIG {
+                        if echKV, ok := kv.(*dns.SVCBECHConfig); ok {
+                            if len(echKV.ECH) > 0 {
+                                xTransport.echConfigList = echKV.ECH
+                                xTransport.enableECH = true
+                                dlog.Infof("ECH config retrieved for %s (length: %d bytes)", host, len(echKV.ECH))
+                                xTransport.rebuildTransport()
+                                return nil
+                            }
                         }
                     }
                 }
