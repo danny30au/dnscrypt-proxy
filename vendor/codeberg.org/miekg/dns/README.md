@@ -37,11 +37,11 @@ year or two (2028?) when things have stablized it will be blessed with a v1.0.0.
 # Porting From v1
 
 Everything from <https://github.com/miekg/dns> works. See
-[README-diff-with-v1.md](https://codeberg.org/miekg/dns/src/branch/main/README-diff-with-v1.md)
+[README-v1-to-v2.md](https://codeberg.org/miekg/dns/src/branch/main/_doc/README-v1-to-v2.md)
 for the differences, if you are porting your application.
 
 For developers please read the
-[developer README](https://codeberg.org/miekg/dns/src/branch/main/README-dev.md).
+[developer README](https://codeberg.org/miekg/dns/src/branch/main/_doc/README-dev.md).
 
 # Goals
 

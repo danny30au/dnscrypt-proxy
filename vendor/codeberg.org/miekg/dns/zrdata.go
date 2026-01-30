@@ -3,6 +3,8 @@
 package dns
 
 import "codeberg.org/miekg/dns/rdata"
+import "codeberg.org/miekg/dns/internal/dnslex"
+import "io"
 
 // TypeToRDATA is a map of functions for each RR type to set it's rdata.
 var TypeToRDATA = map[uint16]func(RR, RDATA){
@@ -176,3 +178,639 @@ func (rr ANY) Data() RDATA         { return nil }
 func (rr AXFR) Data() RDATA        { return nil }
 func (rr IXFR) Data() RDATA        { return nil }
 func (rr *TSIG) Data() RDATA       { return rr.TSIG }
+func parseData(r io.Reader, rrtype uint16, o string) (RDATA, error) {
+	c := dnslex.New(r, StringToType, StringToCode, StringToClass)
+
+	switch rrtype {
+	case TypeCNAME:
+		rd := rdata.CNAME{}
+		pe := parseCNAME(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeHINFO:
+		rd := rdata.HINFO{}
+		pe := parseHINFO(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeMB:
+		rd := rdata.MB{}
+		pe := parseMB(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeMG:
+		rd := rdata.MG{}
+		pe := parseMG(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeMINFO:
+		rd := rdata.MINFO{}
+		pe := parseMINFO(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeMR:
+		rd := rdata.MR{}
+		pe := parseMR(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeMF:
+		rd := rdata.MF{}
+		pe := parseMF(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeMD:
+		rd := rdata.MD{}
+		pe := parseMD(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeMX:
+		rd := rdata.MX{}
+		pe := parseMX(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeAFSDB:
+		rd := rdata.AFSDB{}
+		pe := parseAFSDB(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeX25:
+		rd := rdata.X25{}
+		pe := parseX25(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeISDN:
+		rd := rdata.ISDN{}
+		pe := parseISDN(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeRT:
+		rd := rdata.RT{}
+		pe := parseRT(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeNS:
+		rd := rdata.NS{}
+		pe := parseNS(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypePTR:
+		rd := rdata.PTR{}
+		pe := parsePTR(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeRP:
+		rd := rdata.RP{}
+		pe := parseRP(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeSOA:
+		rd := rdata.SOA{}
+		pe := parseSOA(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeTXT:
+		rd := rdata.TXT{}
+		pe := parseTXT(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeSPF:
+		rd := rdata.TXT{}
+		pe := parseTXT(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeAVC:
+		rd := rdata.TXT{}
+		pe := parseTXT(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeWALLET:
+		rd := rdata.TXT{}
+		pe := parseTXT(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeCLA:
+		rd := rdata.TXT{}
+		pe := parseTXT(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeIPN:
+		rd := rdata.IPN{}
+		pe := parseIPN(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeSRV:
+		rd := rdata.SRV{}
+		pe := parseSRV(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeNAPTR:
+		rd := rdata.NAPTR{}
+		pe := parseNAPTR(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeCERT:
+		rd := rdata.CERT{}
+		pe := parseCERT(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeDNAME:
+		rd := rdata.DNAME{}
+		pe := parseDNAME(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeA:
+		rd := rdata.A{}
+		pe := parseA(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeAAAA:
+		rd := rdata.AAAA{}
+		pe := parseAAAA(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypePX:
+		rd := rdata.PX{}
+		pe := parsePX(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeGPOS:
+		rd := rdata.GPOS{}
+		pe := parseGPOS(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeLOC:
+		rd := rdata.LOC{}
+		pe := parseLOC(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeSIG:
+		rd := rdata.RRSIG{}
+		pe := parseRRSIG(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeRRSIG:
+		rd := rdata.RRSIG{}
+		pe := parseRRSIG(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeNXT:
+		rd := rdata.NSEC{}
+		pe := parseNSEC(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeNSEC:
+		rd := rdata.NSEC{}
+		pe := parseNSEC(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeDLV:
+		rd := rdata.DS{}
+		pe := parseDS(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeCDS:
+		rd := rdata.DS{}
+		pe := parseDS(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeDS:
+		rd := rdata.DS{}
+		pe := parseDS(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeKX:
+		rd := rdata.KX{}
+		pe := parseKX(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeTA:
+		rd := rdata.TA{}
+		pe := parseTA(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeTALINK:
+		rd := rdata.TALINK{}
+		pe := parseTALINK(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeSSHFP:
+		rd := rdata.SSHFP{}
+		pe := parseSSHFP(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeKEY:
+		rd := rdata.DNSKEY{}
+		pe := parseDNSKEY(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeCDNSKEY:
+		rd := rdata.DNSKEY{}
+		pe := parseDNSKEY(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeDNSKEY:
+		rd := rdata.DNSKEY{}
+		pe := parseDNSKEY(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeRKEY:
+		rd := rdata.RKEY{}
+		pe := parseRKEY(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeNSAPPTR:
+		rd := rdata.NSAPPTR{}
+		pe := parseNSAPPTR(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeNSEC3:
+		rd := rdata.NSEC3{}
+		pe := parseNSEC3(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeNSEC3PARAM:
+		rd := rdata.NSEC3PARAM{}
+		pe := parseNSEC3PARAM(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeTKEY:
+		rd := rdata.TKEY{}
+		pe := parseTKEY(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeURI:
+		rd := rdata.URI{}
+		pe := parseURI(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeDHCID:
+		rd := rdata.DHCID{}
+		pe := parseDHCID(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeTLSA:
+		rd := rdata.TLSA{}
+		pe := parseTLSA(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeSMIMEA:
+		rd := rdata.SMIMEA{}
+		pe := parseSMIMEA(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeHIP:
+		rd := rdata.HIP{}
+		pe := parseHIP(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeNINFO:
+		rd := rdata.NINFO{}
+		pe := parseNINFO(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeNID:
+		rd := rdata.NID{}
+		pe := parseNID(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeL32:
+		rd := rdata.L32{}
+		pe := parseL32(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeL64:
+		rd := rdata.L64{}
+		pe := parseL64(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeLP:
+		rd := rdata.LP{}
+		pe := parseLP(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeEUI48:
+		rd := rdata.EUI48{}
+		pe := parseEUI48(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeEUI64:
+		rd := rdata.EUI64{}
+		pe := parseEUI64(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeCAA:
+		rd := rdata.CAA{}
+		pe := parseCAA(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeUID:
+		rd := rdata.UID{}
+		pe := parseUID(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeGID:
+		rd := rdata.GID{}
+		pe := parseGID(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeUINFO:
+		rd := rdata.UINFO{}
+		pe := parseUINFO(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeEID:
+		rd := rdata.EID{}
+		pe := parseEID(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeNIMLOC:
+		rd := rdata.NIMLOC{}
+		pe := parseNIMLOC(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeOPENPGPKEY:
+		rd := rdata.OPENPGPKEY{}
+		pe := parseOPENPGPKEY(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeCSYNC:
+		rd := rdata.CSYNC{}
+		pe := parseCSYNC(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeZONEMD:
+		rd := rdata.ZONEMD{}
+		pe := parseZONEMD(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeRESINFO:
+		rd := rdata.TXT{}
+		pe := parseTXT(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeSVCB:
+		rd := rdata.SVCB{}
+		pe := parseSVCB(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeHTTPS:
+		rd := rdata.SVCB{}
+		pe := parseSVCB(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeDELEG:
+		rd := rdata.DELEG{}
+		pe := parseDELEG(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeDELEGI:
+		rd := rdata.DELEG{}
+		pe := parseDELEG(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	case TypeDSYNC:
+		rd := rdata.DSYNC{}
+		pe := parseDSYNC(&rd, c, o)
+		if pe != nil {
+			return rd, pe
+		}
+		return rd, nil
+
+	}
+	rd := rdata.RFC3597{}
+	pe := parseRFC3597(&rd, c, o)
+	if pe != nil {
+		return rd, pe
+	}
+	return rd, nil
+}
