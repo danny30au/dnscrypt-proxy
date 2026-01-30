@@ -180,8 +180,6 @@ tlsPreferRSA             bool
 proxyDialer              *netproxy.Dialer
 httpProxyFunction        func(*http.Request) (*url.URL, error)
 tlsClientCreds           DOHClientCreds
-    echConfigList []byte
-    enableECH     bool
 keyLogWriter             io.Writer
 gzipPool                 sync.Pool
 dnsClientPool            sync.Pool
@@ -216,8 +214,6 @@ tlsPreferRSA:             false,
 keyLogWriter:             nil,
 sessionCache:             tls.NewLRUClientSessionCache(4096),
 dnsMessagePool:           newDNSMessagePool(),
-        echConfigList:        nil,
-        enableECH:            false,
 stringBuilderPool:        newStringBuilderPool(),
 }
 
@@ -630,11 +626,6 @@ transport.Proxy = xTransport.httpProxyFunction
 
 clientCreds := xTransport.tlsClientCreds
 tlsClientConfig := tls.Config{}
-
-    if xTransport.enableECH && len(xTransport.echConfigList) > 0 {
-        tlsClientConfig.EncryptedClientHelloConfigList = xTransport.echConfigList
-        dlog.Debug("ECH enabled for TLS connections")
-    }
 certPool, certPoolErr := x509.SystemCertPool()
 
 if xTransport.keyLogWriter != nil {
@@ -1455,97 +1446,4 @@ dlog.Warnf("Failed to pre-warm DNS for [%s]: %v", host, err)
 }
 
 wg.Wait()
-}
-
-func (xTransport *XTransport) FetchECHConfig(host string) error {
-    msg := xTransport.dnsMessagePool.Get()
-    defer xTransport.dnsMessagePool.Put(msg)
-
-    // Manually construct the question
-    msg.Id = dns.Id()
-    msg.RecursionDesired = true
-    msg.Question = make([]dns.Question, 1)
-    msg.Question[0] = dns.Question{
-        Name:   fqdn(host),
-        Qtype:  dns.TypeHTTPS,
-        Qclass: dns.ClassINET,
-    }
-
-    dnsClient := xTransport.dnsClientPool.Get().(*dns.Client)
-    defer xTransport.dnsClientPool.Put(dnsClient)
-
-    ctx, cancel := context.WithTimeout(bgCtx, xTransport.timeout)
-    defer cancel()
-
-    resolvers := xTransport.internalResolvers
-    if len(resolvers) == 0 || !xTransport.internalResolverReady {
-        resolvers = xTransport.bootstrapResolvers
-    }
-
-    for _, resolver := range resolvers {
-        in, _, err := dnsClient.Exchange(ctx, msg, "udp", resolver)
-        if err != nil {
-            dlog.Debugf("ECH config query failed for %s via %s: %v", host, resolver, err)
-            continue
-        }
-
-        for _, answer := range in.Answer {
-            if https, ok := answer.(*dns.HTTPS); ok {
-                // Iterate through SVCB parameters
-                for _, kv := range https.Value {
-                    // Check if this is the ECH parameter (key 5)
-                    if kv.Key() == dns.SVCB_ECHCONFIG {
-                        if echKV, ok := kv.(*dns.SVCBECHConfig); ok {
-                            if len(echKV.ECH) > 0 {
-                                xTransport.echConfigList = echKV.ECH
-                                xTransport.enableECH = true
-                                dlog.Infof("ECH config retrieved for %s (length: %d bytes)", host, len(echKV.ECH))
-                                xTransport.rebuildTransport()
-                                return nil
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    return fmt.Errorf("no ECH config found for %s", host)
-}
-
-func (xTransport *XTransport) PrewarmWithECH(dohResolvers []string) {
-    xTransport.PrewarmDNSCache(dohResolvers)
-
-    for _, resolver := range dohResolvers {
-        u, err := url.Parse(resolver)
-        if err != nil {
-            dlog.Debugf("Failed to parse resolver URL %s: %v", resolver, err)
-            continue
-        }
-        host, _ := ExtractHostAndPort(u.Host, 443)
-
-        if err := xTransport.FetchECHConfig(host); err != nil {
-            dlog.Debugf("ECH not available for %s: %v", host, err)
-        } else {
-            dlog.Infof("ECH configured for %s", host)
-        }
-    }
-}
-
-func (xTransport *XTransport) SetECHConfig(echConfigList []byte) error {
-    if len(echConfigList) == 0 {
-        return errors.New("empty ECH config list")
-    }
-    xTransport.echConfigList = echConfigList
-    xTransport.enableECH = true
-    dlog.Infof("ECH config manually set (%d bytes)", len(echConfigList))
-    xTransport.rebuildTransport()
-    return nil
-}
-
-func (xTransport *XTransport) DisableECH() {
-    xTransport.enableECH = false
-    xTransport.echConfigList = nil
-    dlog.Info("ECH disabled")
-    xTransport.rebuildTransport()
 }
