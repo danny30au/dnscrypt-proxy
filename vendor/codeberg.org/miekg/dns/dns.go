@@ -43,7 +43,7 @@ const (
 type RR interface {
 	// Header returns the header of a resource record. The header contains everything up to the rdata.
 	Header() *Header
-	// Data return the rdata of a resource record. The Data contains everything after the header.
+	// Data return the rdata of a resource record. The data contains everything after the header.
 	Data() RDATA
 	// String returns the text representation of the resource record.
 	String() string
@@ -70,7 +70,8 @@ type RDATA interface {
 //	dns.TypeToString[codepoint] = "TYPE"
 //	dns.StringToType["TYPE"] = codepoint
 //
-// For EDNS0 registration use, [CodeToRR], [CodeToString] and [StringToType].
+// For EDNS0 registration use, [CodeToRR], [CodeToString] and [StringToType]. See the file rr_test.go for an
+// example on how to register a private RR and an EDNS0 type.
 type Typer interface {
 	Type() uint16
 }
