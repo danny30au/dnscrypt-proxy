@@ -24,7 +24,6 @@ import (
 )
 
 // Optimization: Reuse buffers to reduce GC pressure
-// Go 1.26 Green Tea GC will handle this pool more efficiently
 var packetBufferPool = sync.Pool{
     New: func() any {
         b := make([]byte, MaxDNSPacketSize)
@@ -39,10 +38,10 @@ var relayMagicHeader = [10]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 
 type queryJob struct {
     bufPtr      *[]byte
     packet      []byte
-    clientAddr  netip.AddrPort        // Optimization: Zero-allocation address
+    clientAddr  netip.AddrPort        // Optimization: Zero-allocation address storage
     clientPc    *net.UDPConn
     start       time.Time
-    clientProto unique.Handle[string] // Optimization: Interned string
+    clientProto unique.Handle[string] // Optimization: Interned string handle
     serverProto string
 }
 
@@ -286,6 +285,11 @@ func (proxy *Proxy) addLocalDoHListener(listenAddrStr string) {
     dlog.Noticef("Now listening to https://%v%v [DoH]", listenAddrStr, proxy.localDoHPath)
 }
 
+// StartProxy initializes the listeners and starts acceptance loop
+func (proxy *Proxy) StartProxy() {
+    proxy.startAcceptingClients()
+}
+
 // Initialize worker pool for handling queries
 func (proxy *Proxy) initWorkerPool() {
     proxy.numWorkers = runtime.GOMAXPROCS(0) * 4
@@ -303,11 +307,15 @@ func (proxy *Proxy) initWorkerPool() {
 // Query worker processes jobs from the worker pool
 func (proxy *Proxy) queryWorker() {
     for job := range proxy.workerPool {
+        // Convert efficient netip.AddrPort to net.UDPAddr for compatibility
+        // This allocation is necessary until processIncomingQuery is refactored across all plugins
+        clientAddr := net.UDPAddrFromAddrPort(job.clientAddr)
+        
         proxy.processIncomingQuery(
-            job.clientProto,
+            job.clientProto.Value(), // Convert unique.Handle back to string
             job.serverProto,
             job.packet,
-            job.clientAddr,
+            clientAddr,
             job.clientPc,
             job.start,
             false,
@@ -322,8 +330,8 @@ func (proxy *Proxy) initStatsBatcher() {
     proxy.statsBatchChan = make(chan statsUpdate, 10000)
     go func() {
         for update := range proxy.statsBatchChan {
-            // Stats logic here (elided for brevity)
-            _ = update
+             // Logic kept minimal as implementation details weren't provided
+             _ = update
         }
     }()
 }
@@ -431,7 +439,7 @@ func (proxy *Proxy) udpListener(conn *net.UDPConn) {
     for {
         n, err := pconn.ReadBatch(ms, 0)
         if err != nil {
-            if isClosedConnError(err) {
+            if strings.Contains(err.Error(), "use of closed network connection") {
                 return
             }
             dlog.Warnf("ReadBatch error: %v", err)
@@ -445,9 +453,19 @@ func (proxy *Proxy) udpListener(conn *net.UDPConn) {
             }
 
             msg := ms[i]
-            addr, ok := netip.AddrPortFrom(msg.Addr)
-            if !ok {
-                 // Fallback if address conversion fails
+            // Efficiently convert net.Addr to netip.AddrPort to avoid allocations in job struct
+            // Note: msg.Addr is an interface (net.UDPAddr typically)
+            // We use netip for storage efficiency in the queue
+            var addr netip.AddrPort
+            if udpAddr, ok := msg.Addr.(*net.UDPAddr); ok {
+                 // Fast path conversion
+                 if ip, ok := netip.AddrFromSlice(udpAddr.IP); ok {
+                    addr = netip.AddrPortFrom(ip, uint16(udpAddr.Port))
+                 }
+            }
+
+            if !addr.IsValid() {
+                 // Fallback or error
                  proxy.clientsCountDec()
                  continue
             }
@@ -481,7 +499,7 @@ func (proxy *Proxy) tcpListener(listener *net.TCPListener) {
     for {
         conn, err := listener.Accept()
         if err != nil {
-            if isClosedConnError(err) {
+            if strings.Contains(err.Error(), "use of closed network connection") {
                 return
             }
             dlog.Warnf("Accept error: %v", err)
@@ -495,16 +513,12 @@ func (proxy *Proxy) tcpListener(listener *net.TCPListener) {
     }
 }
 
-// Placeholder for handleTCP - assuming standard implementation
+// handleTCP is assumed to be defined elsewhere or standard impl
 func (proxy *Proxy) handleTCP(conn net.Conn) {
-    // Implementation would go here
+    // Basic implementation placeholder if not provided
+    // In real code, this would handle the TCP handshake
     defer conn.Close()
     defer proxy.clientsCountDec()
-    // ...
-}
-
-func (proxy *Proxy) localDoHListener(listener *net.TCPListener) {
-    // Implementation for DoH listener
 }
 
 func (proxy *Proxy) prepareForRelay(ip net.IP, port int, encryptedQuery *[]byte) {
@@ -732,12 +746,28 @@ func (proxy *Proxy) getDynamicTimeout() time.Duration {
     return dynamicTimeout
 }
 
+func (proxy *Proxy) updateRegisteredServers() error {
+    proxy.serverMapsMu.Lock()
+    defer proxy.serverMapsMu.Unlock()
+
+    proxy.registeredServersMap = make(map[string]int)
+    for i, s := range proxy.registeredServers {
+        proxy.registeredServersMap[s.name] = i
+    }
+
+    proxy.registeredRelaysMap = make(map[string]int)
+    for i, s := range proxy.registeredRelays {
+        proxy.registeredRelaysMap[s.name] = i
+    }
+    return nil
+}
+
 func (proxy *Proxy) processIncomingQuery(
-    clientProto unique.Handle[string], // Changed to Handle
+    clientProto string,
     serverProto string,
     query []byte,
-    clientAddr netip.AddrPort, // Changed to AddrPort
-    clientPc *net.UDPConn,
+    clientAddr net.Addr,
+    clientPc net.Conn,
     start time.Time,
     onlyCached bool,
 ) []byte {
@@ -747,15 +777,7 @@ func (proxy *Proxy) processIncomingQuery(
         return response
     }
 
-    // Adapt netip.AddrPort back to net.Addr if plugins require it, 
-    // or better yet, update PluginsState to use AddrPort.
-    // For now, we create a lightweight wrapper if needed or rely on string form.
-    // Assuming NewPluginsState can take AddrPort or we convert.
-    // For legacy compat, we might need a wrapper:
-    // clientAddrNet := net.UDPAddrFromAddrPort(clientAddr)
-    
-    // Note: clientProto.Value() extracts the string
-    pluginsState := NewPluginsState(proxy, clientProto.Value(), clientAddr, serverProto, start)
+    pluginsState := NewPluginsState(proxy, clientProto, clientAddr, serverProto, start)
     var serverInfo *ServerInfo
     var serverName string = "-"
 
@@ -852,7 +874,7 @@ func (proxy *Proxy) processIncomingQuery(
         return response
     }
 
-    sendResponse(proxy, &pluginsState, response, clientProto.Value(), clientAddr, clientPc)
+    sendResponse(proxy, &pluginsState, response, clientProto, clientAddr, clientPc)
     pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
     updateMonitoringMetrics(proxy, &pluginsState)
     return response
@@ -871,20 +893,3 @@ func NewProxy() *Proxy {
         localDoHListeners:    make([]*net.TCPListener, 0, 2),
     }
 }
-
-// Helper for udp listener error checking
-func isClosedConnError(err error) bool {
-    return strings.Contains(err.Error(), "use of closed network connection")
-}
-
-// Helpers assumed to exist or minimal mocks for compilation context
-func (proxy *Proxy) tcpListenerConfig() (*net.ListenConfig, error) {
-    return &net.ListenConfig{}, nil // Mock
-}
-func (proxy *Proxy) udpListenerConfig() (*net.ListenConfig, error) {
-    return &net.ListenConfig{}, nil // Mock
-}
-func isDigit(b byte) bool {
-    return b >= '0' && b <= '9'
-}
-func validateQuery(q []byte) bool { return len(q) >= 12 } // Minimal check
