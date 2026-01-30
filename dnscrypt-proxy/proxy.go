@@ -910,7 +910,7 @@ dlog.Debugf("clients count: %d", newCount)
 return true
 }
 
-// Hot path function - inline optimization hint
+// Hot path function - inline optimization hint  
 //go:inline
 func (proxy *Proxy) clientsCountDec() {
 if proxy.clientsCount.Load() == 0 {
