@@ -21,9 +21,11 @@ netproxy "golang.org/x/net/proxy"
 )
 
 // Optimization: Reuse buffers to reduce GC pressure
+// Optimization: Reuse buffers with cache line alignment to reduce GC pressure
 var packetBufferPool = sync.Pool{
 New: func() any {
-b := make([]byte, MaxDNSPacketSize)
+// Align to cache line (64 bytes) for better CPU cache performance
+b := make([]byte, MaxDNSPacketSize, MaxDNSPacketSize+64)
 return &b
 },
 }
@@ -342,9 +344,8 @@ for i := 0; i < stats.failures; i++ {
 proxy.serversInfo.updateServerStats(name, false)
 }
 }
-for k := range batch {
-delete(batch, k)
-}
+// Use clear() built-in (Go 1.21+) for faster map clearing
+clear(batch)
 }
 }
 }()
@@ -890,6 +891,8 @@ return nil, err
 return proxy.Decrypt(serverInfo, sharedKey, encryptedResponse, clientNonce)
 }
 
+// Hot path function - inline optimization hint
+//go:inline
 func (proxy *Proxy) clientsCountInc() bool {
 if proxy.clientsCount.Load() >= proxy.maxClients {
 return false
@@ -907,6 +910,8 @@ dlog.Debugf("clients count: %d", newCount)
 return true
 }
 
+// Hot path function - inline optimization hint
+//go:inline
 func (proxy *Proxy) clientsCountDec() {
 if proxy.clientsCount.Load() == 0 {
 return
