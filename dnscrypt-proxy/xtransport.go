@@ -180,8 +180,8 @@ tlsPreferRSA             bool
 proxyDialer              *netproxy.Dialer
 httpProxyFunction        func(*http.Request) (*url.URL, error)
 tlsClientCreds           DOHClientCreds
-echConfigList []byte
-enableECH     bool
+    echConfigList []byte
+    enableECH     bool
 keyLogWriter             io.Writer
 gzipPool                 sync.Pool
 dnsClientPool            sync.Pool
@@ -216,8 +216,8 @@ tlsPreferRSA:             false,
 keyLogWriter:             nil,
 sessionCache:             tls.NewLRUClientSessionCache(4096),
 dnsMessagePool:           newDNSMessagePool(),
-echConfigList:        nil,
-enableECH:            false,
+        echConfigList:        nil,
+        enableECH:            false,
 stringBuilderPool:        newStringBuilderPool(),
 }
 
@@ -631,10 +631,10 @@ transport.Proxy = xTransport.httpProxyFunction
 clientCreds := xTransport.tlsClientCreds
 tlsClientConfig := tls.Config{}
 
-if xTransport.enableECH && len(xTransport.echConfigList) > 0 {
-tlsClientConfig.EncryptedClientHelloConfigList = xTransport.echConfigList
-dlog.Debug("ECH enabled for TLS connections")
-}
+    if xTransport.enableECH && len(xTransport.echConfigList) > 0 {
+        tlsClientConfig.EncryptedClientHelloConfigList = xTransport.echConfigList
+        dlog.Debug("ECH enabled for TLS connections")
+    }
 certPool, certPoolErr := x509.SystemCertPool()
 
 if xTransport.keyLogWriter != nil {
@@ -1229,18 +1229,6 @@ start := time.Now()
 resp, err := client.Do(req)
 rtt := time.Since(start)
 
-if err != nil {
-var echRejErr *tls.ECHRejectionError
-if errors.As(err, &echRejErr) {
-dlog.Warnf("ECH rejected by %s, retry configs available: %v", url.Host, echRejErr.RetryConfigList != nil)
-if len(echRejErr.RetryConfigList) > 0 {
-xTransport.echConfigList = echRejErr.RetryConfigList
-xTransport.rebuildTransport()
-}
-}
-}
-
-
 if err != nil && xTransport.h3Client != nil && client == xTransport.h3Client {
 if xTransport.http3Probe {
 dlog.Debugf("HTTP/3 probe failed for [%s]: [%s] - falling back to HTTP/2", url.Host, err)
@@ -1470,84 +1458,83 @@ wg.Wait()
 }
 
 func (xTransport *XTransport) FetchECHConfig(host string) error {
-msg := xTransport.dnsMessagePool.Get()
-defer xTransport.dnsMessagePool.Put(msg)
+    msg := xTransport.dnsMessagePool.Get()
+    defer xTransport.dnsMessagePool.Put(msg)
 
-msg.SetQuestion(dns.Fqdn(host), dns.TypeHTTPS)
-msg.RecursionDesired = true
+    msg.SetQuestion(fqdn(host), dns.TypeHTTPS)
+    msg.RecursionDesired = true
 
-dnsClient := xTransport.dnsClientPool.Get().(*dns.Client)
-defer xTransport.dnsClientPool.Put(dnsClient)
+    dnsClient := xTransport.dnsClientPool.Get().(*dns.Client)
+    defer xTransport.dnsClientPool.Put(dnsClient)
 
-ctx, cancel := context.WithTimeout(bgCtx, xTransport.timeout)
-defer cancel()
+    ctx, cancel := context.WithTimeout(bgCtx, xTransport.timeout)
+    defer cancel()
 
-resolvers := xTransport.internalResolvers
-if len(resolvers) == 0 || !xTransport.internalResolverReady {
-resolvers = xTransport.bootstrapResolvers
-}
+    resolvers := xTransport.internalResolvers
+    if len(resolvers) == 0 || !xTransport.internalResolverReady {
+        resolvers = xTransport.bootstrapResolvers
+    }
 
-for _, resolver := range resolvers {
-in, _, err := dnsClient.Exchange(ctx, msg, "udp", resolver)
-if err != nil {
-dlog.Debugf("ECH config query failed for %s via %s: %v", host, resolver, err)
-continue
-}
+    for _, resolver := range resolvers {
+        in, _, err := dnsClient.Exchange(ctx, msg, "udp", resolver)
+        if err != nil {
+            dlog.Debugf("ECH config query failed for %s via %s: %v", host, resolver, err)
+            continue
+        }
 
-for _, answer := range in.Answer {
-if https, ok := answer.(*dns.HTTPS); ok {
-for _, param := range https.Value {
-if param.Key() == 5 {
-echData := []byte(param.String())
-if len(echData) > 0 {
-xTransport.echConfigList = echData
-xTransport.enableECH = true
-dlog.Infof("ECH config retrieved for %s (length: %d bytes)", host, len(echData))
-xTransport.rebuildTransport()
-return nil
-}
-}
-}
-}
-}
-}
+        for _, answer := range in.Answer {
+            if https, ok := answer.(*dns.HTTPS); ok {
+                for _, param := range https.Value {
+                    if echConfig, ok := param.(*dns.SVCBECHConfig); ok {
+                        if len(echConfig.ECH) > 0 {
+                            xTransport.echConfigList = echConfig.ECH
+                            xTransport.enableECH = true
+                            dlog.Infof("ECH config retrieved for %s (length: %d bytes)", host, len(echConfig.ECH))
+                            xTransport.rebuildTransport()
+                            return nil
+                        }
+                    }
+                }
+            }
+        }
+    }
 
-return fmt.Errorf("no ECH config found for %s", host)
+    return fmt.Errorf("no ECH config found for %s", host)
 }
 
 func (xTransport *XTransport) PrewarmWithECH(dohResolvers []string) {
-xTransport.PrewarmDNSCache(dohResolvers)
+    xTransport.PrewarmDNSCache(dohResolvers)
 
-for _, resolver := range dohResolvers {
-u, err := url.Parse(resolver)
-if err != nil {
-dlog.Debugf("Failed to parse resolver URL %s: %v", resolver, err)
-continue
-}
-host, _ := ExtractHostAndPort(u.Host, 443)
+    for _, resolver := range dohResolvers {
+        u, err := url.Parse(resolver)
+        if err != nil {
+            dlog.Debugf("Failed to parse resolver URL %s: %v", resolver, err)
+            continue
+        }
+        host, _ := ExtractHostAndPort(u.Host, 443)
 
-if err := xTransport.FetchECHConfig(host); err != nil {
-dlog.Debugf("ECH not available for %s: %v", host, err)
-} else {
-dlog.Infof("ECH configured for %s", host)
-}
-}
+        if err := xTransport.FetchECHConfig(host); err != nil {
+            dlog.Debugf("ECH not available for %s: %v", host, err)
+        } else {
+            dlog.Infof("ECH configured for %s", host)
+        }
+    }
 }
 
 func (xTransport *XTransport) SetECHConfig(echConfigList []byte) error {
-if len(echConfigList) == 0 {
-return errors.New("empty ECH config list")
-}
-xTransport.echConfigList = echConfigList
-xTransport.enableECH = true
-dlog.Infof("ECH config manually set (%d bytes)", len(echConfigList))
-xTransport.rebuildTransport()
-return nil
+    if len(echConfigList) == 0 {
+        return errors.New("empty ECH config list")
+    }
+    xTransport.echConfigList = echConfigList
+    xTransport.enableECH = true
+    dlog.Infof("ECH config manually set (%d bytes)", len(echConfigList))
+    xTransport.rebuildTransport()
+    return nil
 }
 
 func (xTransport *XTransport) DisableECH() {
-xTransport.enableECH = false
-xTransport.echConfigList = nil
-dlog.Info("ECH disabled")
-xTransport.rebuildTransport()
+    xTransport.enableECH = false
+    xTransport.echConfigList = nil
+    dlog.Info("ECH disabled")
+    xTransport.rebuildTransport()
 }
