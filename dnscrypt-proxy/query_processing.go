@@ -8,7 +8,6 @@ import (
     "sync"
     "sync/atomic"
     "time"
-    "unique"
 
     "codeberg.org/miekg/dns"
     "github.com/jedisct1/dlog"
@@ -352,10 +351,11 @@ func handleDNSExchange(
 }
 
 // processPlugins - Processes plugins for both query and response with enhanced error context
-// FIX: Removed unused parameter, cached rcode, flattened conditionals
+// FIX: Correct parameter order to match existing codebase - (proxy, pluginsState, query, serverInfo, response)
 func processPlugins(
     proxy *Proxy,
     pluginsState *PluginsState,
+    query []byte,
     serverInfo *ServerInfo,
     response []byte,
 ) ([]byte, error) {
