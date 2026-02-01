@@ -48,8 +48,8 @@ var http2Transport *http2.Transport
 
 // Memory-aligned connection pool structure (24 bytes -> 16 bytes on 64-bit)
 type tcpConnWrapper struct {
-	conn     net.Conn   // 8 bytes (pointer)
-	lastUsed atomic.Int64 // 8 bytes (aligned)
+	conn     net.Conn      // 8 bytes (pointer)
+	lastUsed atomic.Int64  // 8 bytes (aligned)
 }
 
 // Optimized connection pool with atomic operations
@@ -65,27 +65,8 @@ var connPool = tcpConnPool{
 	conns: make(map[string][]*tcpConnWrapper, 128), // Pre-allocate map
 }
 
-// Buffer pool for DNS packets - zero-copy optimization
-var bufferPool = sync.Pool{
-	New: func() any {
-		buf := make([]byte, MaxDNSPacketSize)
-		return &buf
-	},
-}
-
-//go:inline
-func getBuffer(size int) []byte {
-	bufPtr := bufferPool.Get().(*[]byte)
-	return (*bufPtr)[:size]
-}
-
-//go:inline
-func putBuffer(buf []byte) {
-	if cap(buf) >= MaxDNSPacketSize {
-		buf = buf[:cap(buf)]
-		bufferPool.Put(&buf)
-	}
-}
+// NOTE: bufferPool, getBuffer, putBuffer already exist in crypto.go/ipcrypt.go
+// We'll use the existing implementations instead of redeclaring
 
 func init() {
 	http2.ConfigureTransport(httpTransport)
@@ -166,7 +147,6 @@ func putTCPConn(addr string, conn net.Conn) {
 	}
 }
 
-//go:inline
 func GetMsg() *dns.Msg {
 	return msgPool.Get().(*dns.Msg)
 }
@@ -271,7 +251,6 @@ build:
 	}
 
 	truncated := make([]byte, offset)
-	// Use memmove for faster bulk copy
 	copy(truncated, packet[:offset])
 	truncated[2] |= 0x82
 
@@ -465,17 +444,6 @@ func NormalizeRawQName(name *[]byte) {
 	}
 }
 
-// Alternative: Bitmask-based optimization for branch-free execution
-func NormalizeRawQNameBranchless(name *[]byte) {
-	b := *name
-	for i := range b {
-		c := b[i]
-		// Branch-free: mask selects 0x20 if uppercase, 0 otherwise
-		mask := byte(((c - 'A') & ^(c - 'Z' - 1)) >> 2) & 0x20
-		b[i] = c | mask
-	}
-}
-
 // ULTRA-OPTIMIZED: Zero-copy with unsafe and 8x unrolling
 func NormalizeQName(str string) (string, error) {
 	n := len(str)
@@ -652,7 +620,6 @@ func addEDNS0PaddingIfNoneFound(msg *dns.Msg, unpaddedPacket []byte, paddingLen 
 	return msg.Data, nil
 }
 
-//go:inline
 func removeEDNS0Options(msg *dns.Msg) bool {
 	if len(msg.Pseudo) == 0 {
 		return false
@@ -673,7 +640,7 @@ func PackTXTRR(s string) []byte {
 
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		if c != '\\' {
+		if c != '\' {
 			buf.WriteByte(c)
 			continue
 		}
@@ -865,14 +832,8 @@ func _dnsExchange(
 			return DNSExchangeResponse{err: err}
 		}
 		rtt = time.Since(now)
-
-		// Zero-copy optimization: avoid extra allocation if possible
-		if length <= MaxDNSPacketSize {
-			packet = make([]byte, length)
-			copy(packet, buf[:length])
-		} else {
-			packet = buf[:length]
-		}
+		packet = make([]byte, length)
+		copy(packet, buf[:length])
 	} else {
 		if err := query.Pack(); err != nil {
 			return DNSExchangeResponse{err: err}
