@@ -18,7 +18,6 @@ import (
 const (
 myResolverHost  string = "resolver.dnscrypt.info."
 nonexistentName string = "nonexistent-zone.dnscrypt-test."
-MaxDNSPacketSize = 1232
 )
 
 type resultPair struct {
@@ -81,7 +80,6 @@ if msg != nil {
 msg.Answer = nil
 msg.Ns = nil
 msg.Extra = nil
-msg.Pseudo = nil
 msg.Question = nil
 r.msgPool.Put(msg)
 }
@@ -93,7 +91,7 @@ defer r.putMessage(msg)
 
 msg.SetQuestion(dns.Fqdn(qName), qType)
 msg.RecursionDesired = true
-msg.SetEdns0(MaxDNSPacketSize, true)
+msg.SetEdns0(uint16(MaxDNSPacketSize), true)
 
 if useECS && r.ecsOpt != nil {
 opt := msg.IsEdns0()
@@ -104,7 +102,7 @@ opt.Option = append(opt.Option, r.ecsOpt)
 
 timeout := r.transport.ReadTimeout
 for attempt := 0; attempt < 2; attempt++ {
-msg.Id = dns.Id()
+msg.ID = dns.ID()
 
 queryCtx, cancel := context.WithTimeout(ctx, timeout)
 response, _, err := r.client.ExchangeContext(queryCtx, msg, r.server)
@@ -112,7 +110,7 @@ cancel()
 
 if err == nil && response != nil {
 if response.Truncated {
-msg.Id = dns.Id()
+msg.ID = dns.ID()
 tcpCtx, tcpCancel := context.WithTimeout(ctx, timeout)
 response, _, err = r.client.ExchangeContext(tcpCtx, msg, r.server)
 tcpCancel()
