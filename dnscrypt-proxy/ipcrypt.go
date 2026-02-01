@@ -46,6 +46,14 @@ const (
 	cacheLineSize      = 64 // CPU cache line alignment
 )
 
+// Global buffer pool for backward compatibility with coldstart.go
+var bufferPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 0, 256)
+		return &buf
+	},
+}
+
 // IPCryptConfig with Go 1.26 optimizations
 type IPCryptConfig struct {
 	aesBlock       cipher.Block
@@ -102,7 +110,7 @@ func ParseAlgorithm(s string) (Algorithm, error) {
 	}
 }
 
-// NewIPCryptConfig with Go 1.26 new(expr) and optimized allocations
+// NewIPCryptConfig with Go 1.26 optimizations
 func NewIPCryptConfig(keyHex string, algorithm string) (*IPCryptConfig, error) {
 	algo, err := ParseAlgorithm(algorithm)
 	if err != nil {
@@ -129,7 +137,6 @@ func NewIPCryptConfig(keyHex string, algorithm string) (*IPCryptConfig, error) {
 		return nil, fmt.Errorf("%s requires %d-byte key, got %d", algorithm, expectedLen, len(rawKey))
 	}
 
-	// Use new(expr) for cleaner initialization (Go 1.26 feature)
 	config := &IPCryptConfig{
 		Key:            bytes.Clone(rawKey),
 		Algorithm:      algo,
