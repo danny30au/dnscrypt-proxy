@@ -44,6 +44,7 @@ jobs:
             -ldflags="-s -w -extldflags '-static'" \
             -o dnscrypt-proxy \
             ./dnscrypt-proxy
+            -cpuprofile=cpu.pprof
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v6
