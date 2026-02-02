@@ -30,8 +30,8 @@ var msgPool = sync.Pool{
 
 var httpTransport = &http.Transport{
 	MaxIdleConns:          5000,
-	MaxIdleConnsPerHost:   1000,
-	MaxConnsPerHost:       100,
+	MaxIdleConnsPerHost:   200,
+	MaxConnsPerHost:       200,
 	IdleConnTimeout:       90 * time.Second,
 	TLSHandshakeTimeout:   10 * time.Second,
 	ExpectContinueTimeout: 1 * time.Second,
