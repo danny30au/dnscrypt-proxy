@@ -38,7 +38,7 @@ jobs:
           go get github.com/davecgh/go-spew
           go mod tidy
           go build \
-            -pgo=auto \
+            -cpuprofile=cpu.pprof \
             -mod=mod \
             -trimpath \
             -tags="netgo,osusergo" \
