@@ -14,15 +14,8 @@ import (
 	"github.com/jedisct1/dlog"
 )
 
-// Buffer pools for zero-allocation operations
+// Buffer pool for padding operations (packetPool already exists in query_processing.go)
 var (
-	packetPool = sync.Pool{
-		New: func() interface{} {
-			buf := make([]byte, MaxDNSPacketSize)
-			return &buf
-		},
-	}
-
 	paddingPool = sync.Pool{
 		New: func() interface{} {
 			pad := make([]byte, MaxDNSPacketSize)
@@ -36,17 +29,19 @@ var (
 
 // Pre-computed constants for hot path
 const (
-	dataType         = "application/dns-message"
-	serverHeader     = "dnscrypt-proxy"
-	contentTypeText  = "text/plain"
-	errorMessage     = "dnscrypt-proxy local DoH server\n"
-	dnsQueryParam    = "dns"
-	minBase64Len     = MinDNSPacketSize * 4 / 3
-	maxBase64Len     = MaxDNSPacketSize * 4 / 3
+	dataType        = "application/dns-message"
+	serverHeader    = "dnscrypt-proxy"
+	contentTypeText = "text/plain"
+	errorMessage    = "dnscrypt-proxy local DoH server\n"
+	dnsQueryParam   = "dns"
 )
 
-// Static response for invalid requests (avoid allocation)
-var errorMessageBytes = []byte(errorMessage)
+// Computed at init time (not const because depends on runtime values)
+var (
+	minBase64Len      = MinDNSPacketSize * 4 / 3
+	maxBase64Len      = MaxDNSPacketSize * 4 / 3
+	errorMessageBytes = []byte(errorMessage)
+)
 
 type localDoHHandler struct {
 	proxy *Proxy
@@ -153,14 +148,14 @@ func (handler localDoHHandler) ServeHTTP(writer http.ResponseWriter, request *ht
 	padLen := paddedLen - responseLen
 
 	if hasEDNS0Padding && padLen > 0 {
-		// Use Go 1.26 new() expression syntax for cleaner allocation
-		msg := new(dns.Msg{Data: packet})
+		// Parse message for EDNS0 padding
+		msg := dns.Msg{Data: packet}
 		if err := msg.Unpack(); err != nil {
 			writer.WriteHeader(400)
 			return
 		}
 
-		response, err = addEDNS0PaddingIfNoneFound(msg, response, padLen)
+		response, err = addEDNS0PaddingIfNoneFound(&msg, response, padLen)
 		if err != nil {
 			dlog.Critical(err)
 			writer.WriteHeader(500)
@@ -247,7 +242,7 @@ func (proxy *Proxy) localDoHListener(acceptPc *net.TCPListener) {
 func dohPaddedLen(unpaddedLen int) int {
 	// Static array allows compiler to vectorize boundary checks in Go 1.26
 	// Array is preferred over slice for const propagation
-	boundaries := [18]int{
+	boundaries := [17]int{
 		64, 128, 192, 256, 320, 384, 512, 704, 768,
 		896, 960, 1024, 1088, 1152, 2688, 4080, MaxDNSPacketSize,
 	}
