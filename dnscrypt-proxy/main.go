@@ -68,11 +68,11 @@ func main() {
     if *cpuProfile != "" {
         f, err := os.Create(*cpuProfile)
         if err != nil {
-            dlog.Fatal("could not create CPU profile: ", err)
+            dlog.Fatalf("could not create CPU profile: %v", err)
         }
         defer f.Close()
         if err := pprof.StartCPUProfile(f); err != nil {
-            dlog.Fatal("could not start CPU profile: ", err)
+            dlog.Fatalf("could not start CPU profile: %v", err)
         }
         defer pprof.StopCPUProfile()
     }
