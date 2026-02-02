@@ -38,13 +38,13 @@ jobs:
           go get github.com/davecgh/go-spew
           go mod tidy
           go build \
+            -cpuprofile=cpu.pprof \
             -mod=mod \
             -trimpath \
             -tags="netgo,osusergo" \
             -ldflags="-s -w -extldflags '-static'" \
             -o dnscrypt-proxy \
             ./dnscrypt-proxy
-            -cpuprofile=cpu.pprof
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v6
