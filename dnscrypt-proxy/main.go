@@ -12,6 +12,7 @@ import (
 
     "github.com/jedisct1/dlog"
     "github.com/kardianos/service"
+    "runtime/pprof"
 )
 
 const (
@@ -25,6 +26,9 @@ type App struct {
 }
 
 func main() {
+    // PGO: CPU profiling support
+    cpuProfile := flag.String("cpuprofile", "", "write cpu profile to file")
+
     if runtime.GOOS == "linux" {
         _ = syscall.Setpriority(syscall.PRIO_PROCESS, 0, -10)
     }
@@ -59,6 +63,19 @@ func main() {
     flags.ShowCerts = flag.Bool("show-certs", false, "print DoH certificate chain hashes")
 
     flag.Parse()
+
+    // Start CPU profiling if enabled
+    if *cpuProfile != "" {
+        f, err := os.Create(*cpuProfile)
+        if err != nil {
+            dlog.Fatal("could not create CPU profile: ", err)
+        }
+        defer f.Close()
+        if err := pprof.StartCPUProfile(f); err != nil {
+            dlog.Fatal("could not start CPU profile: ", err)
+        }
+        defer pprof.StopCPUProfile()
+    }
 
     if *version {
         fmt.Println(AppVersion)
