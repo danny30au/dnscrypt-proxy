@@ -57,7 +57,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unsafe"
 
 	"github.com/jedisct1/dlog"
 	clocksmith "github.com/jedisct1/go-clocksmith"
@@ -70,8 +69,8 @@ import (
 // CACHE-ALIGNED STRUCTURES FOR SIMD & CPU CACHE OPTIMIZATION
 // =============================================================================
 
-// Cache line size for modern CPUs (x86-64, ARM64)
-const cacheLineSize = 64
+// Note: cacheLineSize is already defined in ipcrypt.go (64 bytes)
+// We reuse that constant throughout
 
 // Optimization: Reuse buffers to reduce GC pressure
 // Green Tea GC optimized buffer pool
@@ -83,7 +82,7 @@ var packetBufferPool = sync.Pool{
 	New: func() any {
 		// Allocate with cache line alignment + extra capacity
 		// Small allocations (<512 bytes) use specialized allocators in Go 1.26
-		b := make([]byte, MaxDNSPacketSize, MaxDNSPacketSize+cacheLineSize)
+		b := make([]byte, MaxDNSPacketSize, MaxDNSPacketSize+64)
 		return &b
 	},
 }
@@ -106,12 +105,11 @@ type queryJob struct {
 }
 
 // Stats update for batching
-// Green Tea GC: Tiny struct (24 bytes), vectorized scanning friendly
-// Aligned to 8-byte boundary for SIMD operations
+// Green Tea GC: Tiny struct (16 bytes), vectorized scanning friendly
+// Compact layout without explicit padding for better packing
 type statsUpdate struct {
 	serverName string // 16 bytes (string header)
 	success    bool   // 1 byte
-	_          [7]byte // Explicit padding to 24 bytes (cache-friendly)
 }
 
 // Proxy structure with optimized field ordering
@@ -410,7 +408,8 @@ func (proxy *Proxy) initWorkerPool() {
 	proxy.workerPool = make(chan *queryJob, proxy.numWorkers*2)
 
 	// Spawn workers - Go 1.26 Green Tea GC handles this efficiently
-	for i := range proxy.numWorkers { // Go 1.23+ range-over-int syntax
+	// Use blank identifier for unused loop variable
+	for range proxy.numWorkers { // Go 1.23+ range-over-int syntax
 		go proxy.queryWorker()
 	}
 	dlog.Noticef("Initialized worker pool with %d workers", proxy.numWorkers)
@@ -1274,10 +1273,13 @@ func (proxy *Proxy) processIncomingQuery(
 			pluginsState.serverName = serverName
 			exchangeResponse, err := handleDNSExchange(proxy, serverInfo, &pluginsState, query, serverProto)
 
-			// Batch stats update
+			// Batch stats update - fixed struct literal
 			success := (err == nil && exchangeResponse != nil)
 			select {
-			case proxy.statsBatchChan <- statsUpdate{serverName, success}:
+			case proxy.statsBatchChan <- statsUpdate{
+				serverName: serverName,
+				success:    success,
+			}:
 			default:
 				// Channel full - skip stats update
 			}
