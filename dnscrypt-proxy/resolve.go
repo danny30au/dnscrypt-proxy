@@ -12,7 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	_ "unsafe" // For go:linkname
+	"unsafe" // For go:linkname
 
 	"codeberg.org/miekg/dns"
 	"codeberg.org/miekg/dns/svcb"
