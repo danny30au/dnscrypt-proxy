@@ -20,7 +20,7 @@ const (
     nonexistentName string = "nonexistent-zone.dnscrypt-test."
 )
 
-// Resolver holds reusable client state to avoid per-query allocations
+// Resolver holds reusable client state to avoid per-query allocations.
 type Resolver struct {
     server    string
     transport *dns.Transport
@@ -28,7 +28,7 @@ type Resolver struct {
     ecsOpt    *dns.SUBNET // pre-built ECS option
 }
 
-// NewResolver creates a reusable resolver instance
+// NewResolver creates a reusable resolver instance.
 func NewResolver(server string, sendClientSubnet bool) *Resolver {
     tr := dns.NewTransport()
     tr.ReadTimeout = 1500 * time.Millisecond
@@ -60,7 +60,7 @@ func NewResolver(server string, sendClientSubnet bool) *Resolver {
     }
 }
 
-// resolveQuery performs a DNS query with automatic TCP fallback on truncation
+// resolveQuery performs a DNS query with automatic TCP fallback on truncation.
 func (r *Resolver) resolveQuery(
     ctx context.Context,
     qName string,
@@ -83,7 +83,7 @@ func (r *Resolver) resolveQuery(
         msg.Pseudo = msg.Pseudo[:0]
     }
 
-    // Retry with bounded timeout growth
+    // Retry with bounded timeout growth.
     timeout := r.transport.ReadTimeout
 
     for attempt := 0; attempt < 2; attempt++ {
@@ -94,7 +94,7 @@ func (r *Resolver) resolveQuery(
         response, _, err := r.client.Exchange(queryCtx, msg, "udp", r.server)
         cancel()
 
-        // TCP fallback on truncation
+        // TCP fallback on truncation.
         if err == nil && response != nil && response.Truncated {
             msg.ID = dns.ID()
             msg.Data = nil
@@ -120,7 +120,7 @@ func (r *Resolver) resolveQuery(
     return nil, errors.New("timeout")
 }
 
-// parallelQueries executes multiple DNS queries concurrently
+// parallelQueries executes multiple DNS queries concurrently.
 func (r *Resolver) parallelQueries(
     ctx context.Context,
     qName string,
@@ -258,7 +258,7 @@ func Resolve(server string, name string, singleResolver bool) {
     cname := name
     var clientSubnet string
 
-    // Resolver identification with parallel PTR lookups
+    // Resolver identification with parallel PTR lookups.
     for once := true; once; once = false {
         infos, err := resolveResolverInfo(ctx, resolver, &clientSubnet)
         if err != nil {
@@ -324,7 +324,7 @@ func Resolve(server string, name string, singleResolver bool) {
 
     fmt.Println("")
 
-    // CNAME resolution with early exit
+    // CNAME resolution with early exit.
 cnameLoop:
     for once := true; once; once = false {
         fmt.Printf("Canonical name: ")
@@ -352,7 +352,7 @@ cnameLoop:
 
     fmt.Println("")
 
-    // Parallel A/AAAA queries
+    // Parallel A/AAAA queries.
     ipQueries := resolver.parallelQueries(ctx, cname, []uint16{dns.TypeA, dns.TypeAAAA})
 
     fmt.Printf("IPv4 addresses: ")
@@ -391,12 +391,12 @@ cnameLoop:
 
     fmt.Println("")
 
-    // Parallel record queries (NS/MX/HTTPS/HINFO/TXT)
+    // Parallel record queries (NS/MX/HTTPS/HINFO/TXT).
     recordQueries := resolver.parallelQueries(ctx, cname, []uint16{
         dns.TypeNS, dns.TypeMX, dns.TypeHTTPS, dns.TypeHINFO, dns.TypeTXT,
     })
 
-    // Name servers
+    // Name servers.
     fmt.Printf("Name servers  : ")
     if response, ok := recordQueries[dns.TypeNS]; ok {
         nss := make([]string, 0, len(response.Answer))
@@ -424,11 +424,10 @@ cnameLoop:
         }
     } else {
         fmt.Println("-")
-        fmt.Printf("DNSSEC signed : -
-")
+        fmt.Println("DNSSEC signed : -")
     }
 
-    // Mail servers
+    // Mail servers.
     fmt.Printf("Mail servers  : ")
     if response, ok := recordQueries[dns.TypeMX]; ok {
         mxs := make([]string, 0, len(response.Answer))
@@ -452,7 +451,7 @@ cnameLoop:
 
     fmt.Println("")
 
-    // HTTPS records
+    // HTTPS records.
     fmt.Printf("HTTPS alias   : ")
     if response, ok := recordQueries[dns.TypeHTTPS]; ok {
         aliases := make([]string, 0, len(response.Answer))
@@ -496,13 +495,12 @@ cnameLoop:
         }
     } else {
         fmt.Println("-")
-        fmt.Printf("HTTPS info    : -
-")
+        fmt.Println("HTTPS info    : -")
     }
 
     fmt.Println("")
 
-    // Host info
+    // Host info.
     fmt.Printf("Host info     : ")
     if response, ok := recordQueries[dns.TypeHINFO]; ok {
         hinfo := make([]string, 0, len(response.Answer))
@@ -526,7 +524,7 @@ cnameLoop:
         fmt.Println("-")
     }
 
-    // TXT records
+    // TXT records.
     fmt.Printf("TXT records   : ")
     if response, ok := recordQueries[dns.TypeTXT]; ok {
         txt := make([]string, 0, len(response.Answer))
