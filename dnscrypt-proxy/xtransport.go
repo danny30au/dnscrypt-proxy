@@ -34,6 +34,11 @@ netproxy "golang.org/x/net/proxy"
 "golang.org/x/sys/cpu"
 )
 
+
+var fnvPool = sync.Pool{
+    New: func() any { return fnv.New64a() },
+}
+
 var (
 protoTCPFirst = []string{"tcp", "udp"}
 protoUDPFirst = []string{"udp", "tcp"}
@@ -243,53 +248,64 @@ return net.ParseIP(s)
 }
 
 func uniqueNormalizedIPs(ips []net.IP) []net.IP {
-if len(ips) == 0 {
-return nil
+    n := len(ips)
+    if n == 0 {
+        return nil
+    }
+
+    if n <= 4 {
+        var seenStack [4][16]byte
+        seen := seenStack[:0:4]
+        unique := make([]net.IP, 0, n)
+
+        for _, ip := range ips {
+            if ip == nil {
+                continue
+            }
+            v16 := ip.To16()
+            if v16 == nil {
+                continue
+            }
+            var key [16]byte
+            copy(key[:], v16)
+
+            found := false
+            for i := range seen {
+                if seen[i] == key {
+                    found = True
+                    break
+                }
+            }
+            if !found {
+                seen = append(seen, key)
+                unique = append(unique, append(net.IP(nil), v16...))
+            }
+        }
+        return unique
+    }
+
+    seen := make(map[[16]byte]struct{}, n)
+    unique := make([]net.IP, 0, n)
+
+    for _, ip := range ips {
+        if ip == nil {
+            continue
+        }
+        v16 := ip.To16()
+        if v16 == nil {
+            continue
+        }
+        var key [16]byte
+        copy(key[:], v16)
+        if _, exists := seen[key]; !exists {
+            seen[key] = struct{}{}
+            unique = append(unique, append(net.IP(nil), v16...))
+        }
+    }
+    return unique
 }
 
-if len(ips) <= 4 {
-var seenStack [4][16]byte
-seen := seenStack[:0:4]
-unique := make([]net.IP, 0, len(ips))
 
-for _, ip := range ips {
-if ip == nil {
-continue
-}
-var key [16]byte
-copy(key[:], ip.To16())
-
-found := false
-for i := range seen {
-if seen[i] == key {
-found = true
-break
-}
-}
-if !found {
-seen = append(seen, key)
-unique = append(unique, append(net.IP(nil), ip...))
-}
-}
-return unique
-}
-
-seen := make(map[[16]byte]struct{}, len(ips))
-unique := make([]net.IP, 0, len(ips))
-
-for _, ip := range ips {
-if ip == nil {
-continue
-}
-var key [16]byte
-copy(key[:], ip.To16())
-if _, exists := seen[key]; !exists {
-seen[key] = struct{}{}
-unique = append(unique, append(net.IP(nil), ip...))
-}
-}
-return unique
-}
 
 func formatEndpoint(ip net.IP, port int) string {
 if ip == nil {
@@ -387,16 +403,19 @@ return ips, expired, updating
 }
 
 func (xTransport *XTransport) cleanupExpiredCache() {
-gen := xTransport.cachedIPs.generation.Add(1)
-dlog.Debugf("Cache cleanup cycle %d started", gen)
-xTransport.cachedIPs.cache.Range(func(key, value interface{}) bool {
-item := value.(*CachedIPItem)
-if item.expiration != nil && time.Now().After(*item.expiration) {
-xTransport.cachedIPs.cache.Delete(key)
+    gen := xTransport.cachedIPs.generation.Add(1)
+    dlog.Debugf("Cache cleanup cycle %d started", gen)
+    now := time.Now()
+    xTransport.cachedIPs.cache.Range(func(key, value interface{}) bool {
+        item := value.(*CachedIPItem)
+        if item.expiration != nil && now.After(*item.expiration) {
+            xTransport.cachedIPs.cache.Delete(key)
+        }
+        return true
+    })
 }
-return true
-})
-}
+
+
 
 func (xTransport *XTransport) getGzipReader(r io.Reader) (*gzip.Reader, error) {
 gr := xTransport.gzipPool.Get().(*gzip.Reader)
@@ -539,13 +558,14 @@ targets = append(targets, net.JoinHostPort(host, strconv.Itoa(port)))
 }
 }
 
-dial := func(address string) (net.Conn, error) {
-if xTransport.proxyDialer == nil {
 dialer := &net.Dialer{
 Timeout:   timeout,
 KeepAlive: 15 * time.Second,
 DualStack: true,
 }
+
+dial := func(address string) (net.Conn, error) {
+if xTransport.proxyDialer == nil {
 conn, err := dialer.DialContext(ctx, network, address)
 if err == nil {
 if tcpConn, ok := conn.(*net.TCPConn); ok {
@@ -895,18 +915,13 @@ defer xTransport.dnsClientPool.Put(dnsClient)
 
 for _, qType := range queryTypes {
 go func(qt uint16) {
-msg := dns.NewMsg(fqdn(host), qt)
-if msg == nil {
-select {
-case results <- queryResult{ips: nil, ttl: 0, err: errors.New("failed to create DNS message")}:
-case <-ctx.Done():
-}
-return
-}
-
+msg := xTransport.dnsMessagePool.Get()
+msg.SetQuestion(fqdn(host), qt)
 msg.RecursionDesired = true
 msg.UDPSize = uint16(MaxDNSPacketSize)
 msg.Security = true
+
+defer xTransport.dnsMessagePool.Put(msg)
 
 var qIPs []net.IP
 var qTTL uint32
@@ -939,7 +954,6 @@ case <-ctx.Done():
 }
 
 collectedIPs := make([]net.IP, 0, len(queryTypes)*2)
-collectedIPs = slices.Grow(collectedIPs, len(queryTypes)*2)
 var minTTL time.Duration
 var lastErr error
 
