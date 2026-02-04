@@ -3,6 +3,7 @@
 package main
 
 import (
+"fmt"
 "net"
 "slices"
 "syscall"
@@ -22,13 +23,12 @@ dlog.Fatal(
 )
 }
 dlog.Warn("Systemd sockets are untested and unsupported - use at your own risk")
-// Pre-allocate slice to avoid resizing overhead
 proxy.listenAddresses = make([]string, 0, numFiles)
 }
 
+successCount := 0
+
 for i, file := range files {
-// Optimize: Check socket type directly to avoid failed duplications and syscall overhead
-// from net.FileListener/FilePacketConn on mismatched types.
 fd := int(file.Fd())
 soType, err := syscall.GetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_TYPE)
 if err != nil {
@@ -42,25 +42,21 @@ var regErr error
 
 switch soType {
 case syscall.SOCK_STREAM:
-// Handle TCP (and potentially Unix) streams
 if listener, err := net.FileListener(file); err == nil {
-// Safety: Ensure it is actually a TCP listener before casting
 if tcpListener, ok := listener.(*net.TCPListener); ok {
 proxy.registerTCPListener(tcpListener)
 listenAddress = tcpListener.Addr().String()
 dlog.Noticef("Wiring systemd TCP socket #%d, %s, %s", i, file.Name(), listenAddress)
 } else {
 dlog.Warnf("Systemd socket #%d is a stream but not TCP (likely Unix socket). Skipping.", i)
-listener.Close() // Close the dup'd listener we just created
+listener.Close()
 }
 } else {
 regErr = err
 }
 
 case syscall.SOCK_DGRAM:
-// Handle UDP datagrams
 if pc, err := net.FilePacketConn(file); err == nil {
-// Safety: Ensure it is actually a UDP connection
 if udpConn, ok := pc.(*net.UDPConn); ok {
 proxy.registerUDPListener(udpConn)
 listenAddress = udpConn.LocalAddr().String()
@@ -81,14 +77,18 @@ if regErr != nil {
 dlog.Warnf("Failed to create listener for systemd socket #%d: %v", i, regErr)
 }
 
-// Update listen addresses if valid
-if len(listenAddress) > 0 && !slices.Contains(proxy.listenAddresses, listenAddress) {
+if len(listenAddress) > 0 {
+if !slices.Contains(proxy.listenAddresses, listenAddress) {
 proxy.listenAddresses = append(proxy.listenAddresses, listenAddress)
 }
+successCount++
+}
 
-// Critical: Close the original file descriptor immediately after processing
-// This releases the FD resource back to the OS without waiting for the loop to finish.
 file.Close()
+}
+
+if numFiles > 0 && successCount == 0 {
+return fmt.Errorf("failed to register any systemd sockets (%d provided)", numFiles)
 }
 
 return nil
