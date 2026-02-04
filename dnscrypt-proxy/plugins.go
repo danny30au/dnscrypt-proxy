@@ -4,19 +4,97 @@ import (
     "errors"
     "net"
     "strings"
-    "sync/atomic"
+    "sync"
     "time"
 
     "codeberg.org/miekg/dns"
     "github.com/jedisct1/dlog"
 )
 
-// Note: Types PluginsAction, PluginsReturnCode, Plugin, PluginsGlobals, and PluginsState
-// are declared in plugin.go - this file contains only the optimized implementations
+type PluginsAction int
 
-// InitPluginsGlobals: Optimized with Go 1.26 features and parallel initialization
+const (
+    PluginsActionNone     = 0
+    PluginsActionContinue = 1
+    PluginsActionDrop     = 2
+    PluginsActionReject   = 3
+    PluginsActionSynth    = 4
+)
+
+type PluginsGlobals struct {
+    sync.RWMutex
+    queryPlugins           *[]Plugin
+    responsePlugins        *[]Plugin
+    loggingPlugins         *[]Plugin
+    refusedCodeInResponses bool
+    respondWithIPv4        net.IP
+    respondWithIPv6        net.IP
+}
+
+type PluginsReturnCode int
+
+const (
+    PluginsReturnCodePass = iota
+    PluginsReturnCodeForward
+    PluginsReturnCodeDrop
+    PluginsReturnCodeReject
+    PluginsReturnCodeSynth
+    PluginsReturnCodeParseError
+    PluginsReturnCodeNXDomain
+    PluginsReturnCodeResponseError
+    PluginsReturnCodeServFail
+    PluginsReturnCodeNetworkError
+    PluginsReturnCodeCloak
+    PluginsReturnCodeServerTimeout
+    PluginsReturnCodeNotReady
+)
+
+var PluginsReturnCodeToString = map[PluginsReturnCode]string{
+    PluginsReturnCodePass:          "PASS",
+    PluginsReturnCodeForward:       "FORWARD",
+    PluginsReturnCodeDrop:          "DROP",
+    PluginsReturnCodeReject:        "REJECT",
+    PluginsReturnCodeSynth:         "SYNTH",
+    PluginsReturnCodeParseError:    "PARSE_ERROR",
+    PluginsReturnCodeNXDomain:      "NXDOMAIN",
+    PluginsReturnCodeResponseError: "RESPONSE_ERROR",
+    PluginsReturnCodeServFail:      "SERVFAIL",
+    PluginsReturnCodeNetworkError:  "NETWORK_ERROR",
+    PluginsReturnCodeCloak:         "CLOAK",
+    PluginsReturnCodeServerTimeout: "SERVER_TIMEOUT",
+    PluginsReturnCodeNotReady:      "NOT_READY",
+}
+
+type PluginsState struct {
+    requestStart                     time.Time
+    requestEnd                       time.Time
+    clientProto                      string
+    serverName                       string
+    serverProto                      string
+    qName                            string
+    clientAddr                       *net.Addr
+    synthResponse                    *dns.Msg
+    questionMsg                      *dns.Msg
+    xTransport                       *XTransport
+    sessionData                      map[string]interface{}
+    action                           PluginsAction
+    timeout                          time.Duration
+    returnCode                       PluginsReturnCode
+    maxPayloadSize                   int
+    cacheSize                        int
+    originalMaxPayloadSize           int
+    maxUnencryptedUDPSafePayloadSize int
+    rejectTTL                        uint32
+    cacheMaxTTL                      uint32
+    cacheNegMaxTTL                   uint32
+    cacheNegMinTTL                   uint32
+    cacheMinTTL                      uint32
+    cacheHit                         bool
+    dnssec                           bool
+}
+
 func (proxy *Proxy) InitPluginsGlobals() error {
-    // Pre-allocate with exact capacity to avoid reallocation
+    // Pre-allocate with estimated capacity to reduce reallocation
     queryPlugins := make([]Plugin, 0, 13)
 
     // Use Go 1.26's new(expr) for cleaner pointer initialization
@@ -83,54 +161,23 @@ func (proxy *Proxy) InitPluginsGlobals() error {
         loggingPlugins = append(loggingPlugins, new(PluginQueryLog))
     }
 
-    // Parallel plugin initialization for faster startup
-    type initResult struct {
-        err error
-        idx int
+    // Initialize plugins sequentially (parallel would require modification of plugin.Init)
+    for i := range queryPlugins {
+        if err := queryPlugins[i].Init(proxy); err != nil {
+            return err
+        }
     }
-
-    totalPlugins := len(queryPlugins) + len(responsePlugins) + len(loggingPlugins)
-    if totalPlugins == 0 {
-        proxy.pluginsGlobals.queryPlugins = &queryPlugins
-        proxy.pluginsGlobals.responsePlugins = &responsePlugins
-        proxy.pluginsGlobals.loggingPlugins = &loggingPlugins
-        parseBlockedQueryResponse(proxy.blockedQueryResponse, &proxy.pluginsGlobals)
-        return nil
+    for i := range responsePlugins {
+        if err := responsePlugins[i].Init(proxy); err != nil {
+            return err
+        }
     }
-
-    errChan := make(chan initResult, totalPlugins)
-
-    // Initialize query plugins concurrently
-    for i, plugin := range queryPlugins {
-        go func(idx int, p Plugin) {
-            errChan <- initResult{p.Init(proxy), idx}
-        }(i, plugin)
-    }
-
-    // Initialize response plugins concurrently
-    offset := len(queryPlugins)
-    for i, plugin := range responsePlugins {
-        go func(idx int, p Plugin) {
-            errChan <- initResult{p.Init(proxy), offset + idx}
-        }(i, plugin)
-    }
-
-    // Initialize logging plugins concurrently
-    offset += len(responsePlugins)
-    for i, plugin := range loggingPlugins {
-        go func(idx int, p Plugin) {
-            errChan <- initResult{p.Init(proxy), offset + idx}
-        }(i, plugin)
-    }
-
-    // Collect results and check for errors
-    for range totalPlugins {
-        if result := <-errChan; result.err != nil {
-            return result.err
+    for i := range loggingPlugins {
+        if err := loggingPlugins[i].Init(proxy); err != nil {
+            return err
         }
     }
 
-    // Store plugin slices
     proxy.pluginsGlobals.queryPlugins = &queryPlugins
     proxy.pluginsGlobals.responsePlugins = &responsePlugins
     proxy.pluginsGlobals.loggingPlugins = &loggingPlugins
@@ -140,15 +187,14 @@ func (proxy *Proxy) InitPluginsGlobals() error {
     return nil
 }
 
-// parseBlockedQueryResponse: Optimized string processing
+// blockedQueryResponse can be 'refused', 'hinfo' or IP responses 'a:IPv4,aaaa:IPv6
 func parseBlockedQueryResponse(blockedResponse string, pluginsGlobals *PluginsGlobals) {
-    // Optimize: combine operations to reduce allocations
-    blockedResponse = strings.ToLower(strings.ReplaceAll(blockedResponse, " ", ""))
+    blockedResponse = StringStripSpaces(strings.ToLower(blockedResponse))
 
     if strings.HasPrefix(blockedResponse, "a:") {
-        // Use SplitN to limit allocations (max 2 parts)
+        // Use SplitN to limit allocations (max 2 parts needed)
         blockedIPStrings := strings.SplitN(blockedResponse, ",", 2)
-        pluginsGlobals.respondWithIPv4 = net.ParseIP(blockedIPStrings[0][2:]) // Skip "a:"
+        pluginsGlobals.respondWithIPv4 = net.ParseIP(strings.TrimPrefix(blockedIPStrings[0], "a:"))
 
         if pluginsGlobals.respondWithIPv4 == nil {
             dlog.Notice("Error parsing IPv4 response given in blocked_query_response option, defaulting to `hinfo`")
@@ -156,15 +202,22 @@ func parseBlockedQueryResponse(blockedResponse string, pluginsGlobals *PluginsGl
             return
         }
 
-        if len(blockedIPStrings) > 1 && strings.HasPrefix(blockedIPStrings[1], "aaaa:") {
-            ipv6Response := strings.Trim(strings.TrimPrefix(blockedIPStrings[1], "aaaa:"), "[]")
-            pluginsGlobals.respondWithIPv6 = net.ParseIP(ipv6Response)
+        if len(blockedIPStrings) > 1 {
+            if strings.HasPrefix(blockedIPStrings[1], "aaaa:") {
+                ipv6Response := strings.TrimPrefix(blockedIPStrings[1], "aaaa:")
+                if strings.HasPrefix(ipv6Response, "[") {
+                    ipv6Response = strings.Trim(ipv6Response, "[]")
+                }
+                pluginsGlobals.respondWithIPv6 = net.ParseIP(ipv6Response)
 
-            if pluginsGlobals.respondWithIPv6 == nil {
-                dlog.Notice("Error parsing IPv6 response given in blocked_query_response option, defaulting to IPv4")
+                if pluginsGlobals.respondWithIPv6 == nil {
+                    dlog.Notice(
+                        "Error parsing IPv6 response given in blocked_query_response option, defaulting to IPv4",
+                    )
+                }
+            } else {
+                dlog.Noticef("Invalid IPv6 response given in blocked_query_response option [%s], the option should take the form 'a:<IPv4>,aaaa:<IPv6>'", blockedIPStrings[1])
             }
-        } else if len(blockedIPStrings) > 1 {
-            dlog.Noticef("Invalid IPv6 response given in blocked_query_response option [%s], the option should take the form 'a:<IPv4>,aaaa:<IPv6>'", blockedIPStrings[1])
         }
 
         if pluginsGlobals.respondWithIPv6 == nil {
@@ -183,7 +236,15 @@ func parseBlockedQueryResponse(blockedResponse string, pluginsGlobals *PluginsGl
     }
 }
 
-// NewPluginsState: Optimized initialization with pre-allocated map
+type Plugin interface {
+    Name() string
+    Description() string
+    Init(proxy *Proxy) error
+    Drop() error
+    Reload() error
+    Eval(pluginsState *PluginsState, msg *dns.Msg) error
+}
+
 func NewPluginsState(
     proxy *Proxy,
     clientProto string,
@@ -210,12 +271,11 @@ func NewPluginsState(
         timeout:                          proxy.timeout,
         requestStart:                     start,
         maxUnencryptedUDPSafePayloadSize: MaxDNSUDPSafePacketSize,
-        sessionData:                      make(map[string]interface{}, 4),
+        sessionData:                      make(map[string]interface{}),
         xTransport:                       proxy.xTransport,
     }
 }
 
-// ApplyQueryPlugins: Optimized implementation
 func (pluginsState *PluginsState) ApplyQueryPlugins(
     pluginsGlobals *PluginsGlobals,
     packet []byte,
@@ -228,20 +288,16 @@ func (pluginsState *PluginsState) ApplyQueryPlugins(
     if len(msg.Question) != 1 {
         return packet, errors.New("unexpected number of questions")
     }
-
     qName, err := NormalizeQName(msg.Question[0].Header().Name)
     if err != nil {
         return packet, err
     }
-
     dlog.Debugf("Handling query for [%v]", qName)
     pluginsState.qName = qName
     pluginsState.questionMsg = &msg
-
-    // Optimized: check length before locking
     if len(*pluginsGlobals.queryPlugins) > 0 {
         pluginsGlobals.RLock()
-        // Index-based iteration avoids slice header copy
+        // Index-based iteration for better performance
         plugins := *pluginsGlobals.queryPlugins
         for i := range plugins {
             if err := plugins[i].Eval(pluginsState, &msg); err != nil {
@@ -250,7 +306,6 @@ func (pluginsState *PluginsState) ApplyQueryPlugins(
                 pluginsGlobals.RUnlock()
                 return packet, err
             }
-
             if pluginsState.action == PluginsActionReject {
                 synth := RefusedResponseFromMessage(
                     &msg,
@@ -261,34 +316,29 @@ func (pluginsState *PluginsState) ApplyQueryPlugins(
                 )
                 pluginsState.synthResponse = synth
             }
-
             if pluginsState.action != PluginsActionContinue {
                 break
             }
         }
         pluginsGlobals.RUnlock()
     }
-
     if err := msg.Pack(); err != nil {
         return packet, err
     }
     packet2 := msg.Data
-
     // Only get server info if we're continuing and need padding
     if pluginsState.action == PluginsActionContinue && getServerInfo != nil {
-        if _, needsEDNS0Padding := getServerInfo(); needsEDNS0Padding {
-            // Optimized bit manipulation for padding calculation
+        _, needsEDNS0Padding := getServerInfo()
+        if needsEDNS0Padding {
             padLen := 63 - ((len(packet2) + 63) & 63)
             if paddedPacket2, _ := addEDNS0PaddingIfNoneFound(&msg, packet2, padLen); paddedPacket2 != nil {
                 return paddedPacket2, nil
             }
         }
     }
-
     return packet2, nil
 }
 
-// ApplyResponsePlugins: Optimized implementation
 func (pluginsState *PluginsState) ApplyResponsePlugins(
     pluginsGlobals *PluginsGlobals,
     packet []byte,
@@ -300,8 +350,6 @@ func (pluginsState *PluginsState) ApplyResponsePlugins(
         }
         return packet, err
     }
-
-    // Fast rcode mapping
     switch Rcode(packet) {
     case dns.RcodeSuccess:
         pluginsState.returnCode = PluginsReturnCodePass
@@ -312,10 +360,7 @@ func (pluginsState *PluginsState) ApplyResponsePlugins(
     default:
         pluginsState.returnCode = PluginsReturnCodeResponseError
     }
-
     removeEDNS0Options(&msg)
-
-    // Optimized: check length before locking
     if len(*pluginsGlobals.responsePlugins) > 0 {
         pluginsGlobals.RLock()
         plugins := *pluginsGlobals.responsePlugins
@@ -326,7 +371,6 @@ func (pluginsState *PluginsState) ApplyResponsePlugins(
                 pluginsGlobals.RUnlock()
                 return packet, err
             }
-
             if pluginsState.action == PluginsActionReject {
                 synth := RefusedResponseFromMessage(
                     &msg,
@@ -337,35 +381,29 @@ func (pluginsState *PluginsState) ApplyResponsePlugins(
                 )
                 pluginsState.synthResponse = synth
             }
-
             if pluginsState.action != PluginsActionContinue {
                 break
             }
         }
         pluginsGlobals.RUnlock()
     }
-
     if err := msg.Pack(); err != nil {
         return packet, err
     }
     return msg.Data, nil
 }
 
-// ApplyLoggingPlugins: Optimized implementation
 func (pluginsState *PluginsState) ApplyLoggingPlugins(pluginsGlobals *PluginsGlobals) error {
     if len(*pluginsGlobals.loggingPlugins) == 0 {
         return nil
     }
-
     pluginsState.requestEnd = time.Now()
     questionMsg := pluginsState.questionMsg
     if questionMsg == nil {
         return errors.New("question not found")
     }
-
     pluginsGlobals.RLock()
     defer pluginsGlobals.RUnlock()
-
     plugins := *pluginsGlobals.loggingPlugins
     for i := range plugins {
         if err := plugins[i].Eval(pluginsState, questionMsg); err != nil {
