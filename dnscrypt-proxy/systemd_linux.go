@@ -12,6 +12,11 @@ import (
 "github.com/jedisct1/dlog"
 )
 
+const (
+// SO_REUSEPORT may not be defined in syscall package on all platforms
+SO_REUSEPORT = 0xf
+)
+
 func (proxy *Proxy) addSystemDListeners() error {
 files := activation.Files(true)
 numFiles := len(files)
@@ -71,7 +76,7 @@ socketOptErrors++
 }
 
 // Check if SO_REUSEPORT is enabled (multi-instance load balancing)
-if val, err := syscall.GetsockoptInt(fdInt, syscall.SOL_SOCKET, syscall.SO_REUSEPORT); err == nil && val != 0 {
+if val, err := syscall.GetsockoptInt(fdInt, syscall.SOL_SOCKET, SO_REUSEPORT); err == nil && val != 0 {
 dlog.Noticef("Socket #%d has SO_REUSEPORT enabled (multi-instance mode)", i)
 }
 
