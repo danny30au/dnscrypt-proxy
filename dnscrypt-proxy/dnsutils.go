@@ -39,7 +39,7 @@ var httpTransport = &http.Transport{
 	DisableCompression:    true,
 	ForceAttemptHTTP2:     true,
 	TLSClientConfig: &tls.Config{
-		MinVersion:         tls.VersionTLS12,
+		MinVersion:         tls.VersionTLS13,
 		ClientSessionCache: tls.NewLRUClientSessionCache(128),
 	},
 }
