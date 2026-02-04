@@ -33,14 +33,6 @@ for i, file := range files {
 defer file.Close()
 
 fd := int(file.Fd())
-
-// Verify non-blocking mode (systemd should set this via NonBlocking=true)
-if flags, err := syscall.FcntlInt(uintptr(fd), syscall.F_GETFL, 0); err == nil {
-if (flags & syscall.O_NONBLOCK) == 0 {
-dlog.Warnf("Systemd socket #%d is blocking (expected non-blocking)", i)
-}
-}
-
 soType, err := syscall.GetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_TYPE)
 if err != nil {
 dlog.Warnf("Failed to inspect systemd socket #%d: %v", i, err)
@@ -56,9 +48,13 @@ switch soType {
 case syscall.SOCK_STREAM:
 if listener, err := net.FileListener(file); err == nil {
 if tcpListener, ok := listener.(*net.TCPListener); ok {
-// Enable TCP_NODELAY for low-latency DNS-over-TCP responses
-if err := tcpListener.SetNoDelay(true); err != nil {
+// Enable TCP_NODELAY on the underlying socket for low-latency DNS-over-TCP
+if rawConn, err := tcpListener.SyscallConn(); err == nil {
+rawConn.Control(func(fd uintptr) {
+if err := syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1); err != nil {
 dlog.Warnf("Failed to set TCP_NODELAY on socket #%d: %v", i, err)
+}
+})
 }
 
 proxy.registerTCPListener(tcpListener)
