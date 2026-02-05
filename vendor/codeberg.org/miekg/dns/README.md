@@ -61,6 +61,8 @@ For developers please read the
     - On my Dell XPS 17 (Intel) it is similar-ish (~300K/240K qps UDP/TCP).
     - On other Intel/AMD hardware it is lower (~200K (UDP) qps) - yet to understand why.
   - See `cmd/reflect` and do a `go build; make new.txt` to redo the performance test. Requires `dnsperf` to be installed.
+  - Parsing zone files goes by 400K RR/s, meaning the SE (8M RR) zone is parsed in 20s, for NL (6M RRs), this would be
+    15s.
 
 # Users
 
