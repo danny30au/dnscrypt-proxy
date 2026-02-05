@@ -65,7 +65,7 @@ type Lexer struct {
 	column int
 
 	l       Lex
-	cachedL *Lex
+	cachedL *Lex // used when finding a token, but delaying it's return.
 
 	brace  int
 	quote  bool
@@ -421,19 +421,19 @@ func (zl *Lexer) Next() (Lex, bool) {
 
 // Extract the class number from CLASSxx
 func classToInt(token string) (uint16, bool) {
-	class, err := strconv.ParseUint(token[5:], 10, 16)
-	return uint16(class), err == nil
+	class, err := strconv.Atoi(token[5:])
+	return uint16(class), err == nil && class >= 0
 }
 
 // Extract the rr number from TYPExxx. There is no length check, it is assumed the caller has checked the
 // prefix is at least "TYPE" (4)
 func TypeToInt(token string) (uint16, bool) {
-	typ, err := strconv.ParseUint(token[4:], 10, 16)
-	return uint16(typ), err == nil
+	typ, err := strconv.Atoi(token[4:])
+	return uint16(typ), err == nil && typ >= 0
 }
 
-// Remainer eats the rest of the "line".
-func Remainder(c *Lexer) *ScanError {
+// Discard discards the rest of the "line".
+func Discard(c *Lexer) *ScanError {
 	l, _ := c.Next()
 	switch l.Value {
 	case Blank:
@@ -465,6 +465,8 @@ func Tokens(c *Lexer) []string {
 	}
 }
 
+// upperLookup will defer strings.ToUpper in the map lookup, until after the lookup has occured and nothing
+// was found.
 func upperLookup(s string, m map[string]uint16) (uint16, bool) {
 	if t, ok := m[s]; ok {
 		return t, true
@@ -473,6 +475,8 @@ func upperLookup(s string, m map[string]uint16) (uint16, bool) {
 	return t, ok
 }
 
+// typeOrCodeOrClass returns the type, or code, or TYPExxxx, or class, or CLASSxxxx, from the current token in
+// l. The check happens in that order.
 func (zl *Lexer) typeOrCodeOrClass(l *Lex) {
 	if t, ok := upperLookup(l.Token, zl.StringToType); ok {
 		l.Value = Rrtype
@@ -502,7 +506,6 @@ func (zl *Lexer) typeOrCodeOrClass(l *Lex) {
 		return
 	}
 
-	// Check for class
 	if t, ok := zl.StringToClass[l.Token]; ok {
 		l.Value = Class
 		l.Torc = t

@@ -108,11 +108,11 @@ const (
 	TypeMAILA uint16 = 254
 	TypeANY   uint16 = 255
 
-	TypeTA       uint16 = 32768
-	TypeDLV      uint16 = 32769
-	TypeDELEG    uint16 = 65432 // Provisional type.
-	TypeDELEGI   uint16 = 65433 // Provisional type.
-	TypeReserved uint16 = 65535
+	TypeTA         uint16 = 32768
+	TypeDLV        uint16 = 32769
+	TypeDELEG      uint16 = 65432 // Provisional type.
+	TypeDELEGPARAM uint16 = 65433 // Provisional type.
+	TypeReserved   uint16 = 65535
 
 	// valid question classes only.
 	ClassINET   = 1
@@ -1355,9 +1355,9 @@ func (rr *DELEG) String() string {
 	return s
 }
 
-type DELEGI struct{ DELEG }
+type DELEGPARAM struct{ DELEG }
 
-func (rr *DELEGI) String() string {
+func (rr *DELEGPARAM) String() string {
 	sb := sprintHeader(rr)
 	sb.WriteString(rr.DELEG.DELEG.String())
 	s := sb.String()

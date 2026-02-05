@@ -472,7 +472,7 @@ Next:
 
 			if zp.c.Peek().Token == "" {
 				// This is a dynamic update rr.
-				if err := dnslex.Remainder(zp.c); err != nil {
+				if err := dnslex.Discard(zp.c); err != nil {
 					return zp.setParseError(err.Err, err.Lex)
 				}
 
@@ -488,16 +488,17 @@ Next:
 
 			// This needs zparser which calls Parser for new types.
 			if err := parse(parseAsRR, zp.c, zp.origin); err != nil {
+				pe := err.(*ParseError)
 				// err is a concrete *ParseError without the file field set.
 				// The setParseError call below will construct a new
 				// *ParseError with file set to zp.file.
 
 				// err.lex may be nil in which case we substitute our current lex token.
-				if err.lex == (dnslex.Lex{}) {
-					return zp.setParseError(err.err, l)
+				if pe.lex == (dnslex.Lex{}) {
+					return zp.setParseError(pe.err, l)
 				}
 
-				return zp.setParseError(err.err, err.lex)
+				return zp.setParseError(pe.err, pe.lex)
 			}
 
 			if parseAsRFC3597 {
@@ -585,7 +586,7 @@ Next:
 				return zp.setParseError("expecting $TTL value, not this...", l)
 			}
 
-			if err := dnslex.Remainder(zp.c); err != nil {
+			if err := dnslex.Discard(zp.c); err != nil {
 				return zp.setParseError(err.Err, err.Lex)
 			}
 
@@ -602,7 +603,7 @@ Next:
 				return zp.setParseError("expecting $ORIGIN value, not this...", l)
 			}
 
-			if err := dnslex.Remainder(zp.c); err != nil {
+			if err := dnslex.Discard(zp.c); err != nil {
 				return zp.setParseError(err.Err, err.Lex)
 			}
 
@@ -871,7 +872,7 @@ func defaultIncludeAllowFunc(file, include string) bool {
 	return false
 }
 
-func toParseError(err *dnslex.ScanError) *ParseError {
+func toParseError(err *dnslex.ScanError) error {
 	if err == nil {
 		return nil
 	}
