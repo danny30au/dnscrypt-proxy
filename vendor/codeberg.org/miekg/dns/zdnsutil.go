@@ -5,6 +5,8 @@ package dns
 import (
 	"strings"
 	"time"
+
+	"codeberg.org/miekg/dns/internal/dnsstring"
 )
 
 // This is copied to zdnsutil.go in the main package to also have access to these functions and not have an
@@ -180,7 +182,7 @@ func dnsutilTimeToString(t uint32) string {
 // StringToTime translates the RRSIG's incep. and expir. times from string values like "20110403154150" to an 32 bit integer.
 // It takes serial arithmetic (RFC 1982) into account.
 func dnsutilStringToTime(s string) (uint32, error) {
-	t, err := time.Parse("20060102150405", s)
+	t, err := dnsstring.ToTime(s)
 	if err != nil {
 		return 0, err
 	}
