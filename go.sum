@@ -1,5 +1,5 @@
-codeberg.org/miekg/dns v0.6.47 h1:THatiBHlud9prBhlvuuwY/CLNbPXC56jh+qxweo+K4g=
-codeberg.org/miekg/dns v0.6.47/go.mod h1:fIxAzBMDPnXWSw0fp8+pfZMRiAqYY4+HHYLzUo/S6Dg=
+codeberg.org/miekg/dns v0.6.48 h1:+RZiJMKPq5BYjePB7AfTv7O+qf/3Kjsz9C4WmOUHdoA=
+codeberg.org/miekg/dns v0.6.48/go.mod h1:fIxAzBMDPnXWSw0fp8+pfZMRiAqYY4+HHYLzUo/S6Dg=
 github.com/BurntSushi/toml v1.6.0 h1:dRaEfpa2VI55EwlIW72hMRHdWouJeRF7TPYhI+AUQjk=
 github.com/BurntSushi/toml v1.6.0/go.mod h1:ukJfTF/6rtPPRCnwkur4qwRxa8vTRFBF0uk2lLoLwho=
 github.com/VividCortex/ewma v1.2.0 h1:f58SaIzcDXrSy3kWaHNvuJgJ3Nmz59Zji6XoJR/q1ow=
