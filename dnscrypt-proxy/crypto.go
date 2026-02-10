@@ -19,8 +19,7 @@ const (
 	TagSize          = 16
 	PublicKeySize    = 32
 	QueryOverhead    = ClientMagicLen + PublicKeySize + HalfNonceSize + TagSize
-	ResponseOverhead = len(ServerMagic) + NonceSize + TagSize
-) + NonceSize + TagSize
+	ResponseOverhead = len(ServerMagic) + NonceSize + TagSize + NonceSize + TagSize
 )
 
 func pad(packet []byte, minSize int) []byte {
