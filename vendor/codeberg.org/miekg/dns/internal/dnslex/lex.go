@@ -42,9 +42,9 @@ type Lex struct {
 	Line   int    // line in the file
 	Column int    // column in the file
 	Torc   uint16 // type or class as parsed in the lexer, we only need to look this up in the grammar
-	Err    bool   // when true, token text has lexer error
 	Value  uint8  // value: String, Blank, etc.
 	As     uint8  // create an RR (asRR), an EDNS0 (asCode) or DSO RR (asStateful)
+	Err    bool   // when true, token text has lexer error
 }
 
 const (
@@ -56,16 +56,20 @@ const (
 // Lexer tokenizes the zone data, so that the grammar implemented in ZoneParser can parse RRs out of an RFC
 // 1035 styled text file.
 type Lexer struct {
+	stringToType  map[string]uint16
+	stringToCode  map[string]uint16
+	stringToClass map[string]uint16
+
 	br  io.ByteReader
 	tok []byte
 
 	readErr error
 
-	line   int
-	column int
-
 	l       Lex
 	cachedL *Lex // used when finding a token, but delaying it's return.
+
+	line   int
+	column int
 
 	brace  int
 	quote  bool
@@ -73,14 +77,8 @@ type Lexer struct {
 	commt  bool
 	rrtype bool
 	owner  bool
-
-	nextL bool
-
-	eol bool // end-of-line
-
-	StringToType  map[string]uint16
-	StringToCode  map[string]uint16
-	StringToClass map[string]uint16
+	nextL  bool
+	eol    bool
 }
 
 // New returns a pointer to a new Lexer.
@@ -95,9 +93,9 @@ func New(r io.Reader, StringToType, StringToCode, StringToClass map[string]uint1
 		tok:           make([]byte, 512),
 		line:          1,
 		owner:         true,
-		StringToType:  StringToType,
-		StringToCode:  StringToCode,
-		StringToClass: StringToClass,
+		stringToType:  StringToType,
+		stringToCode:  StringToCode,
+		stringToClass: StringToClass,
 	}
 }
 
@@ -109,7 +107,7 @@ func (zl *Lexer) Err() error {
 	return zl.readErr
 }
 
-// readByte returns the next byte from the input
+// readByte returns the next byte from the input.
 func (zl *Lexer) readByte() (byte, bool) {
 	if zl.readErr != nil {
 		return 0, false
@@ -129,10 +127,10 @@ func (zl *Lexer) readByte() (byte, bool) {
 		zl.eol = false
 	}
 
+	zl.column++
 	if c == '\n' {
 		zl.eol = true
-	} else {
-		zl.column++
+		zl.column--
 	}
 
 	return c, true
@@ -196,21 +194,9 @@ func (zl *Lexer) Next() (Lex, bool) {
 			var retL Lex
 			if len(zl.tok) > 0 {
 				if zl.owner {
-					// If we have a string and it's the first, make it an owner
-					l.Value = Owner
-					l.Token = string(zl.tok)
 
-					// escape $... start with a \ not a $, so this will work
-					switch l.Token {
-					case "$TTL":
-						l.Value = DirTTL
-					case "$ORIGIN":
-						l.Value = DirOrigin
-					case "$INCLUDE":
-						l.Value = DirInclude
-					case "$GENERATE":
-						l.Value = DirGenerate
-					}
+					l.Token = string(zl.tok)
+					l.Value = directive(l.Token)
 
 					retL = *l
 				} else {
@@ -465,7 +451,7 @@ func Tokens(c *Lexer) []string {
 	}
 }
 
-// upperLookup will defer strings.ToUpper in the map lookup, until after the lookup has occured and nothing
+// upperLookup will defer strings.ToUpper in the map lookup, until after the lookup has occurred and nothing
 // was found.
 func upperLookup(s string, m map[string]uint16) (uint16, bool) {
 	if t, ok := m[s]; ok {
@@ -478,14 +464,14 @@ func upperLookup(s string, m map[string]uint16) (uint16, bool) {
 // typeOrCodeOrClass returns the type, or code, or TYPExxxx, or class, or CLASSxxxx, from the current token in
 // l. The check happens in that order.
 func (zl *Lexer) typeOrCodeOrClass(l *Lex) {
-	if t, ok := upperLookup(l.Token, zl.StringToType); ok {
+	if t, ok := upperLookup(l.Token, zl.stringToType); ok {
 		l.Value = Rrtype
 		l.Torc = t
 		zl.rrtype = true
 		return
 	}
 
-	if t, ok := zl.StringToCode[l.Token]; ok {
+	if t, ok := zl.stringToCode[l.Token]; ok {
 		l.As = asCode
 		l.Value = Rrtype
 		l.Torc = t
@@ -506,7 +492,7 @@ func (zl *Lexer) typeOrCodeOrClass(l *Lex) {
 		return
 	}
 
-	if t, ok := zl.StringToClass[l.Token]; ok {
+	if t, ok := zl.stringToClass[l.Token]; ok {
 		l.Value = Class
 		l.Torc = t
 		return
@@ -522,4 +508,22 @@ func (zl *Lexer) typeOrCodeOrClass(l *Lex) {
 		l.Value = Class
 		l.Torc = t
 	}
+}
+
+func directive(s string) uint8 {
+	if s[0] != '$' {
+		return Owner
+	}
+	dir, ok := dirMap[s]
+	if ok {
+		return dir
+	}
+	return Owner
+}
+
+var dirMap = map[string]uint8{
+	"$TTL":      DirTTL,
+	"$ORIGIN":   DirOrigin,
+	"$INCLUDE":  DirInclude,
+	"$GENERATE": DirGenerate,
 }

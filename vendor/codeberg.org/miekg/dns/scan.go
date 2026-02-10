@@ -168,7 +168,7 @@ func readData(r io.Reader, rrtype uint16, origin ...string) (RDATA, error) {
 // Callers should not assume all returned data in a RR is
 // syntactically correct, e.g. illegal base64 in RRSIGs will be returned as-is.
 type ZoneParser struct {
-	c *dnslex.Lexer
+	h Header // rr header as we parse
 
 	// IncludeAllowFunc tells if and how includes are allowed.
 	IncludeAllowFunc
@@ -188,25 +188,23 @@ type ZoneParser struct {
 	// details.
 	IncludeFS fs.FS
 
-	parseErr *ParseError
-
 	origin string
 	file   string
 	path   string // full path of file
 
-	defttl *ttlState
+	parseErr *ParseError
+	defttl   *ttlState
 
 	// sub is used to parse $INCLUDE files and $GENERATE directives.
 	// Next, by calling subNext, forwards the resulting RRs from this
 	// sub parser to the calling code.
 	sub *ZoneParser
 	r   io.Reader
+	c   *dnslex.Lexer
 
+	t                  uint16 // type as we parse, not stored in the header
 	includeDepth       uint8
 	generateDisallowed bool
-
-	h Header // rr header as we parse
-	t uint16 // type as we parse, not stored in the header
 }
 
 // NewZoneParser returns an RFC 1035 style zone file parser that reads from r.
@@ -837,7 +835,7 @@ func locCheckEast(token string, longitude uint32) (uint32, bool) {
 }
 
 // Parse a 64 bit-like ipv6 address: "0014:4fff:ff20:ee64" Used for NID and L64 record.
-func stringToNodeID(l dnslex.Lex) (uint64, *ParseError) {
+func stringToNodeID(l dnslex.Lex) (uint64, error) {
 	if len(l.Token) < 19 {
 		return 0, &ParseError{file: l.Token, err: "bad NID/L64 NodeID/Locator64", lex: l}
 	}
