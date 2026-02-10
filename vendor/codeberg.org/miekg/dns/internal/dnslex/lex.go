@@ -109,7 +109,7 @@ func (zl *Lexer) Err() error {
 	return zl.readErr
 }
 
-// readByte returns the next byte from the input.
+// readByte returns the next byte from the input
 func (zl *Lexer) readByte() (byte, bool) {
 	if zl.readErr != nil {
 		return 0, false
@@ -129,10 +129,10 @@ func (zl *Lexer) readByte() (byte, bool) {
 		zl.eol = false
 	}
 
-	zl.column++
 	if c == '\n' {
 		zl.eol = true
-		zl.column--
+	} else {
+		zl.column++
 	}
 
 	return c, true
@@ -196,9 +196,21 @@ func (zl *Lexer) Next() (Lex, bool) {
 			var retL Lex
 			if len(zl.tok) > 0 {
 				if zl.owner {
-
+					// If we have a string and it's the first, make it an owner
+					l.Value = Owner
 					l.Token = string(zl.tok)
-					l.Value = directive(l.Token)
+
+					// escape $... start with a \ not a $, so this will work
+					switch l.Token {
+					case "$TTL":
+						l.Value = DirTTL
+					case "$ORIGIN":
+						l.Value = DirOrigin
+					case "$INCLUDE":
+						l.Value = DirInclude
+					case "$GENERATE":
+						l.Value = DirGenerate
+					}
 
 					retL = *l
 				} else {
@@ -453,7 +465,7 @@ func Tokens(c *Lexer) []string {
 	}
 }
 
-// upperLookup will defer strings.ToUpper in the map lookup, until after the lookup has occurred and nothing
+// upperLookup will defer strings.ToUpper in the map lookup, until after the lookup has occured and nothing
 // was found.
 func upperLookup(s string, m map[string]uint16) (uint16, bool) {
 	if t, ok := m[s]; ok {
@@ -510,22 +522,4 @@ func (zl *Lexer) typeOrCodeOrClass(l *Lex) {
 		l.Value = Class
 		l.Torc = t
 	}
-}
-
-func directive(s string) uint8 {
-	if s[0] != '$' {
-		return Owner
-	}
-	dir, ok := dirMap[s]
-	if ok {
-		return dir
-	}
-	return Owner
-}
-
-var dirMap = map[string]uint8{
-	"$TTL":      DirTTL,
-	"$ORIGIN":   DirOrigin,
-	"$INCLUDE":  DirInclude,
-	"$GENERATE": DirGenerate,
 }

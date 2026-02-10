@@ -586,10 +586,7 @@ func (m *Msg) Len() int {
 	l := MsgHeaderSize
 
 	for i := range m.Question {
-		// See Header.Len() too, we always add a +1, even if the name is the root label.
-		// 4 is for the type and class
-		l += len(m.Question[i].Header().Name) + 1 + 4
-		break
+		l += m.Question[i].Len()
 	}
 	for i := range m.Answer {
 		l += m.Answer[i].Len()
@@ -604,9 +601,7 @@ func (m *Msg) Len() int {
 		l += m.Pseudo[i].Len()
 	}
 
-	// Smallest possible RR header where the name is the root label. This should actually be 11, but we return
-	// len(name) +1 for all domain names, which is not correct for the root which is just 1.
-	const minHeaderSize = 12
+	const minHeaderSize = 11 // smallest possible RR header where the name is the root label.
 
 	if m.isPseudo() > 0 {
 		// If we find things in pseudo we get an OPT RR (fix length) plus the length of the option. OPT is always 11, 10 + "." (root label)

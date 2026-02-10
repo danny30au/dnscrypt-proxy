@@ -837,7 +837,7 @@ func locCheckEast(token string, longitude uint32) (uint32, bool) {
 }
 
 // Parse a 64 bit-like ipv6 address: "0014:4fff:ff20:ee64" Used for NID and L64 record.
-func stringToNodeID(l dnslex.Lex) (uint64, error) {
+func stringToNodeID(l dnslex.Lex) (uint64, *ParseError) {
 	if len(l.Token) < 19 {
 		return 0, &ParseError{file: l.Token, err: "bad NID/L64 NodeID/Locator64", lex: l}
 	}
