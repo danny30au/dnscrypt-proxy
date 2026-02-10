@@ -168,7 +168,7 @@ func readData(r io.Reader, rrtype uint16, origin ...string) (RDATA, error) {
 // Callers should not assume all returned data in a RR is
 // syntactically correct, e.g. illegal base64 in RRSIGs will be returned as-is.
 type ZoneParser struct {
-	h Header // rr header as we parse
+	c *dnslex.Lexer
 
 	// IncludeAllowFunc tells if and how includes are allowed.
 	IncludeAllowFunc
@@ -188,23 +188,25 @@ type ZoneParser struct {
 	// details.
 	IncludeFS fs.FS
 
+	parseErr *ParseError
+
 	origin string
 	file   string
 	path   string // full path of file
 
-	parseErr *ParseError
-	defttl   *ttlState
+	defttl *ttlState
 
 	// sub is used to parse $INCLUDE files and $GENERATE directives.
 	// Next, by calling subNext, forwards the resulting RRs from this
 	// sub parser to the calling code.
 	sub *ZoneParser
 	r   io.Reader
-	c   *dnslex.Lexer
 
-	t                  uint16 // type as we parse, not stored in the header
 	includeDepth       uint8
 	generateDisallowed bool
+
+	h Header // rr header as we parse
+	t uint16 // type as we parse, not stored in the header
 }
 
 // NewZoneParser returns an RFC 1035 style zone file parser that reads from r.
