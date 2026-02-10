@@ -43,7 +43,6 @@ jobs:
             -trimpath \
             -tags="netgo,osusergo" \
             -ldflags="-s -w -extldflags '-static'" \
-            -gcflags="-l=4" \
             -o dnscrypt-proxy \
             ./dnscrypt-proxy
 
