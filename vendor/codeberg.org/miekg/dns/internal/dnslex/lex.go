@@ -42,9 +42,9 @@ type Lex struct {
 	Line   int    // line in the file
 	Column int    // column in the file
 	Torc   uint16 // type or class as parsed in the lexer, we only need to look this up in the grammar
+	Err    bool   // when true, token text has lexer error
 	Value  uint8  // value: String, Blank, etc.
 	As     uint8  // create an RR (asRR), an EDNS0 (asCode) or DSO RR (asStateful)
-	Err    bool   // when true, token text has lexer error
 }
 
 const (
@@ -56,20 +56,16 @@ const (
 // Lexer tokenizes the zone data, so that the grammar implemented in ZoneParser can parse RRs out of an RFC
 // 1035 styled text file.
 type Lexer struct {
-	stringToType  map[string]uint16
-	stringToCode  map[string]uint16
-	stringToClass map[string]uint16
-
 	br  io.ByteReader
 	tok []byte
 
 	readErr error
 
-	l       Lex
-	cachedL *Lex // used when finding a token, but delaying it's return.
-
 	line   int
 	column int
+
+	l       Lex
+	cachedL *Lex // used when finding a token, but delaying it's return.
 
 	brace  int
 	quote  bool
@@ -77,8 +73,14 @@ type Lexer struct {
 	commt  bool
 	rrtype bool
 	owner  bool
-	nextL  bool
-	eol    bool
+
+	nextL bool
+
+	eol bool // end-of-line
+
+	StringToType  map[string]uint16
+	StringToCode  map[string]uint16
+	StringToClass map[string]uint16
 }
 
 // New returns a pointer to a new Lexer.
@@ -93,9 +95,9 @@ func New(r io.Reader, StringToType, StringToCode, StringToClass map[string]uint1
 		tok:           make([]byte, 512),
 		line:          1,
 		owner:         true,
-		stringToType:  StringToType,
-		stringToCode:  StringToCode,
-		stringToClass: StringToClass,
+		StringToType:  StringToType,
+		StringToCode:  StringToCode,
+		StringToClass: StringToClass,
 	}
 }
 
@@ -464,14 +466,14 @@ func upperLookup(s string, m map[string]uint16) (uint16, bool) {
 // typeOrCodeOrClass returns the type, or code, or TYPExxxx, or class, or CLASSxxxx, from the current token in
 // l. The check happens in that order.
 func (zl *Lexer) typeOrCodeOrClass(l *Lex) {
-	if t, ok := upperLookup(l.Token, zl.stringToType); ok {
+	if t, ok := upperLookup(l.Token, zl.StringToType); ok {
 		l.Value = Rrtype
 		l.Torc = t
 		zl.rrtype = true
 		return
 	}
 
-	if t, ok := zl.stringToCode[l.Token]; ok {
+	if t, ok := zl.StringToCode[l.Token]; ok {
 		l.As = asCode
 		l.Value = Rrtype
 		l.Torc = t
@@ -492,7 +494,7 @@ func (zl *Lexer) typeOrCodeOrClass(l *Lex) {
 		return
 	}
 
-	if t, ok := zl.stringToClass[l.Token]; ok {
+	if t, ok := zl.StringToClass[l.Token]; ok {
 		l.Value = Class
 		l.Torc = t
 		return

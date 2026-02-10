@@ -74,12 +74,11 @@ func (o *COOKIE) unpack(s *cryptobyte.String) error {
 }
 
 func (o *PADDING) unpack(s *cryptobyte.String) error {
-	o.Padding = hex.EncodeToString(*s)
 	return nil
 }
 
 func (o *PADDING) pack(msg []byte, off int) (int, error) {
-	return hex.Decode(msg[off:], []byte(o.Padding))
+	return 0, nil
 }
 
 func (o *DAU) pack(msg []byte, off int) (off1 int, err error) {

@@ -137,15 +137,9 @@ type PADDING struct {
 	Padding string `dns:"hex"`
 }
 
-func (o *PADDING) Len() int    { return tlv + len(o.Padding)/2 }
-func (o *PADDING) Data() RDATA { return o }
-func (o *PADDING) String() string {
-	sb := sprintOptionHeader(o)
-	sb.WriteString(o.Padding)
-	s := sb.String()
-	builderPool.Put(*sb)
-	return s
-}
+func (o *PADDING) Len() int       { return tlv + len(o.Padding) }
+func (o *PADDING) Data() RDATA    { return o }
+func (o *PADDING) String() string { return "" } // TODO(miek)
 
 // EXPIRE implements the EDNS0 option as described in RFC 7314.
 //
