@@ -7,7 +7,7 @@ import (
 	"errors"
 
 	"github.com/jedisct1/dlog"
-	"github.com/jedisct1/xsecretbox"
+	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/nacl/box"
 	"golang.org/x/crypto/nacl/secretbox"
