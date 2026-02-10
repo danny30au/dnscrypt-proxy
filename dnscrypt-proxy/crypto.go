@@ -108,7 +108,7 @@ func (proxy *Proxy) Encrypt(
 		}
 		minQuestionSize += int(xpad[0])
 	}
-	paddedLength := Min(MaxDNSUDPPacketSize, (Max(minQuestionSize, QueryOverhead)+1+63) & ^63)
+	paddedLength := Min(MaxDNSUDPPacketSize, (Max(minQuestionSize, QueryOverhead)+1+63)&^63)
 	if serverInfo.knownBugs.fragmentsBlocked && proto == "udp" {
 		paddedLength = MaxDNSUDPSafePacketSize
 	} else if serverInfo.Relay != nil && proto == "tcp" {
@@ -121,8 +121,19 @@ func (proxy *Proxy) Encrypt(
 	encrypted = append(serverInfo.MagicQuery[:], publicKey[:]...)
 	encrypted = append(encrypted, nonce[:HalfNonceSize]...)
 	padded := pad(packet, paddedLength-QueryOverhead)
+
 	if serverInfo.CryptoConstruction == XChacha20Poly1305 {
-		encrypted = xsecretbox.Seal(encrypted, nonce, padded, sharedKey[:])
+		aead, err := chacha20poly1305.NewX(sharedKey[:])
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		// Standard Seal: nonce || ciphertext || tag
+		// We need: tag || ciphertext
+		ctWithTag := aead.Seal(nil, nonce, padded, nil)
+		tag := ctWithTag[len(ctWithTag)-16:]
+		ct := ctWithTag[:len(ctWithTag)-16]
+		encrypted = append(encrypted, tag...)
+		encrypted = append(encrypted, ct...)
 	} else {
 		var xsalsaNonce [24]byte
 		copy(xsalsaNonce[:], nonce)
@@ -150,8 +161,26 @@ func (proxy *Proxy) Decrypt(
 	}
 	var packet []byte
 	var err error
+
 	if serverInfo.CryptoConstruction == XChacha20Poly1305 {
-		packet, err = xsecretbox.Open(nil, serverNonce, encrypted[responseHeaderLen:], sharedKey[:])
+		aead, errNew := chacha20poly1305.NewX(sharedKey[:])
+		if errNew != nil {
+			return encrypted, errNew
+		}
+		// Input format: header || tag || ciphertext
+		// Standard Open expects: ciphertext || tag
+		tagAndCt := encrypted[responseHeaderLen:]
+		if len(tagAndCt) < TagSize {
+			return encrypted, errors.New("Message too short")
+		}
+		tag := tagAndCt[:TagSize]
+		ct := tagAndCt[TagSize:]
+
+		stdCt := make([]byte, 0, len(ct)+len(tag))
+		stdCt = append(stdCt, ct...)
+		stdCt = append(stdCt, tag...)
+
+		packet, err = aead.Open(nil, serverNonce, stdCt, nil)
 	} else {
 		var xsalsaServerNonce [24]byte
 		copy(xsalsaServerNonce[:], serverNonce)
@@ -161,6 +190,7 @@ func (proxy *Proxy) Decrypt(
 			err = errors.New("Incorrect tag")
 		}
 	}
+
 	if err != nil {
 		return encrypted, err
 	}
