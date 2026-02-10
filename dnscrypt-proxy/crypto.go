@@ -1,12 +1,12 @@
 package main
 
-import (
-	"bytes"
+import (	"bytes"
 	crypto_rand "crypto/rand"
 	"crypto/sha512"
 	"errors"
 
 	"github.com/jedisct1/dlog"
+	"golang.org/x/crypto/chacha20"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/nacl/box"
@@ -14,12 +14,13 @@ import (
 )
 
 const (
-	NonceSize        = xsecretbox.NonceSize
-	HalfNonceSize    = xsecretbox.NonceSize / 2
-	TagSize          = xsecretbox.TagSize
+	NonceSize        = 24
+	HalfNonceSize    = NonceSize / 2
+	TagSize          = 16
 	PublicKeySize    = 32
 	QueryOverhead    = ClientMagicLen + PublicKeySize + HalfNonceSize + TagSize
 	ResponseOverhead = len(ServerMagic) + NonceSize + TagSize
+) + NonceSize + TagSize
 )
 
 func pad(packet []byte, minSize int) []byte {
@@ -51,11 +52,18 @@ func ComputeSharedKey(
 	providerName *string,
 ) (sharedKey [32]byte) {
 	if cryptoConstruction == XChacha20Poly1305 {
-		var err error
-		sharedKey, err = xsecretbox.SharedKey(*secretKey, *serverPk)
+		// Replicate xsecretbox.SharedKey logic: HChaCha20(X25519(sk, pk), 00...00)
+		dhKey, err := curve25519.X25519(secretKey[:], serverPk[:])
 		if err != nil {
 			dlog.Criticalf("[%v] Weak XChaCha20 public key", providerName)
+			return
 		}
+		var nonce [16]byte // Zero nonce for HChaCha20
+		subKey, err := chacha20.HChaCha20(dhKey, nonce[:])
+		if err != nil {
+			dlog.Fatal(err)
+		}
+		copy(sharedKey[:], subKey)
 	} else {
 		box.Precompute(&sharedKey, serverPk, secretKey)
 		c := byte(0)
@@ -127,8 +135,6 @@ func (proxy *Proxy) Encrypt(
 		if err != nil {
 			return nil, nil, nil, err
 		}
-		// Standard Seal: nonce || ciphertext || tag
-		// We need: tag || ciphertext
 		ctWithTag := aead.Seal(nil, nonce, padded, nil)
 		tag := ctWithTag[len(ctWithTag)-16:]
 		ct := ctWithTag[:len(ctWithTag)-16]
@@ -167,8 +173,6 @@ func (proxy *Proxy) Decrypt(
 		if errNew != nil {
 			return encrypted, errNew
 		}
-		// Input format: header || tag || ciphertext
-		// Standard Open expects: ciphertext || tag
 		tagAndCt := encrypted[responseHeaderLen:]
 		if len(tagAndCt) < TagSize {
 			return encrypted, errors.New("Message too short")
