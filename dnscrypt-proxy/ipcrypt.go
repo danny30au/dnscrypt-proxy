@@ -7,6 +7,7 @@ import (
     "crypto/aes"
     "crypto/cipher"
     crand "crypto/rand"
+    "encoding/base64"
     "encoding/binary"
     "encoding/hex"
     "errors"
@@ -134,9 +135,16 @@ func NewIPCryptConfig(keyHex string, algorithm string) (*IPCryptConfig, error) {
         return nil, ErrNoKey
     }
 
+    // Attempt to decode as Hex first
     rawKey, err := hex.DecodeString(keyHex)
     if err != nil {
-        return nil, fmt.Errorf("%w: %v", ErrInvalidKeyHex, err)
+        // If Hex fails (e.g. contains 'Y'), try Base64
+        var b64Err error
+        rawKey, b64Err = base64.StdEncoding.DecodeString(keyHex)
+        if b64Err != nil {
+            // If both fail, return the original hex error
+            return nil, fmt.Errorf("%w: %v", ErrInvalidKeyHex, err)
+        }
     }
     defer clear(rawKey)
 
