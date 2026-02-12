@@ -5,7 +5,7 @@ go 1.25.0
 exclude google.golang.org/genproto v0.0.0-20230410155749-daa745c078e1
 
 require (
-	codeberg.org/miekg/dns v0.6.48
+	codeberg.org/miekg/dns v0.6.49
 	github.com/BurntSushi/toml v1.6.0
 	github.com/VividCortex/ewma v1.2.0
 	github.com/coreos/go-systemd v0.0.0-20191104093116-d3cd4ed1dbcf
@@ -21,7 +21,6 @@ require (
 	github.com/jedisct1/go-ipcrypt v0.1.2
 	github.com/jedisct1/go-minisign v0.0.0-20241212093149-d2f9f49435c7
 	github.com/jedisct1/go-sieve-cache v0.1.8
-	github.com/jedisct1/xsecretbox v0.0.0-20241212092125-3afc4917ac41
 	github.com/k-sone/critbitgo v1.4.0
 	github.com/kardianos/service v1.2.4
 	github.com/lifenjoiner/dhcpdns v0.0.7
