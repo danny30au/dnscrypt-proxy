@@ -125,6 +125,9 @@ func addColdStartListener(
 	listenAddrStr string,
 	captivePortalHandler *CaptivePortalHandler,
 ) error {
+	if len(listenAddrStr) == 0 {
+		return nil
+	}
 	network := "udp"
 	isIPv4 := isDigit(listenAddrStr[0])
 	if isIPv4 {
@@ -138,13 +141,11 @@ func addColdStartListener(
 	if err != nil {
 		return err
 	}
-	captivePortalHandler.wg.Add(1)
-	go func() {
+	captivePortalHandler.wg.Go(func() {
 		for !handleColdStartClient(clientPc, captivePortalHandler.cancelChannel, ipsMap) {
 		}
 		clientPc.Close()
-		captivePortalHandler.wg.Done()
-	}()
+	})
 	return nil
 }
 
@@ -181,7 +182,7 @@ func ColdStart(proxy *Proxy) (*CaptivePortalHandler, error) {
 			)
 		}
 		var ips []net.IP
-		for _, ip := range strings.Split(ipsStr, ",") {
+		for ip := range strings.SplitSeq(ipsStr, ",") {
 			ipStr := strings.TrimSpace(ip)
 			if ip := net.ParseIP(ipStr); ip != nil {
 				ips = append(ips, ip)
