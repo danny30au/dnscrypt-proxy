@@ -35,11 +35,14 @@ import (
 )
 
 // Hardware acceleration detection for optimized cipher suite selection
+// Go 1.26: Used for intelligent cipher suite ordering based on CPU capabilities
 var hasAESGCMHardwareSupport = (cpu.X86.HasAES && cpu.X86.HasPCLMULQDQ) ||
 	(cpu.ARM64.HasAES && cpu.ARM64.HasPMULL) ||
 	(cpu.S390X.HasAES && cpu.S390X.HasAESGCM)
 
 // Configuration constants with optimized values for modern networks
+// Note: MaxDNSPacketSize, MaxHTTPBodyLength, ExtractHostAndPort, isIPAndPort, 
+// fqdn, and DOHClientCreds are defined in other files (common.go, config.go, serversInfo.go)
 const (
 	DefaultBootstrapResolver    = "9.9.9.9:53"
 	DefaultKeepAlive            = 5 * time.Second
@@ -52,8 +55,6 @@ const (
 	resolverRetryCount          = 3
 	resolverRetryInitialBackoff = 150 * time.Millisecond
 	resolverRetryMaxBackoff     = 1 * time.Second
-	MaxDNSPacketSize            = 4096
-	MaxHTTPBodyLength           = 10 * 1024 * 1024 // 10MB limit
 )
 
 // CachedIPItem represents a cached DNS resolution result with expiration tracking.
@@ -76,13 +77,6 @@ type CachedIPs struct {
 type AltSupport struct {
 	sync.RWMutex
 	cache map[string]uint16
-}
-
-// DOHClientCreds holds TLS client authentication credentials for DoH connections.
-type DOHClientCreds struct {
-	clientCert string
-	clientKey  string
-	rootCA     string
 }
 
 // XTransport provides an advanced HTTP/HTTPS transport with DNS caching,
@@ -137,7 +131,7 @@ func NewXTransport() *XTransport {
 }
 
 // ParseIP parses an IP address string, handling both IPv4 and IPv6 with brackets.
-// Go 1.26: Consider migrating to netip.ParseAddr for better performance.
+// Go 1.26: Consider migrating to netip.ParseAddr for better performance in future updates.
 func ParseIP(ipStr string) net.IP {
 	cleaned := strings.TrimRight(strings.TrimLeft(ipStr, "["), "]")
 	return net.ParseIP(cleaned)
@@ -145,6 +139,7 @@ func ParseIP(ipStr string) net.IP {
 
 // secureRandomInt63n generates a cryptographically secure random int64 in [0, n).
 // Go 1.26: Replaces deprecated math/rand with crypto/rand for security-sensitive operations.
+// This prevents timing attacks and ensures unpredictable jitter in DNS caching.
 func secureRandomInt63n(n int64) int64 {
 	if n <= 0 {
 		return 0
@@ -189,7 +184,7 @@ func uniqueNormalizedIPs(ips []net.IP) []net.IP {
 }
 
 // saveCachedIPs stores resolved IP addresses in the cache with TTL.
-// Go 1.26: Uses crypto/rand for secure jitter calculation.
+// Go 1.26: Uses crypto/rand for secure jitter calculation to prevent thundering herd.
 func (xTransport *XTransport) saveCachedIPs(host string, ips []net.IP, ttl time.Duration) {
 	normalized := uniqueNormalizedIPs(ips)
 	if len(normalized) == 0 {
@@ -219,7 +214,7 @@ func (xTransport *XTransport) saveCachedIPs(host string, ips []net.IP, ttl time.
 	if len(normalized) == 1 {
 		dlog.Debugf("[%s] cached IP [%s], valid for %v", host, normalized[0], ttl)
 	} else {
-		dlog.Debugf("[%s] cached %d IP addresses (first: %s), valid for %v", 
+		dlog.Debugf("[%s] cached %d IP addresses (first: %s), valid for %v",
 			host, len(normalized), normalized[0], ttl)
 	}
 }
@@ -343,13 +338,13 @@ func (xTransport *XTransport) rebuildTransport() {
 	transport := &http.Transport{
 		DisableKeepAlives:      false,
 		DisableCompression:     true,
-		MaxIdleConns:           100,        // Go 1.26: Increased for better connection reuse
-		MaxIdleConnsPerHost:    10,         // Go 1.26: Optimized per-host pooling
+		MaxIdleConns:           100,  // Go 1.26: Increased for better connection reuse
+		MaxIdleConnsPerHost:    10,   // Go 1.26: Optimized per-host pooling
 		IdleConnTimeout:        xTransport.keepAlive,
 		ResponseHeaderTimeout:  timeout,
 		ExpectContinueTimeout:  timeout,
 		MaxResponseHeaderBytes: 4096,
-		ForceAttemptHTTP2:      true,       // Go 1.26: Enable HTTP/2 by default
+		ForceAttemptHTTP2:      true, // Go 1.26: Enable HTTP/2 by default
 
 		// Custom dialer with cached IP resolution
 		DialContext: func(ctx context.Context, network, addrStr string) (net.Conn, error) {
@@ -631,7 +626,7 @@ func (xTransport *XTransport) buildHTTP3Transport(tlsConfig *tls.Config) {
 				udpConn.Close()
 				lastErr = err
 				if idx < len(targets)-1 {
-					dlog.Debugf("HTTP/3: dialing [%v] via %s failed: %v", 
+					dlog.Debugf("HTTP/3: dialing [%v] via %s failed: %v",
 						target.addr, target.network, err)
 				}
 				continue
@@ -714,7 +709,7 @@ func (xTransport *XTransport) resolveUsingResolver(
 		}
 
 		msg.RecursionDesired = true
-		msg.UDPSize = MaxDNSPacketSize
+		msg.UDPSize = uint16(MaxDNSPacketSize) // Use uint16 to match expected type
 		msg.Security = true
 
 		resp, _, err := dnsClient.Exchange(ctx, msg, proto, resolver)
@@ -802,7 +797,7 @@ func (xTransport *XTransport) resolveUsingServers(
 			}
 		}
 
-		dlog.Infof("All retry attempts failed for resolver [%s] (%s): %v", 
+		dlog.Infof("All retry attempts failed for resolver [%s] (%s): %v",
 			resolver, proto, lastErr)
 	}
 
@@ -1086,7 +1081,7 @@ func (xTransport *XTransport) Fetch(
 	// Handle response body with optional decompression
 	var bodyReader io.ReadCloser = resp.Body
 	if compress && resp.Header.Get("Content-Encoding") == "gzip" {
-		gzReader, err := gzip.NewReader(io.LimitReader(resp.Body, MaxHTTPBodyLength))
+		gzReader, err := gzip.NewReader(io.LimitReader(resp.Body, int64(MaxHTTPBodyLength)))
 		if err != nil {
 			return nil, statusCode, resp.TLS, rtt, fmt.Errorf("gzip decompression failed: %w", err)
 		}
@@ -1095,7 +1090,7 @@ func (xTransport *XTransport) Fetch(
 	}
 
 	// Go 1.26: io.ReadAll is significantly optimized
-	data, err := io.ReadAll(io.LimitReader(bodyReader, MaxHTTPBodyLength))
+	data, err := io.ReadAll(io.LimitReader(bodyReader, int64(MaxHTTPBodyLength)))
 	if err != nil {
 		return nil, statusCode, resp.TLS, rtt, fmt.Errorf("failed to read response: %w", err)
 	}
@@ -1230,49 +1225,4 @@ func (xTransport *XTransport) ObliviousDoHQuery(
 	timeout time.Duration,
 ) ([]byte, int, *tls.ConnectionState, time.Duration, error) {
 	return xTransport.dohLikeQuery("application/oblivious-dns-message", useGet, url, body, timeout)
-}
-
-// Helper functions (these would typically be in a separate file)
-
-// ExtractHostAndPort parses a host:port string, using defaultPort if port is missing.
-func ExtractHostAndPort(hostPort string, defaultPort int) (string, int) {
-	host, portStr, err := net.SplitHostPort(hostPort)
-	if err != nil {
-		// No port specified, use default
-		return hostPort, defaultPort
-	}
-
-	port, err := strconv.Atoi(portStr)
-	if err != nil || port < 1 || port > 65535 {
-		return host, defaultPort
-	}
-
-	return host, port
-}
-
-// isIPAndPort validates that a string is in the format IP:port.
-func isIPAndPort(address string) error {
-	host, portStr, err := net.SplitHostPort(address)
-	if err != nil {
-		return fmt.Errorf("invalid address format: %w", err)
-	}
-
-	if net.ParseIP(host) == nil {
-		return fmt.Errorf("invalid IP address: %s", host)
-	}
-
-	port, err := strconv.Atoi(portStr)
-	if err != nil || port < 1 || port > 65535 {
-		return fmt.Errorf("invalid port: %s", portStr)
-	}
-
-	return nil
-}
-
-// fqdn ensures a hostname ends with a dot for DNS queries.
-func fqdn(name string) string {
-	if strings.HasSuffix(name, ".") {
-		return name
-	}
-	return name + "."
 }
