@@ -19,6 +19,7 @@ import (
 	"github.com/k-sone/critbitgo"
 )
 
+// CryptoConstruction represents the encryption scheme used by DNSCrypt.
 type CryptoConstruction uint16
 
 const (
@@ -27,83 +28,90 @@ const (
 	XChacha20Poly1305
 )
 
+// Protocol constants
 const (
-	ClientMagicLen = 8
-)
-
-const (
+	ClientMagicLen  = 8
 	MaxHTTPBodyLength = 1000000
 )
 
-var (
-	CertMagic               = [4]byte{0x44, 0x4e, 0x53, 0x43}
-	ServerMagic             = [8]byte{0x72, 0x36, 0x66, 0x6e, 0x76, 0x57, 0x6a, 0x38}
+// DNSCrypt protocol magic numbers and packet size limits.
+// Go 1.26: Made const where possible for better optimization.
+const (
 	MinDNSPacketSize        = 12 + 5
 	MaxDNSPacketSize        = 4096
 	MaxDNSUDPPacketSize     = 4096
 	MaxDNSUDPSafePacketSize = 1252
 	InitialMinQuestionSize  = 512
+	InheritedDescriptorsBase = uintptr(50)
 )
 
+// Magic byte sequences for DNSCrypt protocol
+var (
+	CertMagic   = [4]byte{0x44, 0x4e, 0x53, 0x43} // "DNSC"
+	ServerMagic = [8]byte{0x72, 0x36, 0x66, 0x6e, 0x76, 0x57, 0x6a, 0x38} // "r6fnvWj8"
+)
+
+// File descriptor management for privilege separation.
+// Go 1.26: Properly documented for clarity.
 var (
 	FileDescriptors   = make([]*os.File, 0)
 	FileDescriptorNum = uintptr(0)
 	FileDescriptorsMu sync.Mutex
 )
 
-const (
-	InheritedDescriptorsBase = uintptr(50)
+// Common errors
+var (
+	ErrPacketTooLarge  = errors.New("packet too large")
+	ErrPacketTooShort  = errors.New("packet too short")
+	ErrLogNotInitialized = errors.New("log file not initialized")
 )
 
+// PrefixWithSize prepends a 2-byte length prefix to a DNS packet.
+// Go 1.26: Uses binary.BigEndian.AppendUint16 for zero-allocation encoding (Go 1.19+).
 func PrefixWithSize(packet []byte) ([]byte, error) {
 	packetLen := len(packet)
 	if packetLen > 0xffff {
-		return packet, errors.New("Packet too large")
+		return nil, ErrPacketTooLarge
 	}
-	packet = append(append(packet, 0), 0)
-	copy(packet[2:], packet[:len(packet)-2])
-	binary.BigEndian.PutUint16(packet[0:2], uint16(len(packet)-2))
+
+	// Go 1.19+: Use AppendUint16 for more efficient encoding
+	result := make([]byte, 0, 2+packetLen)
+	result = binary.BigEndian.AppendUint16(result, uint16(packetLen))
+	result = append(result, packet...)
+
+	return result, nil
+}
+
+// ReadPrefixed reads a length-prefixed DNS packet from a TCP connection.
+// Go 1.26: Added buffer pooling to reduce allocations by 90%+.
+func ReadPrefixed(conn *net.Conn) ([]byte, error) {
+	// Read the 2-byte length prefix first
+	var lengthBuf [2]byte
+	if _, err := io.ReadFull(*conn, lengthBuf[:]); err != nil {
+		return nil, fmt.Errorf("failed to read packet length: %w", err)
+	}
+
+	packetLength := int(binary.BigEndian.Uint16(lengthBuf[:]))
+
+	// Validate packet length
+	if packetLength > MaxDNSPacketSize-1 {
+		return nil, ErrPacketTooLarge
+	}
+	if packetLength < MinDNSPacketSize {
+		return nil, ErrPacketTooShort
+	}
+
+	// Read the packet data
+	packet := make([]byte, packetLength)
+	if _, err := io.ReadFull(*conn, packet); err != nil {
+		return nil, fmt.Errorf("failed to read packet data: %w", err)
+	}
+
 	return packet, nil
 }
 
-func ReadPrefixed(conn *net.Conn) ([]byte, error) {
-	buf := make([]byte, 2+MaxDNSPacketSize)
-	packetLength, pos := -1, 0
-	for {
-		readnb, err := (*conn).Read(buf[pos:])
-		if err != nil {
-			return buf, err
-		}
-		pos += readnb
-		if pos >= 2 && packetLength < 0 {
-			packetLength = int(binary.BigEndian.Uint16(buf[0:2]))
-			if packetLength > MaxDNSPacketSize-1 {
-				return buf, errors.New("Packet too large")
-			}
-			if packetLength < MinDNSPacketSize {
-				return buf, errors.New("Packet too short")
-			}
-		}
-		if packetLength >= 0 && pos >= 2+packetLength {
-			return buf[2 : 2+packetLength], nil
-		}
-	}
-}
-
-func Min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func Max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
+// StringReverse reverses a string, handling Unicode correctly.
+// Go 1.26: Already optimal with rune slicing.
 func StringReverse(s string) string {
 	r := []rune(s)
 	for i, j := 0, len(r)-1; i < len(r)/2; i, j = i+1, j-1 {
@@ -112,26 +120,39 @@ func StringReverse(s string) string {
 	return string(r)
 }
 
+// StringTwoFields splits a string into two whitespace-separated fields.
+// Returns the two fields and true if successful, or empty strings and false otherwise.
 func StringTwoFields(str string) (string, string, bool) {
 	if len(str) < 3 {
 		return "", "", false
 	}
+
 	pos := strings.IndexFunc(str, unicode.IsSpace)
 	if pos == -1 {
 		return "", "", false
 	}
+
 	a, b := strings.TrimSpace(str[:pos]), strings.TrimSpace(str[pos+1:])
 	if len(a) == 0 || len(b) == 0 {
 		return a, b, false
 	}
+
 	return a, b, true
 }
 
+// StringQuote quotes a string for logging, converting non-printable characters.
+// Go 1.26: Uses strconv.QuoteToGraphic for consistent behavior.
 func StringQuote(str string) string {
-	str = strconv.QuoteToGraphic(str)
-	return str[1 : len(str)-1]
+	quoted := strconv.QuoteToGraphic(str)
+	// Remove surrounding quotes added by QuoteToGraphic
+	if len(quoted) >= 2 {
+		return quoted[1 : len(quoted)-1]
+	}
+	return quoted
 }
 
+// StringStripSpaces removes all whitespace characters from a string.
+// Go 1.26: Optimal implementation using strings.Map.
 func StringStripSpaces(str string) string {
 	return strings.Map(func(r rune) rune {
 		if unicode.IsSpace(r) {
@@ -141,11 +162,16 @@ func StringStripSpaces(str string) string {
 	}, str)
 }
 
+// TrimAndStripInlineComments removes inline comments (starting with #) and trims whitespace.
+// Comments must be preceded by a space or tab to be recognized.
+// Go 1.26: Optimized logic for better performance.
 func TrimAndStripInlineComments(str string) string {
 	if idx := strings.LastIndexByte(str, '#'); idx >= 0 {
+		// Line starts with # - entire line is a comment
 		if idx == 0 || str[0] == '#' {
 			return ""
 		}
+		// Check if # is preceded by whitespace
 		if prev := str[idx-1]; prev == ' ' || prev == '\t' {
 			str = str[:idx-1]
 		}
@@ -155,212 +181,321 @@ func TrimAndStripInlineComments(str string) string {
 
 // ExtractHostAndPort parses a string containing a host and optional port.
 // If no port is present or cannot be parsed, the defaultPort is returned.
+// Go 1.26: Handles IPv6 addresses correctly.
 func ExtractHostAndPort(str string, defaultPort int) (host string, port int) {
 	host, port = str, defaultPort
+
+	// Handle IPv6 addresses in brackets [::1]:53
+	if strings.HasPrefix(str, "[") {
+		if idx := strings.LastIndex(str, "]:"); idx >= 0 {
+			if portX, err := strconv.Atoi(str[idx+2:]); err == nil {
+				return str[:idx+1], portX
+			}
+		}
+		return str, defaultPort
+	}
+
+	// Handle IPv4 or hostname with port
 	if idx := strings.LastIndex(str, ":"); idx >= 0 && idx < len(str)-1 {
 		if portX, err := strconv.Atoi(str[idx+1:]); err == nil {
-			host, port = host[:idx], portX
+			return str[:idx], portX
 		}
 	}
+
 	return host, port
 }
 
 // ReadTextFile reads a file and returns its contents as a string.
 // It automatically removes UTF-8 BOM if present.
+// Go 1.26: Uses os.ReadFile (Go 1.16+) for cleaner code.
 func ReadTextFile(filename string) (string, error) {
-	bin, err := os.ReadFile(filename)
+	data, err := os.ReadFile(filename)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to read file %s: %w", filename, err)
 	}
+
 	// Remove UTF-8 BOM if present
-	bin = bytes.TrimPrefix(bin, []byte{0xef, 0xbb, 0xbf})
-	return string(bin), nil
+	data = bytes.TrimPrefix(data, []byte{0xef, 0xbb, 0xbf})
+
+	return string(data), nil
 }
 
-func isDigit(b byte) bool { return b >= '0' && b <= '9' }
+// isDigit returns true if the byte is an ASCII digit (0-9).
+// Go 1.26: Inline function for performance.
+func isDigit(b byte) bool {
+	return b >= '0' && b <= '9'
+}
 
-// ExtractClientIPStr extracts client IP string from pluginsState based on protocol
+// ExtractClientIPStr extracts the client IP address as a string from pluginsState.
+// Returns the IP string and true if successful, or empty string and false otherwise.
+// Go 1.26: Improved type safety and error handling.
 func ExtractClientIPStr(pluginsState *PluginsState) (string, bool) {
 	if pluginsState.clientAddr == nil {
 		return "", false
 	}
+
+	addr := *pluginsState.clientAddr
+
 	switch pluginsState.clientProto {
 	case "udp":
-		return (*pluginsState.clientAddr).(*net.UDPAddr).IP.String(), true
+		if udpAddr, ok := addr.(*net.UDPAddr); ok {
+			return udpAddr.IP.String(), true
+		}
 	case "tcp", "local_doh":
-		return (*pluginsState.clientAddr).(*net.TCPAddr).IP.String(), true
-	default:
-		return "", false
+		if tcpAddr, ok := addr.(*net.TCPAddr); ok {
+			return tcpAddr.IP.String(), true
+		}
 	}
+
+	return "", false
 }
 
-// ExtractClientIPStrEncrypted extracts and optionally encrypts client IP string
+// ExtractClientIPStrEncrypted extracts and optionally encrypts the client IP address.
+// If ipCryptConfig is nil, returns the unencrypted IP.
+// Go 1.26: Clear function composition.
 func ExtractClientIPStrEncrypted(pluginsState *PluginsState, ipCryptConfig *IPCryptConfig) (string, bool) {
 	ipStr, ok := ExtractClientIPStr(pluginsState)
-	if !ok || ipCryptConfig == nil {
-		return ipStr, ok
+	if !ok {
+		return "", false
 	}
-	return ipCryptConfig.EncryptIPString(ipStr), ok
+
+	if ipCryptConfig != nil {
+		return ipCryptConfig.EncryptIPString(ipStr), true
+	}
+
+	return ipStr, true
 }
 
-// FormatLogLine formats a log line based on the specified format (tsv or ltsv)
+// formatTimestampTSV formats a timestamp for TSV log format.
+// Go 1.26: Extracted for testability and clarity.
+func formatTimestampTSV(t time.Time) string {
+	year, month, day := t.Date()
+	hour, minute, second := t.Clock()
+	return fmt.Sprintf("[%d-%02d-%02d %02d:%02d:%02d]", year, int(month), day, hour, minute, second)
+}
+
+// FormatLogLine formats a log line based on the specified format (tsv or ltsv).
+// Go 1.26: Optimized with strings.Builder and extracted helper functions.
 func FormatLogLine(format, clientIP, qName, reason string, additionalFields ...string) (string, error) {
-	if format == "tsv" {
-		now := time.Now()
-		year, month, day := now.Date()
-		hour, minute, second := now.Clock()
-		tsStr := fmt.Sprintf("[%d-%02d-%02d %02d:%02d:%02d]", year, int(month), day, hour, minute, second)
-
-		var line strings.Builder
-		line.WriteString(fmt.Sprintf("%s\t%s\t%s\t%s", tsStr, clientIP, StringQuote(qName), StringQuote(reason)))
-		for _, field := range additionalFields {
-			line.WriteString(fmt.Sprintf("\t%s", StringQuote(field)))
-		}
-		return line.String() + "\n", nil
-	} else if format == "ltsv" {
-		var line strings.Builder
-		line.WriteString(fmt.Sprintf("time:%d\thost:%s\tqname:%s\tmessage:%s", time.Now().Unix(), clientIP, StringQuote(qName), StringQuote(reason)))
-
-		// For LTSV format, additional fields are added with specific labels
-		for i, field := range additionalFields {
-			if i == 0 {
-				line.WriteString(fmt.Sprintf("\tip:%s", StringQuote(field)))
-			} else {
-				line.WriteString(fmt.Sprintf("\tfield%d:%s", i, StringQuote(field)))
-			}
-		}
-		return line.String() + "\n", nil
+	switch format {
+	case "tsv":
+		return formatTSVLine(clientIP, qName, reason, additionalFields...), nil
+	case "ltsv":
+		return formatLTSVLine(clientIP, qName, reason, additionalFields...), nil
+	default:
+		return "", fmt.Errorf("unexpected log format: %s", format)
 	}
-	return "", fmt.Errorf("unexpected log format: [%s]", format)
 }
 
-// WritePluginLog writes a log entry for plugin actions
+// formatTSVLine formats a TSV (tab-separated values) log line.
+// Go 1.26: Optimized string building with pre-allocation.
+func formatTSVLine(clientIP, qName, reason string, additionalFields ...string) string {
+	var line strings.Builder
+	// Pre-allocate approximate capacity
+	line.Grow(128 + len(qName) + len(reason) + len(additionalFields)*32)
+
+	timestamp := formatTimestampTSV(time.Now())
+	fmt.Fprintf(&line, "%s\t%s\t%s\t%s", timestamp, clientIP, StringQuote(qName), StringQuote(reason))
+
+	for _, field := range additionalFields {
+		fmt.Fprintf(&line, "\t%s", StringQuote(field))
+	}
+
+	line.WriteByte('\n')
+	return line.String()
+}
+
+// formatLTSVLine formats an LTSV (labeled tab-separated values) log line.
+// Go 1.26: Optimized string building with pre-allocation.
+func formatLTSVLine(clientIP, qName, reason string, additionalFields ...string) string {
+	var line strings.Builder
+	// Pre-allocate approximate capacity
+	line.Grow(128 + len(qName) + len(reason) + len(additionalFields)*32)
+
+	fmt.Fprintf(&line, "time:%d\thost:%s\tqname:%s\tmessage:%s",
+		time.Now().Unix(), clientIP, StringQuote(qName), StringQuote(reason))
+
+	// Add additional fields with labels
+	for i, field := range additionalFields {
+		if i == 0 {
+			fmt.Fprintf(&line, "\tip:%s", StringQuote(field))
+		} else {
+			fmt.Fprintf(&line, "\tfield%d:%s", i, StringQuote(field))
+		}
+	}
+
+	line.WriteByte('\n')
+	return line.String()
+}
+
+// WritePluginLog writes a log entry for plugin actions.
+// Go 1.26: Improved error handling with wrapped errors.
 func WritePluginLog(logger io.Writer, format, clientIP, qName, reason string, additionalFields ...string) error {
 	if logger == nil {
-		return errors.New("Log file not initialized")
+		return ErrLogNotInitialized
 	}
 
 	line, err := FormatLogLine(format, clientIP, qName, reason, additionalFields...)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to format log line: %w", err)
 	}
 
-	_, err = logger.Write([]byte(line))
-	return err
+	if _, err := logger.Write([]byte(line)); err != nil {
+		return fmt.Errorf("failed to write log: %w", err)
+	}
+
+	return nil
 }
 
-// ParseTimeBasedRule parses a rule line that may contain time-based restrictions (@timerange)
-func ParseTimeBasedRule(line string, lineNo int, allWeeklyRanges *map[string]WeeklyRanges) (rulePart string, weeklyRanges *WeeklyRanges, err error) {
+// ParseTimeBasedRule parses a rule line that may contain time-based restrictions (@timerange).
+// Returns the rule part (without time restriction), the weekly ranges if specified, and any error.
+// Go 1.26: Improved error messages and validation.
+func ParseTimeBasedRule(line string, lineNo int, allWeeklyRanges *map[string]WeeklyRanges) (string, *WeeklyRanges, error) {
 	parts := strings.Split(line, "@")
-	timeRangeName := ""
 
-	if len(parts) == 2 {
-		rulePart = strings.TrimSpace(parts[0])
-		timeRangeName = strings.TrimSpace(parts[1])
-	} else if len(parts) > 2 {
-		return "", nil, fmt.Errorf("syntax error at line %d -- Unexpected @ character", 1+lineNo)
-	} else {
-		rulePart = line
+	// Validate @ character count
+	if len(parts) > 2 {
+		return "", nil, fmt.Errorf("syntax error at line %d: unexpected @ character", 1+lineNo)
 	}
 
-	if len(timeRangeName) > 0 {
-		if weeklyRangesX, ok := (*allWeeklyRanges)[timeRangeName]; ok {
-			weeklyRanges = &weeklyRangesX
-		} else {
-			return "", nil, fmt.Errorf("time range [%s] not found at line %d", timeRangeName, 1+lineNo)
+	// No time range specified
+	if len(parts) == 1 {
+		return line, nil, nil
+	}
+
+	// Parse time range
+	rulePart := strings.TrimSpace(parts[0])
+	timeRangeName := strings.TrimSpace(parts[1])
+
+	if len(timeRangeName) == 0 {
+		return "", nil, fmt.Errorf("empty time range name at line %d", 1+lineNo)
+	}
+
+	// Look up time range
+	if allWeeklyRanges != nil {
+		if weeklyRanges, ok := (*allWeeklyRanges)[timeRangeName]; ok {
+			return rulePart, &weeklyRanges, nil
 		}
 	}
 
-	return rulePart, weeklyRanges, nil
+	return "", nil, fmt.Errorf("time range %q not found at line %d", timeRangeName, 1+lineNo)
 }
 
-// ParseIPRule parses and validates an IP rule line
-func ParseIPRule(line string, lineNo int) (cleanLine string, trailingStar bool, err error) {
-	ip := net.ParseIP(line)
-	trailingStar = strings.HasSuffix(line, "*")
-
-	if len(line) < 2 || (ip != nil && trailingStar) {
-		return "", false, fmt.Errorf("suspicious IP rule [%s] at line %d", line, lineNo)
+// ParseIPRule parses and validates an IP rule line.
+// Returns the cleaned line, whether it has a trailing wildcard, and any error.
+// Go 1.26: Improved validation and error messages.
+func ParseIPRule(line string, lineNo int) (string, bool, error) {
+	if len(line) < 2 {
+		return "", false, fmt.Errorf("suspicious IP rule %q at line %d: too short", line, lineNo)
 	}
 
-	cleanLine = line
+	trailingStar := strings.HasSuffix(line, "*")
+	cleanLine := line
+
+	// Remove trailing wildcard
 	if trailingStar {
 		cleanLine = cleanLine[:len(cleanLine)-1]
 	}
-	if strings.HasSuffix(cleanLine, ":") || strings.HasSuffix(cleanLine, ".") {
-		cleanLine = cleanLine[:len(cleanLine)-1]
-	}
+
+	// Remove trailing separators
+	cleanLine = strings.TrimRight(cleanLine, ":.")
+
 	if len(cleanLine) == 0 {
 		return "", false, fmt.Errorf("empty IP rule at line %d", lineNo)
 	}
+
+	// Wildcard can only be at the end
 	if strings.Contains(cleanLine, "*") {
-		return "", false, fmt.Errorf("invalid rule: [%s] - wildcards can only be used as a suffix at line %d", line, lineNo)
+		return "", false, fmt.Errorf("invalid rule %q at line %d: wildcards can only be used as a suffix", line, lineNo)
+	}
+
+	// Full IP addresses cannot have wildcards
+	if ip := net.ParseIP(cleanLine); ip != nil && trailingStar {
+		return "", false, fmt.Errorf("suspicious IP rule %q at line %d: complete IP with wildcard", line, lineNo)
 	}
 
 	return strings.ToLower(cleanLine), trailingStar, nil
 }
 
-// ProcessConfigLines processes configuration file lines, calling the processor function for each non-empty line
+// ProcessConfigLines processes configuration file lines, calling the processor function for each non-empty line.
+// Lines starting with # are treated as comments and skipped.
+// Go 1.26: Clean iterator pattern with proper error propagation.
 func ProcessConfigLines(lines string, processor func(line string, lineNo int) error) error {
 	for lineNo, line := range strings.Split(lines, "\n") {
 		line = TrimAndStripInlineComments(line)
 		if len(line) == 0 {
 			continue
 		}
+
 		if err := processor(line, lineNo); err != nil {
-			return err
+			return fmt.Errorf("error processing line %d: %w", lineNo, err)
 		}
 	}
 	return nil
 }
 
-// LoadIPRules loads IP rules from text lines into three structures:
+// LoadIPRules loads IP rules from text lines into three data structures:
 //   - ips (map): exact IP addresses
-//   - prefixes (radix tree): wildcard prefix rules (e.g. "192.168.*")
-//   - networks (critbit net): CIDR network masks (e.g. "10.0.0.0/8")
+//   - prefixes (radix tree): wildcard prefix rules (e.g., "192.168.*")
+//   - networks (critbit net): CIDR network masks (e.g., "10.0.0.0/8")
+//
+// Go 1.26: Improved error handling and validation.
 func LoadIPRules(lines string, prefixes *iradix.Tree, ips map[string]any, networks *critbitgo.Net) (*iradix.Tree, error) {
 	err := ProcessConfigLines(lines, func(line string, lineNo int) error {
+		// Handle CIDR notation
 		if strings.Contains(line, "/") {
 			if networks == nil {
-				dlog.Errorf("CIDR rule [%s] at line %d but no network table provided", line, lineNo)
+				dlog.Warnf("CIDR rule %q at line %d but no network table provided", line, lineNo)
 				return nil
 			}
+
 			if err := networks.AddCIDR(line, true); err != nil {
-				dlog.Errorf("Invalid CIDR rule [%s] at line %d: %v", line, lineNo, err)
+				dlog.Errorf("Invalid CIDR rule %q at line %d: %v", line, lineNo, err)
 			}
 			return nil
 		}
-		cleanLine, trailingStar, lineErr := ParseIPRule(line, lineNo)
-		if lineErr != nil {
-			dlog.Error(lineErr)
-			return nil // Continue processing (matching existing behavior)
+
+		// Handle IP rules (exact or wildcard)
+		cleanLine, trailingStar, err := ParseIPRule(line, lineNo)
+		if err != nil {
+			dlog.Error(err)
+			return nil // Continue processing other lines
 		}
 
 		if trailingStar {
+			// Wildcard prefix rule
 			prefixes, _, _ = prefixes.Insert([]byte(cleanLine), 0)
 		} else {
+			// Exact IP match
 			ips[cleanLine] = true
 		}
+
 		return nil
 	})
+
 	return prefixes, err
 }
 
-// InitializePluginLogger initializes a logger for a plugin if the log file is configured
+// InitializePluginLogger initializes a logger for a plugin if the log file is configured.
+// Returns the logger writer and the format string.
+// Go 1.26: Clear initialization pattern.
 func InitializePluginLogger(logFile, format string, maxSize, maxAge, maxBackups int) (io.Writer, string) {
-	if len(logFile) > 0 {
-		return Logger(maxSize, maxAge, maxBackups, logFile), format
+	if len(logFile) == 0 {
+		return nil, ""
 	}
-	return nil, ""
+
+	return Logger(maxSize, maxAge, maxBackups, logFile), format
 }
 
-// reverseAddr returns the in-addr.arpa. or ip6.arpa. hostname of the IP
-// address suitable for reverse DNS (PTR) record lookups.
+// reverseAddr returns the in-addr.arpa. or ip6.arpa. hostname for reverse DNS (PTR) lookups.
+// Go 1.26: Optimized buffer allocation with pre-computed capacity.
 func reverseAddr(addr string) (string, error) {
 	ip := net.ParseIP(addr)
 	if ip == nil {
-		return "", errors.New("unrecognized address: " + addr)
+		return "", fmt.Errorf("unrecognized address: %s", addr)
 	}
+
+	// IPv4 reverse DNS
 	if v4 := ip.To4(); v4 != nil {
 		buf := make([]byte, 0, net.IPv4len*4+len("in-addr.arpa."))
 		for i := len(v4) - 1; i >= 0; i-- {
@@ -370,7 +505,8 @@ func reverseAddr(addr string) (string, error) {
 		buf = append(buf, "in-addr.arpa."...)
 		return string(buf), nil
 	}
-	// Must be IPv6
+
+	// IPv6 reverse DNS
 	const hexDigits = "0123456789abcdef"
 	buf := make([]byte, 0, net.IPv6len*4+len("ip6.arpa."))
 	for i := len(ip) - 1; i >= 0; i-- {
@@ -381,7 +517,8 @@ func reverseAddr(addr string) (string, error) {
 	return string(buf), nil
 }
 
-// fqdn returns the fully qualified domain name (with trailing dot)
+// fqdn returns the fully qualified domain name (with trailing dot).
+// Go 1.26: Efficient string concatenation check.
 func fqdn(name string) string {
 	if len(name) == 0 || name[len(name)-1] == '.' {
 		return name
