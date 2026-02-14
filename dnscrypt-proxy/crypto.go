@@ -64,10 +64,7 @@ func pad(packet []byte, minSize int) []byte {
 		return append(packet, paddingDelimiter)
 	}
 
-	// Calculate required padding
-	paddingNeeded := minSize - currentLen
-
-	// Preallocate exact size needed
+	// Preallocate exact size needed (single allocation)
 	result := make([]byte, minSize)
 	copy(result, packet)
 	result[currentLen] = paddingDelimiter
@@ -102,6 +99,16 @@ func unpad(packet []byte) ([]byte, error) {
 	return nil, ErrInvalidPaddingShort
 }
 
+// isZeroKey checks if a key consists only of zero bytes.
+// Go 1.26: Constant-time comparison for security.
+func isZeroKey(key []byte) bool {
+	var result byte
+	for i := 0; i < len(key); i++ {
+		result |= key[i]
+	}
+	return result == 0
+}
+
 // ComputeSharedKey computes a shared secret key using X25519 key exchange.
 // Supports both XChacha20-Poly1305 and XSalsa20-Poly1305 constructions.
 // Go 1.26: Better error handling and clearer logic flow.
@@ -110,24 +117,24 @@ func ComputeSharedKey(
 	secretKey *[32]byte,
 	serverPk *[32]byte,
 	providerName *string,
-) ([32]byte, error) {
-	var sharedKey [32]byte
-
+) (sharedKey [32]byte) {
 	if cryptoConstruction == XChacha20Poly1305 {
 		// XChacha20-Poly1305: HChaCha20(X25519(sk, pk), 00...00)
 		dhKey, err := curve25519.X25519(secretKey[:], serverPk[:])
 		if err != nil {
 			if providerName != nil {
 				dlog.Criticalf("[%v] Weak XChaCha20 public key", *providerName)
+			} else {
+				dlog.Critical("Weak XChaCha20 public key")
 			}
-			return sharedKey, fmt.Errorf("%w (XChaCha20): %w", ErrWeakPublicKey, err)
+			return
 		}
 
 		// Apply HChaCha20 with zero nonce
 		var zeroNonce [16]byte
 		subKey, err := chacha20.HChaCha20(dhKey, zeroNonce[:])
 		if err != nil {
-			return sharedKey, fmt.Errorf("HChaCha20 failed: %w", err)
+			dlog.Fatal(err)
 		}
 
 		copy(sharedKey[:], subKey)
@@ -139,28 +146,18 @@ func ComputeSharedKey(
 		if isZeroKey(sharedKey[:]) {
 			if providerName != nil {
 				dlog.Criticalf("[%v] Weak XSalsa20 public key", *providerName)
+			} else {
+				dlog.Critical("Weak XSalsa20 public key")
 			}
 
 			// Generate random key as fallback (prevents protocol failure)
 			if _, err := rand.Read(sharedKey[:]); err != nil {
-				return sharedKey, fmt.Errorf("failed to generate fallback key: %w", err)
+				dlog.Fatal(err)
 			}
-
-			return sharedKey, ErrWeakPublicKey
 		}
 	}
 
-	return sharedKey, nil
-}
-
-// isZeroKey checks if a key consists only of zero bytes.
-// Go 1.26: Constant-time comparison for security.
-func isZeroKey(key []byte) bool {
-	var result byte
-	for i := 0; i < len(key); i++ {
-		result |= key[i]
-	}
-	return result == 0
+	return sharedKey
 }
 
 // Encrypt encrypts a DNS packet using the DNSCrypt protocol.
@@ -224,7 +221,7 @@ func (proxy *Proxy) generateEphemeralKeys(
 	curve25519.ScalarBaseMult(&ephPk, &ephSk)
 
 	// Compute shared key using ephemeral secret
-	computedSharedKey, err := ComputeSharedKey(
+	computedSharedKey := ComputeSharedKey(
 		serverInfo.CryptoConstruction,
 		&ephSk,
 		&serverInfo.ServerPk,
@@ -233,10 +230,6 @@ func (proxy *Proxy) generateEphemeralKeys(
 
 	// Zero out ephemeral secret key (Go 1.21+ clear is more efficient)
 	clear(ephSk[:])
-
-	if err != nil {
-		return nil, nil, err
-	}
 
 	return &ephPk, &computedSharedKey, nil
 }
