@@ -4,8 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
-	"errors"
-	"fmt"
 	"net"
 	"os"
 	"runtime"
