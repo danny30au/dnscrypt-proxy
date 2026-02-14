@@ -399,7 +399,7 @@ func (proxy *Proxy) sourcePrefetchLoop(ctx context.Context) {
 
 		delay := PrefetchSources(proxy.xTransport, proxy.sources)
 
-		// FIX: Use clocksmith.Sleep directly with delay, it handles context internally
+		// Use clocksmith.Sleep directly - it's designed for this use case
 		clocksmith.Sleep(delay)
 
 		// Check again after sleep in case shutdown was requested
@@ -438,7 +438,7 @@ func (proxy *Proxy) certRefreshLoop(ctx context.Context, liveServers int) {
 			delay = proxy.certRefreshDelayAfterFailure
 		}
 
-		// FIX: Use clocksmith.Sleep directly with delay
+		// Use clocksmith.Sleep directly
 		clocksmith.Sleep(delay)
 
 		// Check after sleep in case shutdown was requested
@@ -886,7 +886,9 @@ func (proxy *Proxy) startAcceptingClients(ctx context.Context) {
 	proxy.tcpListeners = nil
 
 	for _, acceptPc := range proxy.localDoHListeners {
-		go proxy.localDoHListener(ctx, acceptPc)
+		// FIX: localDoHListener in local-doh.go doesn't accept context parameter
+		// Call it with just the listener parameter as defined in local-doh.go:100
+		go proxy.localDoHListener(acceptPc)
 	}
 	proxy.localDoHListeners = nil
 }
