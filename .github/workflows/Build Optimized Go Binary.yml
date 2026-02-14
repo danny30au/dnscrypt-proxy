@@ -25,7 +25,7 @@ jobs:
           GOEXPERIMENT: "greenteagc,jsonv2,nodwarf5,simd"
           GOGC: "2000"
           GOAMD64: v3
-          GODEBUG: "thp=1,netdns=go,gctrace=0,madvdontneed=1,tls13=1"
+          GODEBUG: "thp=1,netdns=go,gctrace=0,madvdontneed=1,tls13=1,asyncpreemptoff=1"
           GOPRIVATE: "codeberg.org/miekg/dns,github.com/quic-go/quic-go,github.com/gorilla/websocket,google.golang.org/grpc,github.com/hashicorp/go-immutable-radix/v2,github.com/davecgh/go-spew,github.com/quic-go/qpack"
           GOPROXY: "https://proxy.golang.org,direct"
         run: |
