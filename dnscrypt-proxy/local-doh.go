@@ -2,10 +2,12 @@ package main
 
 import (
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -13,101 +15,158 @@ import (
 	"github.com/jedisct1/dlog"
 )
 
+const dohMediaType = "application/dns-message"
+
 type localDoHHandler struct {
 	proxy *Proxy
 }
 
-func (handler localDoHHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
-	proxy := handler.proxy
+func (h localDoHHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	proxy := h.proxy
+	if proxy == nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
 	if !proxy.clientsCountInc() {
 		dlog.Warnf("Too many incoming connections (max=%d)", proxy.maxClients)
+		http.Error(w, "too many incoming connections", http.StatusServiceUnavailable)
 		return
 	}
 	defer proxy.clientsCountDec()
-	dataType := "application/dns-message"
-	writer.Header().Set("Server", "dnscrypt-proxy")
-	if request.URL.Path != proxy.localDoHPath {
-		writer.WriteHeader(404)
+
+	w.Header().Set("Server", "dnscrypt-proxy")
+
+	if r.URL.Path != proxy.localDoHPath {
+		http.NotFound(w, r)
 		return
 	}
-	packet := []byte{}
-	var err error
-	start := time.Now()
-	if request.Method == "POST" &&
-		request.Header.Get("Content-Type") == dataType {
-		packet, err = io.ReadAll(io.LimitReader(request.Body, int64(MaxDNSPacketSize)))
-		if err != nil {
-			dlog.Warnf("No body in a local DoH query")
-			return
-		}
-	} else if request.Method == "GET" && request.Header.Get("Accept") == dataType {
-		encodedPacket := request.URL.Query().Get("dns")
-		if len(encodedPacket) >= MinDNSPacketSize*4/3 && len(encodedPacket) <= MaxDNSPacketSize*4/3 {
-			packet, err = base64.RawURLEncoding.DecodeString(encodedPacket)
-			if err != nil {
-				dlog.Warnf("Invalid base64 in a local DoH query")
-				return
-			}
-		}
-	}
-	if len(packet) < MinDNSPacketSize {
-		writer.Header().Set("Content-Type", "text/plain")
-		writer.WriteHeader(400)
-		writer.Write([]byte("dnscrypt-proxy local DoH server\n"))
+
+	packet, start, err := readDoHPacket(r)
+	if err != nil {
+		// Keep responses simple and standards-friendly.
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	clientAddr, err := net.ResolveTCPAddr("tcp", request.RemoteAddr)
+
+	clientAddr, err := net.ResolveTCPAddr("tcp", r.RemoteAddr)
 	if err != nil {
 		dlog.Errorf("Unable to get the client address: [%v]", err)
+		http.Error(w, "bad client address", http.StatusBadRequest)
 		return
 	}
 	xClientAddr := net.Addr(clientAddr)
-	hasEDNS0Padding, err := hasEDNS0Padding(packet)
+
+	hadPadding, err := hasEDNS0Padding(packet)
 	if err != nil {
-		writer.WriteHeader(400)
+		http.Error(w, "invalid dns message", http.StatusBadRequest)
 		return
 	}
-	response := proxy.processIncomingQuery("local_doh", proxy.xTransport.mainProto, packet, &xClientAddr, nil, start, false)
+
+	response := proxy.processIncomingQuery(
+		"local_doh",
+		proxy.xTransport.mainProto,
+		packet,
+		&xClientAddr,
+		nil,
+		start,
+		false,
+	)
 	if len(response) == 0 {
-		writer.WriteHeader(500)
+		http.Error(w, "upstream failure", http.StatusInternalServerError)
 		return
 	}
+
 	msg := dns.Msg{Data: packet}
 	if err := msg.Unpack(); err != nil {
-		writer.WriteHeader(400)
+		http.Error(w, "invalid dns message", http.StatusBadRequest)
 		return
 	}
+
+	response, err = applyDoHPadding(w, &msg, response, hadPadding)
+	if err != nil {
+		dlog.Critical(err)
+		http.Error(w, "padding failure", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", dohMediaType)
+	w.Header().Set("Content-Length", strconv.Itoa(len(response)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(response)
+}
+
+func readDoHPacket(r *http.Request) (packet []byte, start time.Time, err error) {
+	start = time.Now()
+
+	switch r.Method {
+	case http.MethodPost:
+		if r.Header.Get("Content-Type") != dohMediaType {
+			return nil, start, errors.New("invalid content type")
+		}
+		packet, err = io.ReadAll(io.LimitReader(r.Body, int64(MaxDNSPacketSize)))
+		if err != nil {
+			return nil, start, errors.New("unable to read body")
+		}
+
+	case http.MethodGet:
+		if r.Header.Get("Accept") != dohMediaType {
+			return nil, start, errors.New("invalid accept header")
+		}
+		encoded := r.URL.Query().Get("dns")
+		if len(encoded) < MinDNSPacketSize*4/3 || len(encoded) > MaxDNSPacketSize*4/3 {
+			return nil, start, errors.New("missing or invalid dns parameter")
+		}
+		packet, err = base64.RawURLEncoding.DecodeString(encoded)
+		if err != nil {
+			return nil, start, errors.New("invalid base64")
+		}
+
+	default:
+		return nil, start, errors.New("method not allowed")
+	}
+
+	if len(packet) < MinDNSPacketSize {
+		return nil, start, errors.New("dns message too short")
+	}
+
+	return packet, start, nil
+}
+
+func applyDoHPadding(w http.ResponseWriter, q *dns.Msg, response []byte, clientHadPadding bool) ([]byte, error) {
 	responseLen := len(response)
 	paddedLen := dohPaddedLen(responseLen)
 	padLen := paddedLen - responseLen
-	if hasEDNS0Padding {
-		response, err = addEDNS0PaddingIfNoneFound(&msg, response, padLen)
-		if err != nil {
-			dlog.Critical(err)
-			writer.WriteHeader(500)
-			return
-		}
-	} else {
-		pad := strings.Repeat("X", padLen)
-		writer.Header().Set("X-Pad", pad)
+	if padLen <= 0 {
+		return response, nil
 	}
-	writer.Header().Set("Content-Type", dataType)
-	writer.Header().Set("Content-Length", fmt.Sprint(len(response)))
-	writer.WriteHeader(200)
-	writer.Write(response)
+
+	if clientHadPadding {
+		return addEDNS0PaddingIfNoneFound(q, response, padLen)
+	}
+
+	// If the client didn't send padding, mimic previous behavior: use a header.
+	w.Header().Set("X-Pad", strings.Repeat("X", padLen))
+	return response, nil
 }
 
 func (proxy *Proxy) localDoHListener(acceptPc *net.TCPListener) {
 	defer acceptPc.Close()
-	if len(proxy.localDoHCertFile) == 0 || len(proxy.localDoHCertKeyFile) == 0 {
+
+	if proxy == nil {
+		dlog.Fatal("Proxy is nil")
+	}
+	if proxy.localDoHCertFile == "" || proxy.localDoHCertKeyFile == "" {
 		dlog.Fatal("A certificate and a key are required to start a local DoH service")
 	}
+
 	httpServer := &http.Server{
 		ReadTimeout:  proxy.timeout,
 		WriteTimeout: proxy.timeout,
 		Handler:      localDoHHandler{proxy: proxy},
 	}
 	httpServer.SetKeepAlivesEnabled(true)
+
 	if err := httpServer.ServeTLS(acceptPc, proxy.localDoHCertFile, proxy.localDoHCertKeyFile); err != nil {
 		dlog.Fatal(err)
 	}
