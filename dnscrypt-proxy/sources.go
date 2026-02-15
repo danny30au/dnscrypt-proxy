@@ -32,7 +32,7 @@ const (
 
 // Source represents a DNS server list source with caching and signature verification.
 type Source struct {
-	mu                      sync.RWMutex
+	sync.RWMutex
 	name                    string
 	urls                    []*url.URL
 	format                  SourceFormat
@@ -86,9 +86,9 @@ func (source *Source) fetchFromCache() (time.Duration, error) {
 		return 0, err
 	}
 
-	source.mu.Lock()
+	source.Lock()
 	source.bin = bin
-	source.mu.Unlock()
+	source.Unlock()
 
 	fi, err := os.Stat(source.cacheFile)
 	if err != nil {
@@ -146,9 +146,9 @@ func (source *Source) updateCache(bin, sig []byte) {
 		absPath = resolved
 	}
 
-	source.mu.Lock()
+	source.Lock()
 	needsWrite := !bytes.Equal(source.bin, bin)
-	source.mu.Unlock()
+	source.Unlock()
 
 	if needsWrite {
 		if err := writeSource(file, bin, sig); err != nil {
@@ -160,9 +160,9 @@ func (source *Source) updateCache(bin, sig []byte) {
 		dlog.Warnf("Couldn't update cache file timestamps [%s]: %s", absPath, err)
 	}
 
-	source.mu.Lock()
+	source.Lock()
 	source.bin = bin
-	source.mu.Unlock()
+	source.Unlock()
 }
 
 func (source *Source) parseURLs(urls []string) {
@@ -346,10 +346,10 @@ func (source *Source) parseV2() ([]RegisteredServer, error) {
 		dlog.Warn(stampErr)
 	}
 
-	source.mu.RLock()
+	source.RLock()
 	binCopy := make([]byte, len(source.bin))
 	copy(binCopy, source.bin)
-	source.mu.RUnlock()
+	source.RUnlock()
 
 	in := string(binCopy)
 	parts := strings.Split(in, "## ")
