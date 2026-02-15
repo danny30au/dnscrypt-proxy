@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -13,202 +15,310 @@ import (
 	"github.com/jedisct1/dlog"
 )
 
+// CaptivePortalEntryIPs is the list of IPs returned for captive portal detection.
+// Keeping net.IP (instead of netip.Addr) preserves compatibility with existing parsing.
 type CaptivePortalEntryIPs []net.IP
 
+// CaptivePortalMap maps normalized QNAMEs to captive portal response IPs.
 type CaptivePortalMap map[string]CaptivePortalEntryIPs
 
+// CaptivePortalHandler owns the cold-start captive portal listeners.
+// Stop() is safe to call multiple times.
 type CaptivePortalHandler struct {
-	wg            sync.WaitGroup
-	cancelChannel chan struct{}
+	wg        sync.WaitGroup
+	stopOnce  sync.Once
+	cancel    context.CancelFunc
+	cancelCtx context.Context
 }
 
-func (captivePortalHandler *CaptivePortalHandler) Stop() {
-	close(captivePortalHandler.cancelChannel)
-	captivePortalHandler.wg.Wait()
+// newCaptivePortalHandler constructs a handler with an internal cancelable context.
+func newCaptivePortalHandler() *CaptivePortalHandler {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &CaptivePortalHandler{cancelCtx: ctx, cancel: cancel}
 }
 
-func (ipsMap *CaptivePortalMap) GetEntry(msg *dns.Msg) (dns.RR, *CaptivePortalEntryIPs) {
+// Stop stops all captive portal listeners and waits for goroutines to exit.
+func (h *CaptivePortalHandler) Stop() {
+	if h == nil {
+		return
+	}
+	h.stopOnce.Do(func() {
+		if h.cancel != nil {
+			h.cancel()
+		}
+	})
+	h.wg.Wait()
+}
+
+// GetEntry returns the question (as dns.RR) and the configured IPs for that name.
+// Note: returning a pointer to a local variable preserves the original signature.
+func (m *CaptivePortalMap) GetEntry(msg *dns.Msg) (dns.RR, *CaptivePortalEntryIPs) {
+	if m == nil || msg == nil {
+		return nil, nil
+	}
 	if len(msg.Question) != 1 {
 		return nil, nil
 	}
+
 	question := msg.Question[0]
 	hdr := question.Header()
 	name, err := NormalizeQName(hdr.Name)
 	if err != nil {
 		return nil, nil
 	}
-	ips, ok := (*ipsMap)[name]
-	if !ok {
+	if hdr.Class != dns.ClassINET {
 		return nil, nil
 	}
-	if hdr.Class != dns.ClassINET {
+	ips, ok := (*m)[name]
+	if !ok {
 		return nil, nil
 	}
 	return question, &ips
 }
 
+// HandleCaptivePortalQuery synthesizes an A/AAAA answer from a captive portal mapping.
 func HandleCaptivePortalQuery(msg *dns.Msg, question dns.RR, ips *CaptivePortalEntryIPs) *dns.Msg {
+	if msg == nil || question == nil || ips == nil {
+		return nil
+	}
+
 	respMsg := EmptyResponseFromMessage(msg)
-	ttl := uint32(1)
+	const ttl = uint32(1)
+
 	hdr := question.Header()
 	qtype := dns.RRToType(question)
-	if qtype == dns.TypeA {
+
+	switch qtype {
+	case dns.TypeA:
 		for _, xip := range *ips {
-			if ip := xip.To4(); ip != nil {
-				rr := new(dns.A)
-				rr.Hdr = dns.Header{Name: hdr.Name, Class: dns.ClassINET, TTL: ttl}
-				rr.A = rdata.A{Addr: netip.AddrFrom4([4]byte(ip))}
-				respMsg.Answer = append(respMsg.Answer, rr)
+			ip4 := xip.To4()
+			if ip4 == nil {
+				continue
 			}
+			var b4 [4]byte
+			copy(b4[:], ip4)
+			rr := &dns.A{Hdr: dns.Header{Name: hdr.Name, Class: dns.ClassINET, TTL: ttl}}
+			rr.A = rdata.A{Addr: netip.AddrFrom4(b4)}
+			respMsg.Answer = append(respMsg.Answer, rr)
 		}
-	} else if qtype == dns.TypeAAAA {
+
+	case dns.TypeAAAA:
 		for _, xip := range *ips {
-			if xip.To4() == nil {
-				rr := new(dns.AAAA)
-				rr.Hdr = dns.Header{Name: hdr.Name, Class: dns.ClassINET, TTL: ttl}
-				rr.AAAA = rdata.AAAA{Addr: netip.AddrFrom16([16]byte(xip.To16()))}
-				respMsg.Answer = append(respMsg.Answer, rr)
+			if xip.To4() != nil {
+				continue
 			}
+			ip16 := xip.To16()
+			if ip16 == nil {
+				continue
+			}
+			var b16 [16]byte
+			copy(b16[:], ip16)
+			rr := &dns.AAAA{Hdr: dns.Header{Name: hdr.Name, Class: dns.ClassINET, TTL: ttl}}
+			rr.AAAA = rdata.AAAA{Addr: netip.AddrFrom16(b16)}
+			respMsg.Answer = append(respMsg.Answer, rr)
 		}
 	}
 
-	qTypeStr, ok := dns.TypeToString[qtype]
-	if !ok {
+	qTypeStr := dns.TypeToString[qtype]
+	if qTypeStr == "" {
 		qTypeStr = fmt.Sprint(qtype)
 	}
 	dlog.Infof("Query for captive portal detection: [%v] (%v)", hdr.Name, qTypeStr)
+
 	return respMsg
 }
 
-func handleColdStartClient(clientPc *net.UDPConn, cancelChannel chan struct{}, ipsMap *CaptivePortalMap) bool {
+// readDeadline is the maximum time we block while waiting for packets.
+const readDeadline = 1 * time.Second
+
+func handleColdStartConn(ctx context.Context, clientPc *net.UDPConn, ipsMap *CaptivePortalMap) {
+	defer clientPc.Close()
+
 	buffer := make([]byte, MaxDNSPacketSize)
-	clientPc.SetDeadline(time.Now().Add(time.Duration(1) * time.Second))
-	length, clientAddr, err := clientPc.ReadFrom(buffer)
-	exit := false
-	select {
-	case <-cancelChannel:
-		exit = true
-	default:
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		_ = clientPc.SetReadDeadline(time.Now().Add(readDeadline))
+		length, clientAddr, err := clientPc.ReadFrom(buffer)
+		if err != nil {
+			// If we timed out, just re-check cancellation and continue.
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				continue
+			}
+			dlog.Warn(err)
+			return
+		}
+		if length < MinDNSPacketSize {
+			continue
+		}
+
+		packet := buffer[:length]
+		msg := &dns.Msg{Data: packet}
+		if err := msg.Unpack(); err != nil {
+			continue
+		}
+
+		question, ips := ipsMap.GetEntry(msg)
+		if ips == nil {
+			continue
+		}
+
+		respMsg := HandleCaptivePortalQuery(msg, question, ips)
+		if respMsg == nil {
+			continue
+		}
+		if err := respMsg.Pack(); err != nil {
+			continue
+		}
+		if _, err := clientPc.WriteTo(respMsg.Data, clientAddr); err != nil {
+			// Non-fatal: keep listening.
+			dlog.Debugf("Cold start captive portal write failed: %v", err)
+		}
 	}
-	if exit {
-		return true
-	}
-	if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
-		return false
-	}
-	if err != nil {
-		dlog.Warn(err)
-		return true
-	}
-	packet := buffer[:length]
-	msg := &dns.Msg{}
-	msg.Data = packet
-	if err := msg.Unpack(); err != nil {
-		return false
-	}
-	question, ips := ipsMap.GetEntry(msg)
-	if ips == nil {
-		return false
-	}
-	respMsg := HandleCaptivePortalQuery(msg, question, ips)
-	if respMsg == nil {
-		return false
-	}
-	if err := respMsg.Pack(); err == nil {
-		clientPc.WriteTo(respMsg.Data, clientAddr)
-	}
-	return false
 }
 
-func addColdStartListener(
-	ipsMap *CaptivePortalMap,
-	listenAddrStr string,
-	captivePortalHandler *CaptivePortalHandler,
-) error {
+func udpNetworkForListenAddr(listenAddrStr string) string {
+	// Preserve original intent: use udp4 for obvious IPv4 literals, but also handle
+	// bracketed IPv6 or hostnames robustly.
+	if len(listenAddrStr) == 0 {
+		return "udp"
+	}
+
+	host, _, err := net.SplitHostPort(listenAddrStr)
+	if err != nil {
+		// Fallback: original code guessed using isDigit(listenAddrStr[0]).
+		if isDigit(listenAddrStr[0]) {
+			return "udp4"
+		}
+		return "udp"
+	}
+
+	host = strings.Trim(host, "[]")
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.To4() != nil {
+			return "udp4"
+		}
+		return "udp6"
+	}
+	return "udp"
+}
+
+func addColdStartListener(ipsMap *CaptivePortalMap, listenAddrStr string, h *CaptivePortalHandler) error {
+	if h == nil || ipsMap == nil {
+		return errors.New("handler/map is nil")
+	}
 	if len(listenAddrStr) == 0 {
 		return nil
 	}
-	network := "udp"
-	isIPv4 := isDigit(listenAddrStr[0])
-	if isIPv4 {
-		network = "udp4"
-	}
+
+	network := udpNetworkForListenAddr(listenAddrStr)
 	listenUDPAddr, err := net.ResolveUDPAddr(network, listenAddrStr)
 	if err != nil {
 		return err
 	}
+
 	clientPc, err := net.ListenUDP(network, listenUDPAddr)
 	if err != nil {
 		return err
 	}
-	captivePortalHandler.wg.Go(func() {
-		for !handleColdStartClient(clientPc, captivePortalHandler.cancelChannel, ipsMap) {
-		}
-		clientPc.Close()
-	})
+
+	h.wg.Add(1)
+	go func() {
+		defer h.wg.Done()
+		handleColdStartConn(h.cancelCtx, clientPc, ipsMap)
+	}()
+
 	return nil
 }
 
-func ColdStart(proxy *Proxy) (*CaptivePortalHandler, error) {
-	if len(proxy.captivePortalMapFile) == 0 {
-		return nil, nil
-	}
-	lines, err := ReadTextFile(proxy.captivePortalMapFile)
-	if err != nil {
-		dlog.Warn(err)
-		return nil, err
-	}
+func parseCaptivePortalMap(lines string) (CaptivePortalMap, error) {
 	ipsMap := make(CaptivePortalMap)
 	for lineNo, line := range strings.Split(lines, "\n") {
 		line = TrimAndStripInlineComments(line)
 		if len(line) == 0 {
 			continue
 		}
+
 		name, ipsStr, ok := StringTwoFields(line)
 		if !ok {
-			return nil, fmt.Errorf(
-				"Syntax error for a captive portal rule at line %d",
-				1+lineNo,
-			)
+			return nil, fmt.Errorf("syntax error for a captive portal rule at line %d", 1+lineNo)
 		}
-		name, err = NormalizeQName(name)
+
+		// Enforce exact hostname (wildcards belong in the name, not the IP list).
+		if strings.Contains(name, "*") {
+			return nil, fmt.Errorf("a captive portal rule must use an exact host name at line %d", 1+lineNo)
+		}
+
+		normName, err := NormalizeQName(name)
 		if err != nil {
+			// Preserve original behavior: skip invalid names.
 			continue
 		}
-		if strings.Contains(ipsStr, "*") {
-			return nil, fmt.Errorf(
-				"A captive portal rule must use an exact host name at line %d",
-				1+lineNo,
-			)
-		}
+
 		var ips []net.IP
-		for ip := range strings.SplitSeq(ipsStr, ",") {
-			ipStr := strings.TrimSpace(ip)
-			if ip := net.ParseIP(ipStr); ip != nil {
-				ips = append(ips, ip)
-			} else {
-				return nil, fmt.Errorf(
-					"Syntax error for a captive portal rule at line %d",
-					1+lineNo,
-				)
+		for ipToken := range strings.SplitSeq(ipsStr, ",") {
+			ipStr := strings.TrimSpace(ipToken)
+			ip := net.ParseIP(ipStr)
+			if ip == nil {
+				return nil, fmt.Errorf("invalid IP %q for captive portal rule at line %d", ipStr, 1+lineNo)
 			}
+			ips = append(ips, ip)
 		}
-		ipsMap[name] = ips
+		ipsMap[normName] = ips
 	}
+	return ipsMap, nil
+}
+
+// ColdStart sets up lightweight UDP listeners that answer captive portal detection queries.
+func ColdStart(proxy *Proxy) (*CaptivePortalHandler, error) {
+	if proxy == nil {
+		return nil, errors.New("proxy is nil")
+	}
+	if len(proxy.captivePortalMapFile) == 0 {
+		return nil, nil
+	}
+
+	lines, err := ReadTextFile(proxy.captivePortalMapFile)
+	if err != nil {
+		dlog.Warn(err)
+		return nil, err
+	}
+
+	ipsMap, err := parseCaptivePortalMap(lines)
+	if err != nil {
+		return nil, err
+	}
+
+	h := newCaptivePortalHandler()
 	listenAddrStrs := proxy.listenAddresses
-	captivePortalHandler := CaptivePortalHandler{
-		cancelChannel: make(chan struct{}),
-	}
-	ok := false
+
+	var firstErr error
+	anyOK := false
 	for _, listenAddrStr := range listenAddrStrs {
-		err = addColdStartListener(&ipsMap, listenAddrStr, &captivePortalHandler)
+		err := addColdStartListener(&ipsMap, listenAddrStr, h)
 		if err == nil {
-			ok = true
+			anyOK = true
+			continue
+		}
+		// Preserve the original behavior: keep trying other listeners.
+		if firstErr == nil {
+			firstErr = err
 		}
 	}
-	if ok {
-		err = nil
-	}
+
 	proxy.captivePortalMap = &ipsMap
-	return &captivePortalHandler, err
+	if anyOK {
+		return h, nil
+	}
+	// If none succeeded, return the first error.
+	if firstErr == nil {
+		firstErr = errors.New("no captive portal listeners could be started")
+	}
+	// Nothing started; ensure goroutines stop (none should exist, but keep it safe).
+	h.Stop()
+	return nil, firstErr
 }
