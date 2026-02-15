@@ -19,14 +19,16 @@ import (
 const dnsHeaderLen = 12
 
 func EmptyResponseFromMessage(srcMsg *dns.Msg) *dns.Msg {
+	// Keep behavior compatible with the codeberg/miekg/dns fork used by this project.
+	// In this fork, Msg.Question is not a []dns.Question, so avoid referencing dns.Question.
 	if srcMsg == nil {
 		return &dns.Msg{}
 	}
-	// Copy only the request metadata required for a minimal response.
+	// Copy only metadata required for a minimal response.
 	dstMsg := &dns.Msg{}
 	dstMsg.ID = srcMsg.ID
 	dstMsg.Opcode = srcMsg.Opcode
-	dstMsg.Question = append([]dns.Question(nil), srcMsg.Question...)
+	dstMsg.Question = srcMsg.Question
 	dstMsg.Response = true
 	dstMsg.RecursionAvailable = true
 	dstMsg.RecursionDesired = srcMsg.RecursionDesired
@@ -69,11 +71,11 @@ func RefusedResponseFromMessage(srcMsg *dns.Msg, refusedCode bool, ipv4 net.IP, 
 		return dstMsg
 	}
 
-	// Synthetic success response.
 	dstMsg.Rcode = dns.RcodeSuccess
 	if srcMsg == nil || len(srcMsg.Question) == 0 {
 		return dstMsg
 	}
+
 	question := srcMsg.Question[0]
 	qtype := dns.RRToType(question)
 	qname := question.Header().Name
@@ -203,7 +205,6 @@ func getMinTTL(msg *dns.Msg, minTTL, maxTTL, cacheNegMinTTL, cacheNegMaxTTL uint
 		return time.Duration(cacheNegMinTTL) * time.Second
 	}
 
-	// Start from configured maxima, then clamp to the smallest observed TTL.
 	ttl := maxTTL
 	if msg.Rcode != dns.RcodeSuccess {
 		ttl = cacheNegMaxTTL
@@ -285,22 +286,18 @@ func addEDNS0PaddingIfNoneFound(msg *dns.Msg, unpaddedPacket []byte, paddingLen 
 		return unpaddedPacket, nil
 	}
 
-	// Enable EDNS0 if not already enabled.
 	if msg.UDPSize == 0 {
 		msg.UDPSize = uint16(MaxDNSPacketSize)
 	}
-
-	// If padding already exists, keep the original packet.
 	for _, rr := range msg.Pseudo {
 		if _, ok := rr.(*dns.PADDING); ok {
 			return unpaddedPacket, nil
 		}
 	}
 
-	// miekg/dns encodes EDNS0 padding as a hex string; "00" repeated N times => N bytes.
-	paddingRR := &dns.PADDING{Padding: strings.Repeat("00", paddingLen)}
+	// Preserve original behavior: padding is encoded as hex; 0x58 repeated.
+	paddingRR := &dns.PADDING{Padding: strings.Repeat("58", paddingLen)}
 	msg.Pseudo = append(msg.Pseudo, paddingRR)
-
 	if err := msg.Pack(); err != nil {
 		return nil, err
 	}
@@ -379,11 +376,10 @@ func DNSExchange(
 ) (*dns.Msg, time.Duration, bool, error) {
 	for {
 		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
 
 		const maxTries = 3
 		channel := make(chan DNSExchangeResponse, 2*maxTries)
-		var err error
+		var lastErr error
 		options := 0
 
 		var cancelOnce sync.Once
@@ -403,10 +399,10 @@ func DNSExchange(
 						return
 					case <-t.C:
 					}
-					option := _dnsExchange(proxy, proto, q, serverAddress, relay, 1500)
-					option.fragmentsBlocked = false
-					option.priority = 0
-					channel <- option
+					opt := _dnsExchange(proxy, proto, q, serverAddress, relay, 1500)
+					opt.fragmentsBlocked = false
+					opt.priority = 0
+					channel <- opt
 				}(queryCopy, time.Duration(200*tries)*time.Millisecond)
 			}
 
@@ -422,10 +418,10 @@ func DNSExchange(
 					return
 				case <-t.C:
 				}
-				option := _dnsExchange(proxy, proto, q, serverAddress, relay, 480)
-				option.fragmentsBlocked = true
-				option.priority = 1
-				channel <- option
+				opt := _dnsExchange(proxy, proto, q, serverAddress, relay, 480)
+				opt.fragmentsBlocked = true
+				opt.priority = 1
+				channel <- opt
 			}(queryCopy, time.Duration(250*tries)*time.Millisecond)
 		}
 
@@ -442,10 +438,12 @@ func DNSExchange(
 				}
 				continue
 			}
-			if err == nil {
-				err = resp.err
+			if lastErr == nil {
+				lastErr = resp.err
 			}
 		}
+
+		cancelAll()
 
 		if best != nil {
 			if serverName != nil {
@@ -459,10 +457,10 @@ func DNSExchange(
 		}
 
 		if relay == nil || !proxy.anonDirectCertFallback {
-			if err == nil {
-				err = errors.New("unable to reach the server")
+			if lastErr == nil {
+				lastErr = errors.New("unable to reach the server")
 			}
-			return nil, 0, false, err
+			return nil, 0, false, lastErr
 		}
 
 		if serverName != nil {
@@ -551,7 +549,6 @@ func _dnsExchange(
 		if proxyDialer == nil {
 			pc, err = net.DialTimeout("tcp", upstreamAddr.String(), proxy.timeout)
 		} else {
-			// Use the actual upstream address (relay-aware), not the original tcpAddr.
 			pc, err = (*proxyDialer).Dial("tcp", upstreamAddr.String())
 		}
 		if err != nil {
