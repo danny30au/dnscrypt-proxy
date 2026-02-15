@@ -399,7 +399,7 @@ func (plugin *PluginForward) forwardQuery(pluginsState *PluginsState, msg *dns.M
 
 		dlog.Debugf("Forwarding [%s] to [%s]", qName, server)
 
-		resp Msg, err := plugin.exchangeWithServer(pluginsState, msg, server)
+		respMsg, err := plugin.exchangeWithServer(pluginsState, msg, server)
 		if err != nil {
 			continue
 		}
