@@ -8,29 +8,37 @@ import (
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
-func Logger(logMaxSize int, logMaxAge int, logMaxBackups int, fileName string) io.Writer {
+// Logger returns an io.Writer that handles log rotation or direct output to special files/stdout.
+func Logger(logMaxSize, logMaxAge, logMaxBackups int, fileName string) io.Writer {
+	// Handle stdout directly.
 	if fileName == "/dev/stdout" {
 		return os.Stdout
 	}
-	if st, _ := os.Stat(fileName); st != nil && !st.Mode().IsRegular() {
-		if st.Mode().IsDir() {
-			dlog.Fatalf("[%v] is a directory", fileName)
+
+	// Check if the file exists and its type.
+	info, err := os.Stat(fileName)
+	if err == nil && !info.Mode().IsRegular() {
+		if info.IsDir() {
+			dlog.Fatalf("[%s] is a directory", fileName)
 		}
-		// Special files (devices, pipes) are opened directly
-		// Note: The caller is responsible for closing the returned file descriptor
-		// This is handled by the plugin cleanup during proxy shutdown
+
+		// Special files (devices, pipes) are opened directly without rotation.
 		fp, err := os.OpenFile(fileName, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o644)
 		if err != nil {
-			dlog.Fatalf("Unable to access [%v]: [%v]", fileName, err)
+			dlog.Fatalf("Unable to access special file [%s]: %v", fileName, err)
 		}
 		return fp
 	}
+
+	// Verify we have permission to create/write the file before setting up the rotated logger.
 	if fp, err := os.OpenFile(fileName, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o644); err == nil {
 		fp.Close()
 	} else {
-		dlog.Errorf("Unable to create [%v]: [%v]", fileName, err)
+		dlog.Errorf("Unable to create/access log file [%s]: %v", fileName, err)
 	}
-	logger := &lumberjack.Logger{
+
+	// Return a lumberjack logger for standard files with rotation enabled.
+	return &lumberjack.Logger{
 		LocalTime:  true,
 		MaxSize:    logMaxSize,
 		MaxAge:     logMaxAge,
@@ -38,6 +46,4 @@ func Logger(logMaxSize int, logMaxAge int, logMaxBackups int, fileName string) i
 		Filename:   fileName,
 		Compress:   true,
 	}
-
-	return logger
 }
