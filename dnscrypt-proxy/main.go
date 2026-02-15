@@ -1,11 +1,9 @@
 package main
 
 import (
-	crypto_rand "crypto/rand"
-	"encoding/binary"
 	"flag"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"os"
 	"os/signal"
 	"runtime"
@@ -32,16 +30,9 @@ func main() {
 	if tzErr != nil {
 		dlog.Warnf("Timezone setup failed: [%v]", tzErr)
 	}
-	runtime.MemProfileRate = 0
 
-	// Initialize random number generator
-	// Note: As of Go 1.20, the global RNG is automatically seeded
-	// This explicit seeding is kept for compatibility with older Go versions
-	seed := make([]byte, 8)
-	if _, err := crypto_rand.Read(seed); err != nil {
-		dlog.Fatal(err)
-	}
-	rand.Seed(int64(binary.LittleEndian.Uint64(seed)))
+	// Disable runtime memory profiling by default.
+	runtime.MemProfileRate = 0
 
 	pwd, err := os.Getwd()
 	if err != nil {
@@ -50,6 +41,7 @@ func main() {
 
 	svcFlag := flag.String("service", "", fmt.Sprintf("Control the system service: %q", service.ControlAction))
 	version := flag.Bool("version", false, "print current proxy version")
+
 	flags := ConfigFlags{}
 	flags.Resolve = flag.String("resolve", "", "resolve a DNS name (string can be <name> or <name>,<resolver address>)")
 	flags.List = flag.Bool("list", false, "print the list of available resolvers for the enabled filters")
@@ -73,9 +65,10 @@ func main() {
 		WarnIfMaybeWritableByOtherUsers(fullexecpath)
 	}
 
-	app := &App{
-		flags: &flags,
-	}
+	// Ensure math/rand/v2 is linked and usable (it is auto-seeded).
+	_ = rand.Uint64()
+
+	app := &App{flags: &flags}
 
 	svcOptions := make(service.KeyValue)
 	svcOptions["ReloadSignal"] = "HUP"
@@ -87,6 +80,7 @@ func main() {
 		Arguments:        []string{"-config", *flags.ConfigFile},
 		Option:           svcOptions,
 	}
+
 	svc, err := service.New(app, svcConfig)
 	if err != nil {
 		svc = nil
@@ -95,41 +89,45 @@ func main() {
 
 	app.proxy = NewProxy()
 	_ = ServiceManagerStartNotify()
-	if len(*svcFlag) != 0 {
+
+	if *svcFlag != "" {
 		if svc == nil {
 			dlog.Fatal("Built-in service installation is not supported on this platform")
 		}
 		if err := service.Control(svc, *svcFlag); err != nil {
 			dlog.Fatal(err)
 		}
-		if *svcFlag == "install" {
+		switch *svcFlag {
+		case "install":
 			dlog.Notice("Installed as a service. Use `-service start` to start")
-		} else if *svcFlag == "uninstall" {
+		case "uninstall":
 			dlog.Notice("Service uninstalled")
-		} else if *svcFlag == "start" {
+		case "start":
 			dlog.Notice("Service started")
-		} else if *svcFlag == "stop" {
+		case "stop":
 			dlog.Notice("Service stopped")
-		} else if *svcFlag == "restart" {
+		case "restart":
 			dlog.Notice("Service restarted")
 		}
 		return
 	}
+
 	if svc != nil {
 		if err := svc.Run(); err != nil {
 			dlog.Fatal(err)
 		}
-	} else {
-		app.quit = make(chan os.Signal, 1)
-		signal.Notify(app.quit, os.Interrupt, syscall.SIGTERM)
-		// Possible to exit while initializing
-		go app.AppMain()
-		<-app.quit
-		dlog.Notice("Quit signal received...")
+		return
 	}
+
+	// Non-service mode.
+	app.quit = make(chan os.Signal, 1)
+	signal.Notify(app.quit, os.Interrupt, syscall.SIGTERM)
+	go app.AppMain()
+	<-app.quit
+	dlog.Notice("Quit signal received...")
 }
 
-func (app *App) Start(service service.Service) error {
+func (app *App) Start(service.Service) error {
 	go app.AppMain()
 	return nil
 }
@@ -144,7 +142,6 @@ func (app *App) AppMain() {
 	if err := app.proxy.InitPluginsGlobals(); err != nil {
 		dlog.Fatal(err)
 	}
-	// Initialize hot-reloading support
 	if err := app.proxy.InitHotReload(); err != nil {
 		dlog.Warnf("Failed to initialize hot-reloading: %v", err)
 	}
@@ -152,7 +149,7 @@ func (app *App) AppMain() {
 	runtime.GC()
 }
 
-func (app *App) Stop(service service.Service) error {
+func (app *App) Stop(service.Service) error {
 	if app.proxy != nil && app.proxy.udpConnPool != nil {
 		app.proxy.udpConnPool.Close()
 	}
