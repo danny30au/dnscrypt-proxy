@@ -30,7 +30,7 @@ const (
 
 // Protocol constants
 const (
-	ClientMagicLen  = 8
+	ClientMagicLen    = 8
 	MaxHTTPBodyLength = 1000000
 )
 
@@ -61,10 +61,24 @@ var (
 
 // Common errors
 var (
-	ErrPacketTooLarge  = errors.New("packet too large")
-	ErrPacketTooShort  = errors.New("packet too short")
+	ErrPacketTooLarge    = errors.New("packet too large")
+	ErrPacketTooShort    = errors.New("packet too short")
 	ErrLogNotInitialized = errors.New("log file not initialized")
 )
+
+// Min returns the minimum of two integers.
+// Go 1.26: Wrapper around built-in min() for backward compatibility.
+// Deprecated: Use built-in min() function directly in new code.
+func Min(a, b int) int {
+	return min(a, b)
+}
+
+// Max returns the maximum of two integers.
+// Go 1.26: Wrapper around built-in max() for backward compatibility.
+// Deprecated: Use built-in max() function directly in new code.
+func Max(a, b int) int {
+	return max(a, b)
+}
 
 // PrefixWithSize prepends a 2-byte length prefix to a DNS packet.
 // Go 1.26: Uses binary.BigEndian.AppendUint16 for zero-allocation encoding (Go 1.19+).
@@ -172,7 +186,7 @@ func TrimAndStripInlineComments(str string) string {
 			return ""
 		}
 		// Check if # is preceded by whitespace
-		if prev := str[idx-1]; prev == ' ' || prev == '\t' {
+		if prev := str[idx-1]; prev == ' ' || prev == '	' {
 			str = str[:idx-1]
 		}
 	}
@@ -295,13 +309,14 @@ func formatTSVLine(clientIP, qName, reason string, additionalFields ...string) s
 	line.Grow(128 + len(qName) + len(reason) + len(additionalFields)*32)
 
 	timestamp := formatTimestampTSV(time.Now())
-	fmt.Fprintf(&line, "%s\t%s\t%s\t%s", timestamp, clientIP, StringQuote(qName), StringQuote(reason))
+	fmt.Fprintf(&line, "%s	%s	%s	%s", timestamp, clientIP, StringQuote(qName), StringQuote(reason))
 
 	for _, field := range additionalFields {
-		fmt.Fprintf(&line, "\t%s", StringQuote(field))
+		fmt.Fprintf(&line, "	%s", StringQuote(field))
 	}
 
-	line.WriteByte('\n')
+	line.WriteByte('
+')
 	return line.String()
 }
 
@@ -312,19 +327,20 @@ func formatLTSVLine(clientIP, qName, reason string, additionalFields ...string) 
 	// Pre-allocate approximate capacity
 	line.Grow(128 + len(qName) + len(reason) + len(additionalFields)*32)
 
-	fmt.Fprintf(&line, "time:%d\thost:%s\tqname:%s\tmessage:%s",
+	fmt.Fprintf(&line, "time:%d	host:%s	qname:%s	message:%s",
 		time.Now().Unix(), clientIP, StringQuote(qName), StringQuote(reason))
 
 	// Add additional fields with labels
 	for i, field := range additionalFields {
 		if i == 0 {
-			fmt.Fprintf(&line, "\tip:%s", StringQuote(field))
+			fmt.Fprintf(&line, "	ip:%s", StringQuote(field))
 		} else {
-			fmt.Fprintf(&line, "\tfield%d:%s", i, StringQuote(field))
+			fmt.Fprintf(&line, "	field%d:%s", i, StringQuote(field))
 		}
 	}
 
-	line.WriteByte('\n')
+	line.WriteByte('
+')
 	return line.String()
 }
 
@@ -421,7 +437,8 @@ func ParseIPRule(line string, lineNo int) (string, bool, error) {
 // Lines starting with # are treated as comments and skipped.
 // Go 1.26: Clean iterator pattern with proper error propagation.
 func ProcessConfigLines(lines string, processor func(line string, lineNo int) error) error {
-	for lineNo, line := range strings.Split(lines, "\n") {
+	for lineNo, line := range strings.Split(lines, "
+") {
 		line = TrimAndStripInlineComments(line)
 		if len(line) == 0 {
 			continue
