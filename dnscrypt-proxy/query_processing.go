@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
-	"net/url"
 	"time"
 
 	"codeberg.org/miekg/dns"
