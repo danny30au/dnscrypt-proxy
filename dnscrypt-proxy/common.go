@@ -186,7 +186,7 @@ func TrimAndStripInlineComments(str string) string {
 			return ""
 		}
 		// Check if # is preceded by whitespace
-		if prev := str[idx-1]; prev == ' ' || prev == '	' {
+		if prev := str[idx-1]; prev == ' ' || prev == '\t' {
 			str = str[:idx-1]
 		}
 	}
@@ -309,14 +309,13 @@ func formatTSVLine(clientIP, qName, reason string, additionalFields ...string) s
 	line.Grow(128 + len(qName) + len(reason) + len(additionalFields)*32)
 
 	timestamp := formatTimestampTSV(time.Now())
-	fmt.Fprintf(&line, "%s	%s	%s	%s", timestamp, clientIP, StringQuote(qName), StringQuote(reason))
+	fmt.Fprintf(&line, "%s\t%s\t%s\t%s", timestamp, clientIP, StringQuote(qName), StringQuote(reason))
 
 	for _, field := range additionalFields {
-		fmt.Fprintf(&line, "	%s", StringQuote(field))
+		fmt.Fprintf(&line, "\t%s", StringQuote(field))
 	}
 
-	line.WriteByte('
-')
+	line.WriteByte('\n')
 	return line.String()
 }
 
@@ -327,20 +326,19 @@ func formatLTSVLine(clientIP, qName, reason string, additionalFields ...string) 
 	// Pre-allocate approximate capacity
 	line.Grow(128 + len(qName) + len(reason) + len(additionalFields)*32)
 
-	fmt.Fprintf(&line, "time:%d	host:%s	qname:%s	message:%s",
+	fmt.Fprintf(&line, "time:%d\thost:%s\tqname:%s\tmessage:%s",
 		time.Now().Unix(), clientIP, StringQuote(qName), StringQuote(reason))
 
 	// Add additional fields with labels
 	for i, field := range additionalFields {
 		if i == 0 {
-			fmt.Fprintf(&line, "	ip:%s", StringQuote(field))
+			fmt.Fprintf(&line, "\tip:%s", StringQuote(field))
 		} else {
-			fmt.Fprintf(&line, "	field%d:%s", i, StringQuote(field))
+			fmt.Fprintf(&line, "\tfield%d:%s", i, StringQuote(field))
 		}
 	}
 
-	line.WriteByte('
-')
+	line.WriteByte('\n')
 	return line.String()
 }
 
@@ -437,8 +435,7 @@ func ParseIPRule(line string, lineNo int) (string, bool, error) {
 // Lines starting with # are treated as comments and skipped.
 // Go 1.26: Clean iterator pattern with proper error propagation.
 func ProcessConfigLines(lines string, processor func(line string, lineNo int) error) error {
-	for lineNo, line := range strings.Split(lines, "
-") {
+	for lineNo, line := range strings.Split(lines, "\n") {
 		line = TrimAndStripInlineComments(line)
 		if len(line) == 0 {
 			continue
