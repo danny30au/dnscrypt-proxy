@@ -2,6 +2,7 @@ package main
 
 import (
 	"net"
+	"syscall"
 
 	"github.com/jedisct1/dlog"
 	"golang.org/x/sys/unix"
@@ -10,7 +11,7 @@ import (
 // udpListenerConfig returns a ListenConfig with optimized UDP socket options.
 func (proxy *Proxy) udpListenerConfig() (*net.ListenConfig, error) {
 	return &net.ListenConfig{
-		Control: func(_, _ string, c unix.RawConn) error {
+		Control: func(_, _ string, c syscall.RawConn) error {
 			var sockErr error
 			err := c.Control(func(fd uintptr) {
 				sockErr = setUDPSockOpts(int(fd))
@@ -26,7 +27,7 @@ func (proxy *Proxy) udpListenerConfig() (*net.ListenConfig, error) {
 // tcpListenerConfig returns a ListenConfig with optimized TCP socket options.
 func (proxy *Proxy) tcpListenerConfig() (*net.ListenConfig, error) {
 	return &net.ListenConfig{
-		Control: func(_, _ string, c unix.RawConn) error {
+		Control: func(_, _ string, c syscall.RawConn) error {
 			var sockErr error
 			err := c.Control(func(fd uintptr) {
 				sockErr = setTCPSockOpts(int(fd))
