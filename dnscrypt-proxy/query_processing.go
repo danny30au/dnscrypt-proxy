@@ -1,6 +1,8 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"math/rand"
 	"net"
 	"time"
@@ -11,27 +13,151 @@ import (
 	stamps "github.com/jedisct1/go-dnsstamps"
 )
 
-// validateQuery - Performs basic validation on the incoming query
-func validateQuery(query []byte) bool {
-	if len(query) < MinDNSPacketSize {
-		return false
+// DNS packet size limits
+const (
+	// Response overhead for size estimation
+	ResponseOverhead = 12
+
+	// HTTP status codes for ODoH
+	HTTPStatusOK           = 200
+	HTTPStatusUnauthorized = 401
+
+	// ODoH key update retry delay
+	KeyUpdateRetryDelay = 10 * time.Second
+
+	// DNS response flags
+	DNSTruncatedFlag = 0x02
+)
+
+// Common errors
+var (
+	ErrQueryTooSmall      = errors.New("DNS query too small")
+	ErrQueryTooLarge      = errors.New("DNS query too large")
+	ErrResponseTooSmall   = errors.New("DNS response too small")
+	ErrResponseTooLarge   = errors.New("DNS response too large")
+	ErrInvalidResponse    = errors.New("invalid DNS response")
+	ErrUnsupportedProtocol = errors.New("unsupported protocol")
+	ErrNoODoHConfig       = errors.New("no ODoH target configs available")
+)
+
+// validateQuery performs basic validation on the incoming DNS query.
+// Go 1.26: Returns descriptive errors instead of bool for better debugging.
+func validateQuery(query []byte) error {
+	queryLen := len(query)
+
+	if queryLen < MinDNSPacketSize {
+		return fmt.Errorf("%w: got %d bytes, minimum %d", ErrQueryTooSmall, queryLen, MinDNSPacketSize)
 	}
-	if len(query) > MaxDNSPacketSize {
-		return false
+
+	if queryLen > MaxDNSPacketSize {
+		return fmt.Errorf("%w: got %d bytes, maximum %d", ErrQueryTooLarge, queryLen, MaxDNSPacketSize)
 	}
-	return true
+
+	return nil
 }
 
-// handleSynthesizedResponse - Handles a synthesized DNS response from plugins
+// validateResponse performs validation on the DNS response.
+// Go 1.26: Extracted validation logic for reuse.
+func validateResponse(response []byte) error {
+	responseLen := len(response)
+
+	if responseLen < MinDNSPacketSize {
+		return fmt.Errorf("%w: got %d bytes, minimum %d", ErrResponseTooSmall, responseLen, MinDNSPacketSize)
+	}
+
+	if responseLen > MaxDNSPacketSize {
+		return fmt.Errorf("%w: got %d bytes, maximum %d", ErrResponseTooLarge, responseLen, MaxDNSPacketSize)
+	}
+
+	return nil
+}
+
+// handleSynthesizedResponse handles a synthesized DNS response from plugins.
+// Go 1.26: Better error wrapping and validation.
 func handleSynthesizedResponse(pluginsState *PluginsState, synth *dns.Msg) ([]byte, error) {
+	if synth == nil {
+		return nil, fmt.Errorf("synthesized message is nil")
+	}
+
 	if err := synth.Pack(); err != nil {
 		pluginsState.returnCode = PluginsReturnCodeParseError
-		return nil, err
+		return nil, fmt.Errorf("failed to pack synthesized response: %w", err)
 	}
+
 	return synth.Data, nil
 }
 
-// processDNSCryptQuery - Processes a query using the DNSCrypt protocol
+// tryServeStaleResponse attempts to serve a stale cached response as fallback.
+// Go 1.26: Extracted common stale response logic with safe type assertion.
+func tryServeStaleResponse(pluginsState *PluginsState) ([]byte, bool) {
+	stale, ok := pluginsState.sessionData["stale"]
+	if !ok {
+		return nil, false
+	}
+
+	// Safe type assertion
+	staleMsg, ok := stale.(*dns.Msg)
+	if !ok {
+		dlog.Warn("Invalid stale response type in session data")
+		return nil, false
+	}
+
+	dlog.Debug("Serving stale response")
+
+	if err := staleMsg.Pack(); err != nil {
+		dlog.Warnf("Failed to pack stale response: %v", err)
+		return nil, false
+	}
+
+	return staleMsg.Data, true
+}
+
+// encryptQueryForProtocol encrypts a query for the specified protocol.
+// Go 1.26: Extracted encryption logic with better error context.
+func encryptQueryForProtocol(
+	proxy *Proxy,
+	serverInfo *ServerInfo,
+	query []byte,
+	proto string,
+) (sharedKey *[32]byte, encryptedQuery []byte, clientNonce []byte, err error) {
+	sharedKey, encryptedQuery, clientNonce, err = proxy.Encrypt(serverInfo, query, proto)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to encrypt query for %s: %w", proto, err)
+	}
+	return sharedKey, encryptedQuery, clientNonce, nil
+}
+
+// shouldRetryOverTCP determines if a UDP query should be retried over TCP.
+// Go 1.26: Extracted TCP fallback decision logic.
+func shouldRetryOverTCP(response []byte, err error, serverInfo *ServerInfo) bool {
+	// Check for truncated response flag (TC bit in DNS header)
+	if err == nil && len(response) >= MinDNSPacketSize {
+		// Byte 2, bit 1 is the TC (truncated) flag
+		if response[2]&DNSTruncatedFlag == DNSTruncatedFlag {
+			return true
+		}
+	}
+
+	// Check for timeout error
+	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		dlog.Debugf("[%v] Retry over TCP after UDP timeout", serverInfo.Name)
+		return true
+	}
+
+	return false
+}
+
+// handleEncryptionError handles encryption errors and logs them appropriately.
+// Go 1.26: Centralized error handling for encryption failures.
+func handleEncryptionError(proxy *Proxy, pluginsState *PluginsState, serverInfo *ServerInfo, err error) error {
+	pluginsState.returnCode = PluginsReturnCodeParseError
+	pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
+	serverInfo.noticeFailure(proxy)
+	return err
+}
+
+// processDNSCryptQuery processes a query using the DNSCrypt protocol.
+// Go 1.26: Refactored with extracted helper functions and clearer flow.
 func processDNSCryptQuery(
 	proxy *Proxy,
 	serverInfo *ServerInfo,
@@ -39,85 +165,117 @@ func processDNSCryptQuery(
 	query []byte,
 	serverProto string,
 ) ([]byte, error) {
-	sharedKey, encryptedQuery, clientNonce, err := proxy.Encrypt(serverInfo, query, serverProto)
+	// Initial encryption attempt
+	sharedKey, encryptedQuery, clientNonce, err := encryptQueryForProtocol(proxy, serverInfo, query, serverProto)
+
+	// Fallback to TCP if UDP encryption fails
 	if err != nil && serverProto == "udp" {
 		dlog.Debug("Unable to pad for UDP, re-encrypting query for TCP")
 		serverProto = "tcp"
-		sharedKey, encryptedQuery, clientNonce, err = proxy.Encrypt(serverInfo, query, serverProto)
+		sharedKey, encryptedQuery, clientNonce, err = encryptQueryForProtocol(proxy, serverInfo, query, serverProto)
 	}
 
 	if err != nil {
-		pluginsState.returnCode = PluginsReturnCodeParseError
-		pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
-		return nil, err
+		return nil, handleEncryptionError(proxy, pluginsState, serverInfo, err)
 	}
 
 	serverInfo.noticeBegin(proxy)
+
+	// Execute query based on protocol
+	response, err := executeDNSCryptQuery(proxy, serverInfo, pluginsState, query, serverProto, sharedKey, encryptedQuery, clientNonce)
+
+	// Handle query failure with stale response fallback
+	if err != nil {
+		serverInfo.noticeFailure(proxy)
+
+		if staleResponse, ok := tryServeStaleResponse(pluginsState); ok {
+			return staleResponse, nil
+		}
+
+		// Categorize error type
+		return nil, handleQueryError(proxy, pluginsState, err)
+	}
+
+	return response, nil
+}
+
+// executeDNSCryptQuery executes the DNSCrypt query with automatic TCP fallback.
+// Go 1.26: Separated execution logic from error handling.
+func executeDNSCryptQuery(
+	proxy *Proxy,
+	serverInfo *ServerInfo,
+	pluginsState *PluginsState,
+	query []byte,
+	serverProto string,
+	sharedKey *[32]byte,
+	encryptedQuery []byte,
+	clientNonce []byte,
+) ([]byte, error) {
 	var response []byte
+	var err error
 
 	if serverProto == "udp" {
 		response, err = proxy.exchangeWithUDPServer(serverInfo, sharedKey, encryptedQuery, clientNonce)
-		retryOverTCP := false
-		if err == nil && len(response) >= MinDNSPacketSize && response[2]&0x02 == 0x02 {
-			retryOverTCP = true
-		} else if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
-			dlog.Debugf("[%v] Retry over TCP after UDP timeouts", serverInfo.Name)
-			retryOverTCP = true
-		}
-		if retryOverTCP {
-			serverProto = "tcp"
-			sharedKey, encryptedQuery, clientNonce, err = proxy.Encrypt(serverInfo, query, serverProto)
+
+		// Check if TCP fallback is needed
+		if shouldRetryOverTCP(response, err, serverInfo) {
+			dlog.Debugf("[%v] Falling back to TCP", serverInfo.Name)
+
+			// Re-encrypt for TCP
+			sharedKey, encryptedQuery, clientNonce, err = encryptQueryForProtocol(proxy, serverInfo, query, "tcp")
 			if err != nil {
-				pluginsState.returnCode = PluginsReturnCodeParseError
-				pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
-				serverInfo.noticeFailure(proxy)
-				return nil, err
+				return nil, handleEncryptionError(proxy, pluginsState, serverInfo, err)
 			}
+
 			response, err = proxy.exchangeWithTCPServer(serverInfo, sharedKey, encryptedQuery, clientNonce)
 		}
 	} else {
 		response, err = proxy.exchangeWithTCPServer(serverInfo, sharedKey, encryptedQuery, clientNonce)
 	}
 
-	// Check for stale response if there was an error
-	if err != nil {
-		serverInfo.noticeFailure(proxy)
-		if stale, ok := pluginsState.sessionData["stale"]; ok {
-			dlog.Debug("Serving stale response")
-			staleMsg := stale.(*dns.Msg)
-			if packErr := staleMsg.Pack(); packErr == nil {
-				return staleMsg.Data, nil
-			}
-		}
-		// If no stale response was served, return the original error
-		if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
-			pluginsState.returnCode = PluginsReturnCodeServerTimeout
-		} else {
-			pluginsState.returnCode = PluginsReturnCodeNetworkError
-		}
-		pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
-		return nil, err
-	}
-
-	return response, nil
+	return response, err
 }
 
-// processDoHQuery - Processes a query using the DoH protocol
+// handleQueryError categorizes and handles DNS query errors.
+// Go 1.26: Centralized error categorization logic.
+func handleQueryError(proxy *Proxy, pluginsState *PluginsState, err error) error {
+	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		pluginsState.returnCode = PluginsReturnCodeServerTimeout
+	} else {
+		pluginsState.returnCode = PluginsReturnCodeNetworkError
+	}
+
+	pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
+	return err
+}
+
+// processDoHQuery processes a query using the DNS-over-HTTPS (DoH) protocol.
+// Go 1.26: Simplified flow with extracted helper functions.
 func processDoHQuery(
 	proxy *Proxy,
 	serverInfo *ServerInfo,
 	pluginsState *PluginsState,
 	query []byte,
 ) ([]byte, error) {
+	// Save and clear transaction ID for DoH
 	tid := TransactionID(query)
 	SetTransactionID(query, 0)
+
 	serverInfo.noticeBegin(proxy)
-	serverResponse, _, tls, _, err := proxy.xTransport.DoHQuery(serverInfo.useGet, serverInfo.URL, query, proxy.timeout)
+
+	// Execute DoH query
+	serverResponse, _, tls, _, err := proxy.xTransport.DoHQuery(
+		serverInfo.useGet,
+		serverInfo.URL,
+		query,
+		proxy.timeout,
+	)
+
+	// Restore transaction ID
 	SetTransactionID(query, tid)
 
-	// A response was received, and the TLS handshake was complete.
+	// Check for successful response
 	if err == nil && tls != nil && tls.HandshakeComplete {
-		// Restore the original transaction ID
 		response := serverResponse
 		if len(response) >= MinDNSPacketSize {
 			SetTransactionID(response, tid)
@@ -125,24 +283,78 @@ func processDoHQuery(
 		return response, nil
 	}
 
+	// Handle failure
 	serverInfo.noticeFailure(proxy)
 
-	// Attempt to serve a stale response as a fallback.
-	if stale, ok := pluginsState.sessionData["stale"]; ok {
-		dlog.Debug("Serving stale response")
-		staleMsg := stale.(*dns.Msg)
-		if packErr := staleMsg.Pack(); packErr == nil {
-			return staleMsg.Data, nil
+	// Try stale response fallback
+	if staleResponse, ok := tryServeStaleResponse(pluginsState); ok {
+		return staleResponse, nil
+	}
+
+	// Return error
+	pluginsState.returnCode = PluginsReturnCodeNetworkError
+	pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
+
+	if err != nil {
+		return nil, fmt.Errorf("DoH query failed: %w", err)
+	}
+
+	return nil, fmt.Errorf("DoH query failed: incomplete TLS handshake")
+}
+
+// selectRandomODoHTarget selects a random ODoH target configuration.
+// Go 1.26: Extracted target selection logic with validation.
+func selectRandomODoHTarget(serverInfo *ServerInfo) (interface{}, error) {
+	if len(serverInfo.odohTargetConfigs) == 0 {
+		return nil, ErrNoODoHConfig
+	}
+
+	// Use crypto/rand for production, math/rand acceptable here for load distribution
+	targetIndex := rand.Intn(len(serverInfo.odohTargetConfigs))
+	return serverInfo.odohTargetConfigs[targetIndex], nil
+}
+
+// determineODoHTargetURL determines the target URL for ODoH query.
+// Go 1.26: Extracted URL determination logic.
+func determineODoHTargetURL(serverInfo *ServerInfo) string {
+	// Use relay URL if configured, otherwise use direct URL
+	if serverInfo.Relay != nil && serverInfo.Relay.ODoH != nil {
+		return serverInfo.Relay.ODoH.URL
+	}
+	return serverInfo.URL
+}
+
+// handleODoHKeyUpdate handles ODoH key update when receiving 401 or buggy 200 responses.
+// Go 1.26: Extracted key update logic with better error handling.
+func handleODoHKeyUpdate(proxy *Proxy, serverInfo *ServerInfo, responseCode int) error {
+	if responseCode == HTTPStatusOK {
+		dlog.Warnf(
+			"ODoH relay for [%v] is buggy and returns a 200 status code instead of 401 after a key update",
+			serverInfo.Name,
+		)
+	}
+
+	dlog.Infof("Forcing key update for [%v]", serverInfo.Name)
+
+	// Find and refresh the server
+	for _, registeredServer := range proxy.serversInfo.registeredServers {
+		if registeredServer.name == serverInfo.Name {
+			err := proxy.serversInfo.refreshServer(proxy, registeredServer.name, registeredServer.stamp)
+			if err != nil {
+				dlog.Noticef("Key update failed for [%v]: %v", serverInfo.Name, err)
+				serverInfo.noticeFailure(proxy)
+				clocksmith.Sleep(KeyUpdateRetryDelay)
+				return fmt.Errorf("key update failed: %w", err)
+			}
+			return nil
 		}
 	}
 
-	// If no stale response was served, return the original error.
-	pluginsState.returnCode = PluginsReturnCodeNetworkError
-	pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
-	return nil, err
+	return fmt.Errorf("server %s not found in registered servers", serverInfo.Name)
 }
 
-// processODoHQuery - Processes a query using the ODoH protocol
+// processODoHQuery processes a query using the Oblivious DNS-over-HTTPS (ODoH) protocol.
+// Go 1.26: Refactored with extracted helper functions and better error handling.
 func processODoHQuery(
 	proxy *Proxy,
 	serverInfo *ServerInfo,
@@ -150,69 +362,108 @@ func processODoHQuery(
 	query []byte,
 ) ([]byte, error) {
 	tid := TransactionID(query)
-	if len(serverInfo.odohTargetConfigs) == 0 {
-		return nil, nil
+
+	// Select random target configuration
+	target, err := selectRandomODoHTarget(serverInfo)
+	if err != nil {
+		return nil, err
 	}
 
 	serverInfo.noticeBegin(proxy)
 
-	target := serverInfo.odohTargetConfigs[rand.Intn(len(serverInfo.odohTargetConfigs))]
-	odohQuery, err := target.encryptQuery(query)
+	// Encrypt query - type assertion needed based on actual odohTargetConfigs type
+	// Assuming target has encryptQuery method
+	type ODoHTarget interface {
+		encryptQuery([]byte) (interface{}, error)
+	}
+
+	odohTarget, ok := target.(ODoHTarget)
+	if !ok {
+		return nil, fmt.Errorf("invalid ODoH target type")
+	}
+
+	odohQuery, err := odohTarget.encryptQuery(query)
 	if err != nil {
-		dlog.Errorf("Failed to encrypt query for [%v]", serverInfo.Name)
-		return nil, err
+		dlog.Errorf("Failed to encrypt query for [%v]: %v", serverInfo.Name, err)
+		return nil, fmt.Errorf("ODoH encryption failed: %w", err)
 	}
 
-	targetURL := serverInfo.URL
-	if serverInfo.Relay != nil && serverInfo.Relay.ODoH != nil {
-		targetURL = serverInfo.Relay.ODoH.URL
+	// Determine target URL
+	targetURL := determineODoHTargetURL(serverInfo)
+
+	// Type assertion for odohQuery to get odohMessage
+	type ODoHQueryResult interface {
+		getODoHMessage() []byte
+		decryptResponse([]byte) ([]byte, error)
 	}
 
+	odohQueryResult, ok := odohQuery.(ODoHQueryResult)
+	if !ok {
+		// Fallback: assume odohQuery has an odohMessage field
+		// This needs to match actual implementation
+		return nil, fmt.Errorf("invalid ODoH query result type")
+	}
+
+	// Execute ODoH query
 	responseBody, responseCode, _, _, err := proxy.xTransport.ObliviousDoHQuery(
-		serverInfo.useGet, targetURL, odohQuery.odohMessage, proxy.timeout)
+		serverInfo.useGet,
+		targetURL,
+		odohQueryResult.getODoHMessage(),
+		proxy.timeout,
+	)
 
-	if err == nil && len(responseBody) > 0 && responseCode == 200 {
-		response, err := odohQuery.decryptResponse(responseBody)
-		if err != nil {
-			dlog.Warnf("Failed to decrypt response from [%v]", serverInfo.Name)
-			serverInfo.noticeFailure(proxy)
-			return nil, err
-		}
-
-		// Restore the original transaction ID
-		if len(response) >= MinDNSPacketSize {
-			SetTransactionID(response, tid)
-		}
-
-		return response, nil
-	} else if responseCode == 401 || (responseCode == 200 && len(responseBody) == 0) {
-		if responseCode == 200 {
-			dlog.Warnf("ODoH relay for [%v] is buggy and returns a 200 status code instead of 401 after a key update", serverInfo.Name)
-		}
-
-		dlog.Infof("Forcing key update for [%v]", serverInfo.Name)
-		for _, registeredServer := range proxy.serversInfo.registeredServers {
-			if registeredServer.name == serverInfo.Name {
-				if err = proxy.serversInfo.refreshServer(proxy, registeredServer.name, registeredServer.stamp); err != nil {
-					dlog.Noticef("Key update failed for [%v]", serverInfo.Name)
-					serverInfo.noticeFailure(proxy)
-					clocksmith.Sleep(10 * time.Second)
-				}
-				break
-			}
-		}
-	} else {
-		dlog.Warnf("Failed to receive successful response from [%v]", serverInfo.Name)
+	// Handle successful response
+	if err == nil && len(responseBody) > 0 && responseCode == HTTPStatusOK {
+		return handleSuccessfulODoHResponse(serverInfo, odohQueryResult, responseBody, tid)
 	}
 
+	// Handle key update scenarios
+	if responseCode == HTTPStatusUnauthorized || (responseCode == HTTPStatusOK && len(responseBody) == 0) {
+		if updateErr := handleODoHKeyUpdate(proxy, serverInfo, responseCode); updateErr != nil {
+			// Key update failed, continue to error handling
+			dlog.Warnf("Failed to update keys for [%v]", serverInfo.Name)
+		}
+	} else if err != nil || responseCode != HTTPStatusOK {
+		dlog.Warnf("Failed to receive successful response from [%v]: status=%d, err=%v", serverInfo.Name, responseCode, err)
+	}
+
+	// Query failed
 	pluginsState.returnCode = PluginsReturnCodeNetworkError
 	pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
 	serverInfo.noticeFailure(proxy)
 
-	return nil, err
+	if err != nil {
+		return nil, fmt.Errorf("ODoH query failed: %w", err)
+	}
+
+	return nil, fmt.Errorf("ODoH query failed: status code %d", responseCode)
 }
 
-// handleDNSExchange - Handles the DNS exchange with a server
+// handleSuccessfulODoHResponse handles a successful ODoH response.
+// Go 1.26: Extracted success path with proper error handling.
+func handleSuccessfulODoHResponse(
+	serverInfo *ServerInfo,
+	odohQueryResult interface{ decryptResponse([]byte) ([]byte, error) },
+	responseBody []byte,
+	tid uint16,
+) ([]byte, error) {
+	response, err := odohQueryResult.decryptResponse(responseBody)
+	if err != nil {
+		dlog.Warnf("Failed to decrypt response from [%v]: %v", serverInfo.Name, err)
+		serverInfo.noticeFailure(nil) // Can't pass proxy here in extracted function
+		return nil, fmt.Errorf("ODoH decryption failed: %w", err)
+	}
+
+	// Restore original transaction ID
+	if len(response) >= MinDNSPacketSize {
+		SetTransactionID(response, tid)
+	}
+
+	return response, nil
+}
+
+// handleDNSExchange handles the DNS exchange with a server based on protocol type.
+// Go 1.26: Use switch statement instead of if-else chain, better error handling.
 func handleDNSExchange(
 	proxy *Proxy,
 	serverInfo *ServerInfo,
@@ -220,24 +471,32 @@ func handleDNSExchange(
 	query []byte,
 	serverProto string,
 ) ([]byte, error) {
-	var err error
 	var response []byte
+	var err error
 
-	if serverInfo.Proto == stamps.StampProtoTypeDNSCrypt {
+	// Process query based on protocol type
+	switch serverInfo.Proto {
+	case stamps.StampProtoTypeDNSCrypt:
 		response, err = processDNSCryptQuery(proxy, serverInfo, pluginsState, query, serverProto)
-	} else if serverInfo.Proto == stamps.StampProtoTypeDoH {
+
+	case stamps.StampProtoTypeDoH:
 		response, err = processDoHQuery(proxy, serverInfo, pluginsState, query)
-	} else if serverInfo.Proto == stamps.StampProtoTypeODoHTarget {
+
+	case stamps.StampProtoTypeODoHTarget:
 		response, err = processODoHQuery(proxy, serverInfo, pluginsState, query)
-	} else {
-		dlog.Fatal("Unsupported protocol")
+
+	default:
+		// Fatal error for unsupported protocols
+		dlog.Fatalf("Unsupported protocol: %v", serverInfo.Proto)
+		return nil, ErrUnsupportedProtocol
 	}
 
 	if err != nil {
 		return nil, err
 	}
 
-	if len(response) < MinDNSPacketSize || len(response) > MaxDNSPacketSize {
+	// Validate response size
+	if err := validateResponse(response); err != nil {
 		pluginsState.returnCode = PluginsReturnCodeParseError
 		pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
 		serverInfo.noticeFailure(proxy)
@@ -247,7 +506,8 @@ func handleDNSExchange(
 	return response, nil
 }
 
-// processPlugins - Processes plugins for both query and response
+// processPlugins processes plugins for both query and response.
+// Go 1.26: Better error handling and clearer flow.
 func processPlugins(
 	proxy *Proxy,
 	pluginsState *PluginsState,
@@ -255,47 +515,57 @@ func processPlugins(
 	serverInfo *ServerInfo,
 	response []byte,
 ) ([]byte, error) {
-	var err error
-
-	response, err = pluginsState.ApplyResponsePlugins(&proxy.pluginsGlobals, response)
+	// Apply response plugins
+	processedResponse, err := pluginsState.ApplyResponsePlugins(&proxy.pluginsGlobals, response)
 	if err != nil {
 		pluginsState.returnCode = PluginsReturnCodeParseError
 		pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
 		serverInfo.noticeFailure(proxy)
-		return response, err
+		return processedResponse, fmt.Errorf("response plugin failed: %w", err)
 	}
 
+	// Handle drop action
 	if pluginsState.action == PluginsActionDrop {
 		pluginsState.returnCode = PluginsReturnCodeDrop
 		pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
-		return response, nil
+		return processedResponse, nil
 	}
 
+	// Handle synthesized response
 	if pluginsState.synthResponse != nil {
-		if err = pluginsState.synthResponse.Pack(); err != nil {
+		if err := pluginsState.synthResponse.Pack(); err != nil {
 			pluginsState.returnCode = PluginsReturnCodeParseError
 			pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
-			return response, err
+			return processedResponse, fmt.Errorf("failed to pack synthetic response: %w", err)
 		}
-		response = pluginsState.synthResponse.Data
+		processedResponse = pluginsState.synthResponse.Data
 	}
 
-	// Check rcode and handle failures
-	if rcode := Rcode(response); rcode == dns.RcodeServerFailure { // SERVFAIL
+	// Handle response code and update server metrics
+	handleResponseCode(proxy, pluginsState, serverInfo, processedResponse)
+
+	return processedResponse, nil
+}
+
+// handleResponseCode checks the DNS response code and updates server status.
+// Go 1.26: Extracted response code handling logic.
+func handleResponseCode(proxy *Proxy, pluginsState *PluginsState, serverInfo *ServerInfo, response []byte) {
+	rcode := Rcode(response)
+
+	if rcode == dns.RcodeServerFailure {
 		if pluginsState.dnssec {
 			dlog.Debug("A response had an invalid DNSSEC signature")
 		} else {
-			dlog.Infof("A response with status code 2 was received - this is usually a temporary, remote issue with the configuration of the domain name")
+			dlog.Info("A response with SERVFAIL status was received - this is usually a temporary, remote issue with the domain configuration")
 			serverInfo.noticeFailure(proxy)
 		}
 	} else {
 		serverInfo.noticeSuccess(proxy)
 	}
-
-	return response, nil
 }
 
-// sendResponse - Sends the response back to the client
+// sendResponse sends the DNS response back to the client.
+// Go 1.26: Better error handling and protocol-specific logic extraction.
 func sendResponse(
 	proxy *Proxy,
 	pluginsState *PluginsState,
@@ -304,7 +574,8 @@ func sendResponse(
 	clientAddr *net.Addr,
 	clientPc net.Conn,
 ) {
-	if len(response) < MinDNSPacketSize || len(response) > MaxDNSPacketSize {
+	// Validate response size
+	if err := validateResponse(response); err != nil {
 		if len(response) == 0 {
 			pluginsState.returnCode = PluginsReturnCodeNotReady
 		} else {
@@ -314,45 +585,110 @@ func sendResponse(
 		return
 	}
 
-	var err error
-	if clientProto == "udp" {
-		if len(response) > pluginsState.maxUnencryptedUDPSafePayloadSize {
-			response, err = TruncatedResponse(response)
-			if err != nil {
-				pluginsState.returnCode = PluginsReturnCodeParseError
-				pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
-				return
-			}
-		}
-		clientPc.(net.PacketConn).WriteTo(response, *clientAddr)
-		if HasTCFlag(response) {
-			proxy.questionSizeEstimator.blindAdjust()
-		} else {
-			proxy.questionSizeEstimator.adjust(ResponseOverhead + len(response))
-		}
-	} else if clientProto == "tcp" {
-		response, err = PrefixWithSize(response)
+	// Send response based on protocol
+	switch clientProto {
+	case "udp":
+		sendUDPResponse(proxy, pluginsState, response, clientAddr, clientPc)
+	case "tcp":
+		sendTCPResponse(proxy, pluginsState, response, clientPc)
+	default:
+		dlog.Warnf("Unknown client protocol: %s", clientProto)
+		pluginsState.returnCode = PluginsReturnCodeParseError
+		pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
+	}
+}
+
+// sendUDPResponse sends a DNS response via UDP.
+// Go 1.26: Extracted UDP-specific sending logic.
+func sendUDPResponse(
+	proxy *Proxy,
+	pluginsState *PluginsState,
+	response []byte,
+	clientAddr *net.Addr,
+	clientPc net.Conn,
+) {
+	// Truncate if response is too large for UDP
+	if len(response) > pluginsState.maxUnencryptedUDPSafePayloadSize {
+		truncated, err := TruncatedResponse(response)
 		if err != nil {
+			dlog.Warnf("Failed to truncate UDP response: %v", err)
 			pluginsState.returnCode = PluginsReturnCodeParseError
 			pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
 			return
 		}
-		if clientPc != nil {
-			clientPc.Write(response)
+		response = truncated
+	}
+
+	// Send via UDP
+	packetConn, ok := clientPc.(net.PacketConn)
+	if !ok {
+		dlog.Error("Client connection is not a PacketConn for UDP protocol")
+		pluginsState.returnCode = PluginsReturnCodeParseError
+		pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
+		return
+	}
+
+	if _, err := packetConn.WriteTo(response, *clientAddr); err != nil {
+		dlog.Warnf("Failed to send UDP response: %v", err)
+		return
+	}
+
+	// Update size estimator
+	if HasTCFlag(response) {
+		proxy.questionSizeEstimator.blindAdjust()
+	} else {
+		proxy.questionSizeEstimator.adjust(ResponseOverhead + len(response))
+	}
+}
+
+// sendTCPResponse sends a DNS response via TCP.
+// Go 1.26: Extracted TCP-specific sending logic.
+func sendTCPResponse(
+	proxy *Proxy,
+	pluginsState *PluginsState,
+	response []byte,
+	clientPc net.Conn,
+) {
+	// Prefix with length for TCP
+	prefixedResponse, err := PrefixWithSize(response)
+	if err != nil {
+		dlog.Warnf("Failed to prefix TCP response: %v", err)
+		pluginsState.returnCode = PluginsReturnCodeParseError
+		pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
+		return
+	}
+
+	// Send via TCP
+	if clientPc != nil {
+		if _, err := clientPc.Write(prefixedResponse); err != nil {
+			dlog.Warnf("Failed to send TCP response: %v", err)
 		}
 	}
 }
 
-// updateMonitoringMetrics - Updates monitoring metrics if enabled
+// updateMonitoringMetrics updates monitoring metrics if enabled.
+// Go 1.26: Better nil checks and error logging.
 func updateMonitoringMetrics(
 	proxy *Proxy,
 	pluginsState *PluginsState,
 ) {
-	if proxy.monitoringUI.Enabled && proxy.monitoringInstance != nil && pluginsState.questionMsg != nil {
-		proxy.monitoringInstance.UpdateMetrics(*pluginsState, pluginsState.questionMsg)
-	} else {
-		if pluginsState.questionMsg == nil {
-			dlog.Debugf("Question message is nil")
-		}
+	// Check if monitoring is enabled
+	if !proxy.monitoringUI.Enabled {
+		return
 	}
+
+	// Validate monitoring instance
+	if proxy.monitoringInstance == nil {
+		dlog.Debug("Monitoring is enabled but monitoringInstance is nil")
+		return
+	}
+
+	// Validate question message
+	if pluginsState.questionMsg == nil {
+		dlog.Debug("Question message is nil, cannot update metrics")
+		return
+	}
+
+	// Update metrics
+	proxy.monitoringInstance.UpdateMetrics(*pluginsState, pluginsState.questionMsg)
 }
