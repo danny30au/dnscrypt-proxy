@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"net/url"
 	"time"
 
 	"codeberg.org/miekg/dns"
@@ -13,11 +14,8 @@ import (
 	stamps "github.com/jedisct1/go-dnsstamps"
 )
 
-// DNS packet size limits
+// Constants for DNS processing
 const (
-	// Response overhead for size estimation
-	ResponseOverhead = 12
-
 	// HTTP status codes for ODoH
 	HTTPStatusOK           = 200
 	HTTPStatusUnauthorized = 401
@@ -31,18 +29,25 @@ const (
 
 // Common errors
 var (
-	ErrQueryTooSmall      = errors.New("DNS query too small")
-	ErrQueryTooLarge      = errors.New("DNS query too large")
-	ErrResponseTooSmall   = errors.New("DNS response too small")
-	ErrResponseTooLarge   = errors.New("DNS response too large")
-	ErrInvalidResponse    = errors.New("invalid DNS response")
+	ErrQueryTooSmall       = errors.New("DNS query too small")
+	ErrQueryTooLarge       = errors.New("DNS query too large")
+	ErrResponseTooSmall    = errors.New("DNS response too small")
+	ErrResponseTooLarge    = errors.New("DNS response too large")
+	ErrInvalidResponse     = errors.New("invalid DNS response")
 	ErrUnsupportedProtocol = errors.New("unsupported protocol")
-	ErrNoODoHConfig       = errors.New("no ODoH target configs available")
+	ErrNoODoHConfig        = errors.New("no ODoH target configs available")
 )
 
 // validateQuery performs basic validation on the incoming DNS query.
-// Go 1.26: Returns descriptive errors instead of bool for better debugging.
-func validateQuery(query []byte) error {
+// Go 1.26: Maintains backward compatibility by returning bool.
+// Use validateQueryWithError() for detailed error information.
+func validateQuery(query []byte) bool {
+	return len(query) >= MinDNSPacketSize && len(query) <= MaxDNSPacketSize
+}
+
+// validateQueryWithError performs validation and returns detailed error information.
+// Go 1.26: New function for better error reporting while maintaining compatibility.
+func validateQueryWithError(query []byte) error {
 	queryLen := len(query)
 
 	if queryLen < MinDNSPacketSize {
@@ -76,7 +81,7 @@ func validateResponse(response []byte) error {
 // Go 1.26: Better error wrapping and validation.
 func handleSynthesizedResponse(pluginsState *PluginsState, synth *dns.Msg) ([]byte, error) {
 	if synth == nil {
-		return nil, fmt.Errorf("synthesized message is nil")
+		return nil, errors.New("synthesized message is nil")
 	}
 
 	if err := synth.Pack(); err != nil {
@@ -299,7 +304,7 @@ func processDoHQuery(
 		return nil, fmt.Errorf("DoH query failed: %w", err)
 	}
 
-	return nil, fmt.Errorf("DoH query failed: incomplete TLS handshake")
+	return nil, errors.New("DoH query failed: incomplete TLS handshake")
 }
 
 // selectRandomODoHTarget selects a random ODoH target configuration.
@@ -315,8 +320,8 @@ func selectRandomODoHTarget(serverInfo *ServerInfo) (interface{}, error) {
 }
 
 // determineODoHTargetURL determines the target URL for ODoH query.
-// Go 1.26: Extracted URL determination logic.
-func determineODoHTargetURL(serverInfo *ServerInfo) string {
+// Go 1.26: Extracted URL determination logic, returns *url.URL type.
+func determineODoHTargetURL(serverInfo *ServerInfo) *url.URL {
 	// Use relay URL if configured, otherwise use direct URL
 	if serverInfo.Relay != nil && serverInfo.Relay.ODoH != nil {
 		return serverInfo.Relay.ODoH.URL
@@ -371,15 +376,15 @@ func processODoHQuery(
 
 	serverInfo.noticeBegin(proxy)
 
-	// Encrypt query - type assertion needed based on actual odohTargetConfigs type
-	// Assuming target has encryptQuery method
-	type ODoHTarget interface {
-		encryptQuery([]byte) (interface{}, error)
+	// Encrypt query - use type assertion with the actual ODoH target type
+	type ODoHTargetConfig interface {
+		encryptQuery([]byte) (*ObliviousDoHQuery, error)
 	}
 
-	odohTarget, ok := target.(ODoHTarget)
+	odohTarget, ok := target.(ODoHTargetConfig)
 	if !ok {
-		return nil, fmt.Errorf("invalid ODoH target type")
+		dlog.Errorf("Invalid ODoH target configuration type for [%v]", serverInfo.Name)
+		return nil, errors.New("invalid ODoH target type")
 	}
 
 	odohQuery, err := odohTarget.encryptQuery(query)
@@ -388,33 +393,32 @@ func processODoHQuery(
 		return nil, fmt.Errorf("ODoH encryption failed: %w", err)
 	}
 
-	// Determine target URL
+	// Determine target URL (returns *url.URL)
 	targetURL := determineODoHTargetURL(serverInfo)
-
-	// Type assertion for odohQuery to get odohMessage
-	type ODoHQueryResult interface {
-		getODoHMessage() []byte
-		decryptResponse([]byte) ([]byte, error)
-	}
-
-	odohQueryResult, ok := odohQuery.(ODoHQueryResult)
-	if !ok {
-		// Fallback: assume odohQuery has an odohMessage field
-		// This needs to match actual implementation
-		return nil, fmt.Errorf("invalid ODoH query result type")
-	}
 
 	// Execute ODoH query
 	responseBody, responseCode, _, _, err := proxy.xTransport.ObliviousDoHQuery(
 		serverInfo.useGet,
 		targetURL,
-		odohQueryResult.getODoHMessage(),
+		odohQuery.odohMessage,
 		proxy.timeout,
 	)
 
 	// Handle successful response
 	if err == nil && len(responseBody) > 0 && responseCode == HTTPStatusOK {
-		return handleSuccessfulODoHResponse(serverInfo, odohQueryResult, responseBody, tid)
+		response, err := odohQuery.decryptResponse(responseBody)
+		if err != nil {
+			dlog.Warnf("Failed to decrypt response from [%v]: %v", serverInfo.Name, err)
+			serverInfo.noticeFailure(proxy)
+			return nil, fmt.Errorf("ODoH decryption failed: %w", err)
+		}
+
+		// Restore original transaction ID
+		if len(response) >= MinDNSPacketSize {
+			SetTransactionID(response, tid)
+		}
+
+		return response, nil
 	}
 
 	// Handle key update scenarios
@@ -424,7 +428,8 @@ func processODoHQuery(
 			dlog.Warnf("Failed to update keys for [%v]", serverInfo.Name)
 		}
 	} else if err != nil || responseCode != HTTPStatusOK {
-		dlog.Warnf("Failed to receive successful response from [%v]: status=%d, err=%v", serverInfo.Name, responseCode, err)
+		dlog.Warnf("Failed to receive successful response from [%v]: status=%d, err=%v", 
+			serverInfo.Name, responseCode, err)
 	}
 
 	// Query failed
@@ -437,29 +442,6 @@ func processODoHQuery(
 	}
 
 	return nil, fmt.Errorf("ODoH query failed: status code %d", responseCode)
-}
-
-// handleSuccessfulODoHResponse handles a successful ODoH response.
-// Go 1.26: Extracted success path with proper error handling.
-func handleSuccessfulODoHResponse(
-	serverInfo *ServerInfo,
-	odohQueryResult interface{ decryptResponse([]byte) ([]byte, error) },
-	responseBody []byte,
-	tid uint16,
-) ([]byte, error) {
-	response, err := odohQueryResult.decryptResponse(responseBody)
-	if err != nil {
-		dlog.Warnf("Failed to decrypt response from [%v]: %v", serverInfo.Name, err)
-		serverInfo.noticeFailure(nil) // Can't pass proxy here in extracted function
-		return nil, fmt.Errorf("ODoH decryption failed: %w", err)
-	}
-
-	// Restore original transaction ID
-	if len(response) >= MinDNSPacketSize {
-		SetTransactionID(response, tid)
-	}
-
-	return response, nil
 }
 
 // handleDNSExchange handles the DNS exchange with a server based on protocol type.
