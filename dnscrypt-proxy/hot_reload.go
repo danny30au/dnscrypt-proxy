@@ -6,102 +6,75 @@ import (
 	"github.com/jedisct1/dlog"
 )
 
-// InitHotReload sets up hot-reloading for configuration files
+// PluginReloader defines the interface for plugins that support hot-reloading.
+type PluginReloader interface {
+	Plugin
+	Reload() error
+	SetConfigWatcher(*ConfigWatcher)
+	ConfigFile() string
+}
+
+// InitHotReload sets up hot-reloading for configuration files.
 func (proxy *Proxy) InitHotReload() error {
-	// Check if hot reload is enabled and platform has SIGHUP
+	// Early exit if neither hot reload nor SIGHUP is available.
 	if !proxy.enableHotReload && !HasSIGHUP {
 		dlog.Notice("Hot reload is disabled")
 		return nil
 	}
 
-	// Find plugins that support hot-reloading
-	plugins := []Plugin{}
-
-	// Add query plugins
-	proxy.pluginsGlobals.RLock()
-	if proxy.pluginsGlobals.queryPlugins != nil {
-		plugins = append(plugins, *proxy.pluginsGlobals.queryPlugins...)
-	}
-
-	// Add response plugins
-	if proxy.pluginsGlobals.responsePlugins != nil {
-		plugins = append(plugins, *proxy.pluginsGlobals.responsePlugins...)
-	}
-	proxy.pluginsGlobals.RUnlock()
-
-	// Setup SIGHUP handler for manual reload
+	plugins := proxy.gatherPlugins()
 	setupSignalHandler(proxy, plugins)
 
-	// Check if hot reload is enabled
 	if !proxy.enableHotReload {
-		dlog.Notice("Hot reload is disabled")
+		dlog.Notice("Hot reload is disabled (SIGHUP handler only)")
 		return nil
 	}
 
 	dlog.Notice("Hot reload is enabled")
 
-	// Create a new configuration watcher
-	configWatcher := NewConfigWatcher(time.Second) // Check every second
-
-	// Register plugins for config watching
-	for _, plugin := range plugins {
-		switch p := plugin.(type) {
-		case *PluginAllowName:
-			if len(p.configFile) > 0 {
-				if err := configWatcher.AddFile(p.configFile, p.Reload); err != nil {
-					dlog.Warnf("Failed to watch config file for plugin [%s]: %v", p.Name(), err)
-				} else {
-					p.SetConfigWatcher(configWatcher)
-					dlog.Noticef("Watching config file for plugin [%s]: %s", p.Name(), p.configFile)
-				}
-			}
-		case *PluginAllowedIP:
-			if len(p.configFile) > 0 {
-				if err := configWatcher.AddFile(p.configFile, p.Reload); err != nil {
-					dlog.Warnf("Failed to watch config file for plugin [%s]: %v", p.Name(), err)
-				} else {
-					p.SetConfigWatcher(configWatcher)
-					dlog.Noticef("Watching config file for plugin [%s]: %s", p.Name(), p.configFile)
-				}
-			}
-		case *PluginBlockIP:
-			if len(p.configFile) > 0 {
-				if err := configWatcher.AddFile(p.configFile, p.Reload); err != nil {
-					dlog.Warnf("Failed to watch config file for plugin [%s]: %v", p.Name(), err)
-				} else {
-					p.SetConfigWatcher(configWatcher)
-					dlog.Noticef("Watching config file for plugin [%s]: %s", p.Name(), p.configFile)
-				}
-			}
-		case *PluginBlockName:
-			if len(p.configFile) > 0 {
-				if err := configWatcher.AddFile(p.configFile, p.Reload); err != nil {
-					dlog.Warnf("Failed to watch config file for plugin [%s]: %v", p.Name(), err)
-				} else {
-					p.SetConfigWatcher(configWatcher)
-					dlog.Noticef("Watching config file for plugin [%s]: %s", p.Name(), p.configFile)
-				}
-			}
-		case *PluginCloak:
-			if len(p.configFile) > 0 {
-				if err := configWatcher.AddFile(p.configFile, p.Reload); err != nil {
-					dlog.Warnf("Failed to watch config file for plugin [%s]: %v", p.Name(), err)
-				} else {
-					p.SetConfigWatcher(configWatcher)
-					dlog.Noticef("Watching config file for plugin [%s]: %s", p.Name(), p.configFile)
-				}
-			}
-		case *PluginForward:
-			if len(p.configFile) > 0 {
-				if err := configWatcher.AddFile(p.configFile, p.Reload); err != nil {
-					dlog.Warnf("Failed to watch config file for plugin [%s]: %v", p.Name(), err)
-				} else {
-					p.SetConfigWatcher(configWatcher)
-					dlog.Noticef("Watching config file for plugin [%s]: %s", p.Name(), p.configFile)
-				}
-			}
-		}
-	}
+	configWatcher := NewConfigWatcher(time.Second)
+	proxy.registerPluginWatchers(configWatcher, plugins)
 
 	return nil
+}
+
+// gatherPlugins collects all plugins from query and response plugin lists.
+func (proxy *Proxy) gatherPlugins() []Plugin {
+	proxy.pluginsGlobals.RLock()
+	defer proxy.pluginsGlobals.RUnlock()
+
+	var plugins []Plugin
+
+	if proxy.pluginsGlobals.queryPlugins != nil {
+		plugins = append(plugins, *proxy.pluginsGlobals.queryPlugins...)
+	}
+
+	if proxy.pluginsGlobals.responsePlugins != nil {
+		plugins = append(plugins, *proxy.pluginsGlobals.responsePlugins...)
+	}
+
+	return plugins
+}
+
+// registerPluginWatchers registers file watches for plugins that support hot-reloading.
+func (proxy *Proxy) registerPluginWatchers(configWatcher *ConfigWatcher, plugins []Plugin) {
+	for _, plugin := range plugins {
+		reloadable, ok := plugin.(PluginReloader)
+		if !ok {
+			continue
+		}
+
+		configFile := reloadable.ConfigFile()
+		if configFile == "" {
+			continue
+		}
+
+		if err := configWatcher.AddFile(configFile, reloadable.Reload); err != nil {
+			dlog.Warnf("Failed to watch config file for plugin [%s]: %v", plugin.Name(), err)
+			continue
+		}
+
+		reloadable.SetConfigWatcher(configWatcher)
+		dlog.Noticef("Watching config file for plugin [%s]: %s", plugin.Name(), configFile)
+	}
 }
