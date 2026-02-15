@@ -42,22 +42,27 @@ func intFlag(v *int, def int) int {
 }
 
 type Config struct {
-	LogLevel            int     `toml:"log_level"`
-	LogFile             *string `toml:"log_file"`
-	LogFileLatest       bool    `toml:"log_file_latest"`
-	UseSyslog           bool    `toml:"use_syslog"`
-	ServerNames         []string
+	LogLevel      int     `toml:"log_level"`
+	LogFile       *string `toml:"log_file"`
+	LogFileLatest bool    `toml:"log_file_latest"`
+	UseSyslog     bool    `toml:"use_syslog"`
+
+	ServerNames         []string `toml:"server_names"`
 	DisabledServerNames []string `toml:"disabled_server_names"`
 	ListenAddresses     []string `toml:"listen_addresses"`
-	LocalDoH            LocalDoHConfig
-	MonitoringUI        MonitoringUIConfig `toml:"monitoring_ui"`
-	UserName            string             `toml:"user_name"`
-	ForceTCP            bool               `toml:"force_tcp"`
-	HTTP3               bool               `toml:"http3"`
-	HTTP3Probe          bool               `toml:"http3_probe"`
-	Timeout             int                `toml:"timeout"`
-	KeepAlive           int                `toml:"keepalive"`
-	Proxy               string             `toml:"proxy"`
+
+	LocalDoH     LocalDoHConfig     `toml:"local_doh"`
+	MonitoringUI MonitoringUIConfig `toml:"monitoring_ui"`
+
+	UserName        string `toml:"user_name"`
+	ForceTCP        bool   `toml:"force_tcp"`
+	HTTP3           bool   `toml:"http3"`
+	HTTP3Probe      bool   `toml:"http3_probe"`
+	Timeout         int    `toml:"timeout"`
+	KeepAlive       int    `toml:"keepalive"`
+	Proxy           string `toml:"proxy"`
+	HTTPProxyURL    string `toml:"http_proxy"`
+	IgnoreSystemDNS bool   `toml:"ignore_system_dns"`
 
 	CertRefreshConcurrency int  `toml:"cert_refresh_concurrency"`
 	CertRefreshDelay       int  `toml:"cert_refresh_delay"`
@@ -72,9 +77,9 @@ type Config struct {
 	BlockUndelegated bool `toml:"block_undelegated"`
 	EnableHotReload  bool `toml:"enable_hot_reload"`
 
-	Cache          bool `toml:"cache"`
-	CacheSize      int  `toml:"cache_size"`
-	CacheNegTTL    uint32
+	Cache          bool   `toml:"cache"`
+	CacheSize      int    `toml:"cache_size"`
+	CacheNegTTL    uint32 `toml:"cache_neg_ttl"`
 	CacheNegMinTTL uint32 `toml:"cache_neg_min_ttl"`
 	CacheNegMaxTTL uint32 `toml:"cache_neg_max_ttl"`
 	CacheMinTTL    uint32 `toml:"cache_min_ttl"`
@@ -82,23 +87,21 @@ type Config struct {
 	RejectTTL      uint32 `toml:"reject_ttl"`
 	CloakTTL       uint32 `toml:"cloak_ttl"`
 
-	QueryLog            QueryLogConfig        `toml:"query_log"`
-	NxLog               NxLogConfig           `toml:"nx_log"`
-	BlockName           BlockNameConfig       `toml:"blocked_names"`
-	BlockNameLegacy     BlockNameConfigLegacy `toml:"blacklist"`
-	WhitelistNameLegacy WhitelistNameConfigLegacy
-	AllowedName         AllowedNameConfig `toml:"allowed_names"`
-	BlockIP             BlockIPConfig     `toml:"blocked_ips"`
-	BlockIPLegacy       BlockIPConfigLegacy
-	AllowIP             AllowIPConfig `toml:"allowed_ips"`
+	QueryLog QueryLogConfig `toml:"query_log"`
+	NxLog    NxLogConfig    `toml:"nx_log"`
 
-	ForwardFile    string               `toml:"forwarding_rules"`
-	CloakFile      string               `toml:"cloaking_rules"`
-	CaptivePortals CaptivePortalsConfig `toml:"captive_portals"`
-
-	StaticsConfig map[string]StaticConfig `toml:"static"`
-	SourcesConfig map[string]SourceConfig `toml:"sources"`
-
+	BlockName           BlockNameConfig             `toml:"blocked_names"`
+	BlockNameLegacy     BlockNameConfigLegacy       `toml:"blacklist"`
+	WhitelistNameLegacy WhitelistNameConfigLegacy   `toml:"whitelist"`
+	AllowedName         AllowedNameConfig           `toml:"allowed_names"`
+	BlockIP             BlockIPConfig               `toml:"blocked_ips"`
+	BlockIPLegacy       BlockIPConfigLegacy         `toml:"ip_blacklist"`
+	AllowIP             AllowIPConfig               `toml:"allowed_ips"`
+	ForwardFile         string                      `toml:"forwarding_rules"`
+	CloakFile           string                      `toml:"cloaking_rules"`
+	CaptivePortals      CaptivePortalsConfig        `toml:"captive_portals"`
+	StaticsConfig       map[string]StaticConfig     `toml:"static"`
+	SourcesConfig       map[string]SourceConfig     `toml:"sources"`
 	BrokenImplementations BrokenImplementationsConfig `toml:"broken_implementations"`
 
 	SourceRequireDNSSEC   bool `toml:"require_dnssec"`
@@ -115,7 +118,6 @@ type Config struct {
 
 	BootstrapResolversLegacy []string `toml:"fallback_resolvers"`
 	BootstrapResolvers       []string `toml:"bootstrap_resolvers"`
-	IgnoreSystemDNS          bool     `toml:"ignore_system_dns"`
 
 	AllWeeklyRanges map[string]WeeklyRangesStr `toml:"schedules"`
 
@@ -132,11 +134,10 @@ type Config struct {
 	NetprobeTimeout int    `toml:"netprobe_timeout"`
 	OfflineMode     bool   `toml:"offline_mode"`
 
-	HTTPProxyURL           string `toml:"http_proxy"`
 	RefusedCodeInResponses bool   `toml:"refused_code_in_responses"`
 	BlockedQueryResponse   string `toml:"blocked_query_response"`
-	QueryMeta              []string
-	CloakedPTR             bool `toml:"cloak_ptr"`
+	QueryMeta              []string `toml:"query_meta"`
+	CloakedPTR             bool   `toml:"cloak_ptr"`
 
 	AnonymizedDNS AnonymizedDNSConfig `toml:"anonymized_dns"`
 
@@ -402,7 +403,6 @@ func ConfigLoad(proxy *Proxy, flags *ConfigFlags) error {
 
 	// Check for unsupported keys in configuration.
 	if undecoded := md.Undecoded(); len(undecoded) > 0 {
-		// Report all keys, but keep the error short and actionable.
 		max := 8
 		if len(undecoded) < max {
 			max = len(undecoded)
@@ -418,7 +418,6 @@ func ConfigLoad(proxy *Proxy, flags *ConfigFlags) error {
 		return fmt.Errorf("Unsupported key(s) in configuration file: %s%s", strings.Join(keys, ", "), more)
 	}
 
-	// Basic proxy properties.
 	proxy.showCerts = boolFlag(flags.ShowCerts) || os.Getenv("SHOW_CERTS") != ""
 	proxy.logMaxSize = config.LogMaxSize
 	proxy.logMaxAge = config.LogMaxAge
@@ -428,7 +427,6 @@ func ConfigLoad(proxy *Proxy, flags *ConfigFlags) error {
 	proxy.enableHotReload = config.EnableHotReload
 	proxy.xTransport = NewXTransport()
 
-	// Configure logging and subsystems.
 	configureLogging(proxy, flags, &config)
 	configureServerParams(proxy, &config)
 	if err := configureXTransport(proxy, &config); err != nil {
@@ -476,13 +474,11 @@ func ConfigLoad(proxy *Proxy, flags *ConfigFlags) error {
 		return err
 	}
 
-	// If 'userName' is set and we are the parent process drop privilege and exit.
 	if len(proxy.userName) > 0 && !proxy.child {
 		proxy.dropPrivilege(proxy.userName, FileDescriptors)
 		return errors.New("Dropping privileges is not supported on this operating system. Unset `user_name` in the configuration file")
 	}
 
-	// Load sources and verify servers.
 	if !config.OfflineMode {
 		if err := config.loadSources(proxy); err != nil {
 			return err
@@ -492,7 +488,6 @@ func ConfigLoad(proxy *Proxy, flags *ConfigFlags) error {
 		}
 	}
 
-	// Handle listing servers if requested.
 	if boolFlag(flags.List) || boolFlag(flags.ListAll) {
 		if err := config.printRegisteredServers(proxy, boolFlag(flags.JSONOutput), boolFlag(flags.IncludeRelays)); err != nil {
 			return err
@@ -500,7 +495,6 @@ func ConfigLoad(proxy *Proxy, flags *ConfigFlags) error {
 		os.Exit(0)
 	}
 
-	// Log anonymized DNS routes.
 	if proxy.routes != nil && len(*proxy.routes) > 0 {
 		hasSpecificRoutes := false
 		for _, server := range proxy.registeredServers {
@@ -522,7 +516,6 @@ func ConfigLoad(proxy *Proxy, flags *ConfigFlags) error {
 		}
 	}
 
-	// Exit if just checking configuration.
 	if boolFlag(flags.Check) {
 		dlog.Notice("Configuration successfully checked")
 		os.Exit(0)
@@ -531,7 +524,6 @@ func ConfigLoad(proxy *Proxy, flags *ConfigFlags) error {
 	return nil
 }
 
-// GetRefusedFlag returns the current value of refused_code_in_responses and whether it was defined.
 func (config *Config) GetRefusedFlag(configFile string) (bool, bool) {
 	var v struct {
 		Refused bool `toml:"refused_code_in_responses"`
@@ -543,9 +535,7 @@ func (config *Config) GetRefusedFlag(configFile string) (bool, bool) {
 	return v.Refused, md.IsDefined("refused_code_in_responses")
 }
 
-// configureBrokenImplementations keeps backward compatibility with older keys.
 func configureBrokenImplementations(proxy *Proxy, config *Config) {
-	// Backwards compatibility: broken_query_padding is now part of fragments_blocked.
 	config.BrokenImplementations.FragmentsBlocked = append(
 		config.BrokenImplementations.FragmentsBlocked,
 		config.BrokenImplementations.BrokenQueryPadding...,
@@ -600,8 +590,6 @@ func (config *Config) printRegisteredServers(proxy *Proxy, jsonOutput bool, incl
 
 		nolog := registered.stamp.Props&stamps.ServerInformalPropertyNoLog != 0
 		nofilter := registered.stamp.Props&stamps.ServerInformalPropertyNoFilter != 0
-
-		// Preserve original relay behavior: for relays, 'nolog/nofilter' reporting differs.
 		if isRelay {
 			nolog = true
 			nofilter = true
@@ -655,7 +643,6 @@ func (config *Config) loadSources(proxy *Proxy) error {
 		return errors.New("proxy is nil")
 	}
 
-	// Use a local RNG so this doesn't depend on global state.
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	for cfgSourceName, cfgSource_ := range config.SourcesConfig {
