@@ -119,8 +119,6 @@ func (cw *ConfigWatcher) handleEvent(path string) {
 		return
 	}
 
-	// We watch directories. On any event in a watched directory, schedule checks for all
-	// watched files under that directory.
 	dir := filepath.Dir(absPath)
 	cw.mu.RLock()
 	filesInDir := cw.filesByDir[dir]
@@ -142,8 +140,6 @@ func (cw *ConfigWatcher) scheduleCheck(absPath string) {
 	}
 
 	if t, ok := cw.timers[absPath]; ok {
-		// Reset returns false if the timer already expired; in that case the callback
-		// might be running, but checkFile itself is serialized via wf.mu.
 		t.Reset(cw.debounce)
 		cw.mu.Unlock()
 		return
@@ -166,7 +162,7 @@ func (cw *ConfigWatcher) checkFile(wf *WatchedFile) {
 	defer wf.mu.Unlock()
 
 	// First snapshot.
-	info1, hash1, size1, err := statAndHash(wf.path)
+	_, hash1, size1, err := statAndHash(wf.path)
 	if err != nil {
 		// File may be temporarily unavailable during atomic replacement.
 		dlog.Debugf("Cannot read file [%s]: %v", wf.path, err)
@@ -282,12 +278,10 @@ func (cw *ConfigWatcher) RemoveFile(path string) {
 	}
 
 	cw.mu.Lock()
-	wf, exists := cw.watchedFiles[absPath]
-	if !exists {
+	if _, exists := cw.watchedFiles[absPath]; !exists {
 		cw.mu.Unlock()
 		return
 	}
-	_ = wf
 	delete(cw.watchedFiles, absPath)
 
 	if t, ok := cw.timers[absPath]; ok {
@@ -341,15 +335,10 @@ func newPollingConfigWatcher(interval time.Duration) *ConfigWatcher {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cw := &ConfigWatcher{
-		watchedFiles:  make(map[string]*WatchedFile),
-		filesByDir:    make(map[string]map[string]struct{}),
-		watchedDirs:   make(map[string]struct{}),
-		timers:        make(map[string]*time.Timer),
-		debounce:      defaultDebounceDelay,
-		ctx:           ctx,
-		cancel:        cancel,
-		pollInterval:  poll,
-		shutdownOnce:  sync.Once{},
+		watchedFiles: make(map[string]*WatchedFile),
+		ctx:         ctx,
+		cancel:      cancel,
+		pollInterval: poll,
 	}
 
 	cw.wg.Add(1)
