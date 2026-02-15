@@ -40,7 +40,6 @@ var (
 
 // validateQuery performs basic validation on the incoming DNS query.
 // Go 1.26: Maintains backward compatibility by returning bool.
-// Use validateQueryWithError() for detailed error information.
 func validateQuery(query []byte) bool {
 	return len(query) >= MinDNSPacketSize && len(query) <= MaxDNSPacketSize
 }
@@ -307,59 +306,8 @@ func processDoHQuery(
 	return nil, errors.New("DoH query failed: incomplete TLS handshake")
 }
 
-// selectRandomODoHTarget selects a random ODoH target configuration.
-// Go 1.26: Extracted target selection logic with validation.
-func selectRandomODoHTarget(serverInfo *ServerInfo) (interface{}, error) {
-	if len(serverInfo.odohTargetConfigs) == 0 {
-		return nil, ErrNoODoHConfig
-	}
-
-	// Use crypto/rand for production, math/rand acceptable here for load distribution
-	targetIndex := rand.Intn(len(serverInfo.odohTargetConfigs))
-	return serverInfo.odohTargetConfigs[targetIndex], nil
-}
-
-// determineODoHTargetURL determines the target URL for ODoH query.
-// Go 1.26: Extracted URL determination logic, returns *url.URL type.
-func determineODoHTargetURL(serverInfo *ServerInfo) *url.URL {
-	// Use relay URL if configured, otherwise use direct URL
-	if serverInfo.Relay != nil && serverInfo.Relay.ODoH != nil {
-		return serverInfo.Relay.ODoH.URL
-	}
-	return serverInfo.URL
-}
-
-// handleODoHKeyUpdate handles ODoH key update when receiving 401 or buggy 200 responses.
-// Go 1.26: Extracted key update logic with better error handling.
-func handleODoHKeyUpdate(proxy *Proxy, serverInfo *ServerInfo, responseCode int) error {
-	if responseCode == HTTPStatusOK {
-		dlog.Warnf(
-			"ODoH relay for [%v] is buggy and returns a 200 status code instead of 401 after a key update",
-			serverInfo.Name,
-		)
-	}
-
-	dlog.Infof("Forcing key update for [%v]", serverInfo.Name)
-
-	// Find and refresh the server
-	for _, registeredServer := range proxy.serversInfo.registeredServers {
-		if registeredServer.name == serverInfo.Name {
-			err := proxy.serversInfo.refreshServer(proxy, registeredServer.name, registeredServer.stamp)
-			if err != nil {
-				dlog.Noticef("Key update failed for [%v]: %v", serverInfo.Name, err)
-				serverInfo.noticeFailure(proxy)
-				clocksmith.Sleep(KeyUpdateRetryDelay)
-				return fmt.Errorf("key update failed: %w", err)
-			}
-			return nil
-		}
-	}
-
-	return fmt.Errorf("server %s not found in registered servers", serverInfo.Name)
-}
-
 // processODoHQuery processes a query using the Oblivious DNS-over-HTTPS (ODoH) protocol.
-// Go 1.26: Refactored with extracted helper functions and better error handling.
+// Go 1.26: Simplified to work with actual implementation without type assumptions.
 func processODoHQuery(
 	proxy *Proxy,
 	serverInfo *ServerInfo,
@@ -368,33 +316,27 @@ func processODoHQuery(
 ) ([]byte, error) {
 	tid := TransactionID(query)
 
-	// Select random target configuration
-	target, err := selectRandomODoHTarget(serverInfo)
-	if err != nil {
-		return nil, err
+	if len(serverInfo.odohTargetConfigs) == 0 {
+		return nil, ErrNoODoHConfig
 	}
 
 	serverInfo.noticeBegin(proxy)
 
-	// Encrypt query - use type assertion with the actual ODoH target type
-	type ODoHTargetConfig interface {
-		encryptQuery([]byte) (*ObliviousDoHQuery, error)
-	}
+	// Select random target configuration
+	target := serverInfo.odohTargetConfigs[rand.Intn(len(serverInfo.odohTargetConfigs))]
 
-	odohTarget, ok := target.(ODoHTargetConfig)
-	if !ok {
-		dlog.Errorf("Invalid ODoH target configuration type for [%v]", serverInfo.Name)
-		return nil, errors.New("invalid ODoH target type")
-	}
-
-	odohQuery, err := odohTarget.encryptQuery(query)
+	// Encrypt query - use actual method without type assumptions
+	odohQuery, err := target.encryptQuery(query)
 	if err != nil {
 		dlog.Errorf("Failed to encrypt query for [%v]: %v", serverInfo.Name, err)
 		return nil, fmt.Errorf("ODoH encryption failed: %w", err)
 	}
 
-	// Determine target URL (returns *url.URL)
-	targetURL := determineODoHTargetURL(serverInfo)
+	// Determine target URL
+	targetURL := serverInfo.URL
+	if serverInfo.Relay != nil && serverInfo.Relay.ODoH != nil {
+		targetURL = serverInfo.Relay.ODoH.URL
+	}
 
 	// Execute ODoH query
 	responseBody, responseCode, _, _, err := proxy.xTransport.ObliviousDoHQuery(
@@ -423,11 +365,27 @@ func processODoHQuery(
 
 	// Handle key update scenarios
 	if responseCode == HTTPStatusUnauthorized || (responseCode == HTTPStatusOK && len(responseBody) == 0) {
-		if updateErr := handleODoHKeyUpdate(proxy, serverInfo, responseCode); updateErr != nil {
-			// Key update failed, continue to error handling
-			dlog.Warnf("Failed to update keys for [%v]", serverInfo.Name)
+		if responseCode == HTTPStatusOK {
+			dlog.Warnf(
+				"ODoH relay for [%v] is buggy and returns a 200 status code instead of 401 after a key update",
+				serverInfo.Name,
+			)
 		}
-	} else if err != nil || responseCode != HTTPStatusOK {
+
+		dlog.Infof("Forcing key update for [%v]", serverInfo.Name)
+
+		// Find and refresh the server
+		for _, registeredServer := range proxy.serversInfo.registeredServers {
+			if registeredServer.name == serverInfo.Name {
+				if err := proxy.serversInfo.refreshServer(proxy, registeredServer.name, registeredServer.stamp); err != nil {
+					dlog.Noticef("Key update failed for [%v]: %v", serverInfo.Name, err)
+					serverInfo.noticeFailure(proxy)
+					clocksmith.Sleep(KeyUpdateRetryDelay)
+				}
+				break
+			}
+		}
+	} else {
 		dlog.Warnf("Failed to receive successful response from [%v]: status=%d, err=%v", 
 			serverInfo.Name, responseCode, err)
 	}
