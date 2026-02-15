@@ -7,7 +7,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"codeberg.org/miekg/dns"
 	"github.com/jedisct1/dlog"
 )
 
