@@ -10,8 +10,11 @@ import (
 	"net/netip"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+	"unique"
 )
 
 // TestFormatDialTarget verifies that formatDialTarget produces the correct
@@ -429,5 +432,99 @@ func BenchmarkH3HealthInBackoff(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		_ = s.inBackoff()
+	}
+}
+
+func TestTrimStringCache(t *testing.T) {
+	t.Parallel()
+
+	t.Run("does not clear below max", func(t *testing.T) {
+		t.Parallel()
+
+		var cache sync.Map
+		var sizeCounter atomic.Int64
+		cache.Store(hostPortKey{host: "example.com", port: 443}, "example.com:443")
+
+		trimStringCache(&cache, &sizeCounter, 2)
+
+		if sizeCounter.Load() != 1 {
+			t.Fatalf("size counter = %d, want 1", sizeCounter.Load())
+		}
+		found := false
+		cache.Range(func(_, _ any) bool {
+			found = true
+			return false
+		})
+		if !found {
+			t.Fatal("cache unexpectedly cleared below max")
+		}
+	})
+
+	t.Run("clears at max", func(t *testing.T) {
+		t.Parallel()
+
+		var cache sync.Map
+		var sizeCounter atomic.Int64
+		cache.Store(hostPortKey{host: "example.com", port: 443}, "example.com:443")
+
+		trimStringCache(&cache, &sizeCounter, 1)
+
+		if sizeCounter.Load() != 0 {
+			t.Fatalf("size counter = %d, want 0 after clear", sizeCounter.Load())
+		}
+		found := false
+		cache.Range(func(_, _ any) bool {
+			found = true
+			return false
+		})
+		if found {
+			t.Fatal("cache not cleared at max")
+		}
+	})
+}
+
+func TestResetCacheClearsPrewarmAndH3Health(t *testing.T) {
+	t.Parallel()
+
+	x := NewXTransport()
+	x.cachedIPs.cache["example.com"] = &CachedIPItem{
+		addrs:      []netip.Addr{netip.MustParseAddr("1.1.1.1")},
+		expiration: time.Now().Add(time.Minute),
+	}
+	x.altSupport.cache["example.com"] = altSvcEntry{port: 443, noExpiry: true}
+	x.prewarmed.do(unique.Make("example.com:443"), func() {})
+	x.h3Health.Store("example.com", &h3HealthState{})
+	dialTargetCache.Store(dialTargetKey{addr: netip.MustParseAddr("1.1.1.1"), port: 443}, "1.1.1.1:443")
+	hostPortCache.Store(hostPortKey{host: "example.com", port: 443}, "example.com:443")
+	dialTargetCacheSize.Store(1)
+	hostPortCacheSize.Store(1)
+
+	x.ResetCache()
+
+	if len(x.cachedIPs.cache) != 0 {
+		t.Fatalf("cachedIPs not cleared: %d entries", len(x.cachedIPs.cache))
+	}
+	if len(x.altSupport.cache) != 0 {
+		t.Fatalf("altSupport not cleared: %d entries", len(x.altSupport.cache))
+	}
+	prewarmedFound := false
+	x.prewarmed.m.Range(func(_, _ any) bool {
+		prewarmedFound = true
+		return false
+	})
+	if prewarmedFound {
+		t.Fatal("prewarmed cache not cleared")
+	}
+	h3HealthFound := false
+	x.h3Health.Range(func(_, _ any) bool {
+		h3HealthFound = true
+		return false
+	})
+	if h3HealthFound {
+		t.Fatal("h3Health cache not cleared")
+	}
+	if dialTargetCacheSize.Load() != 0 || hostPortCacheSize.Load() != 0 {
+		t.Fatalf("cache size counters not reset: dial=%d hostport=%d",
+			dialTargetCacheSize.Load(), hostPortCacheSize.Load())
 	}
 }
