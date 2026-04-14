@@ -1,3 +1,5 @@
+//go:build linux
+
 package main
 
 import (
@@ -20,6 +22,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -49,7 +52,6 @@ const (
 
 	DefaultBootstrapResolver    = "9.9.9.9:53"
 	DefaultKeepAlive            = 5 * time.Second
-	DefaultIdleConnTimeout      = 90 * time.Second
 	DefaultTimeout              = 30 * time.Second
 	ResolverReadTimeout         = 5 * time.Second
 	SystemResolverTimeout       = 5 * time.Second
@@ -62,7 +64,6 @@ const (
 	resolverRetryMaxBackoff     = 1 * time.Second
 	MaxIdleConns                = 2000
 	MaxResponseHeaderBytes      = 4096
-	TLSHandshakeTimeout         = 10 * time.Second
 	altSvcNegativeTTL           = 10 * time.Minute
 
 	// ── HTTP/2 tuning – maximised for low‑latency DoH ────────────────────────
@@ -73,7 +74,6 @@ const (
 	h2MaxReceiveBufferPerConn   = 4*1024*1024 - 1  // ~4 MiB
 	h2MaxReceiveBufferPerStream = 4*1024*1024 - 1  // ~4 MiB
 	h2SendPingTimeout           = 15 * time.Second
-	h2PingTimeout               = h2SendPingTimeout // same budget for both send and round-trip ping
 	h2WriteByteTimeout          = 10 * time.Second
 	h2TLSSessionCacheSize       = 512
 	h2ReadWriteBufferSize       = 64 * 1024 // 64 KiB – larger I/O buffers reduce syscalls
@@ -91,9 +91,9 @@ const (
 	h3InitialConnWindow   = 1024 * 1024     // 1 MiB per connection
 	h3MaxConnWindow       = 8 * 1024 * 1024 // 8 MiB per connection
 
-	// ── TCP socket buffer sizes ───────────────────────────────────────────────
+	// ── Socket buffer sizes ───────────────────────────────────────────────────
 	// Request 256 KiB send/recv buffers. Kernel caps at net.core.{w,r}mem_max.
-	tcpSocketBufSize = 256 * 1024 // 256 KiB
+	socketBufSize = 256 * 1024 // 256 KiB
 
 	// ── TCP_NOTSENT_LOWAT value ───────────────────────────────────────────────
 	// 16 KiB: enough slack to keep writes non-blocking while preventing
@@ -117,10 +117,6 @@ const (
 	// hostPortCacheMaxSize bounds the global host:port cache.
 	hostPortCacheMaxSize = 2048
 
-	// cacheTrimWindow prevents repeated cache clears under bursty concurrent
-	// insertions by allowing only a narrow clear window around max size.
-	cacheTrimWindow = 16
-
 	// ── H3 per-host failure / backoff thresholds ──────────────────────────────
 	// After h3FailureThreshold consecutive H3 failures for a host, suppress H3
 	// for an exponentially increasing window (h3BackoffInitial × 2^n, capped at
@@ -132,6 +128,10 @@ const (
 	// 1 << 4 == 16, so the maximum multiplier is 16× h3BackoffInitial = 480s,
 	// which is already capped to h3BackoffMax (10 min) anyway.
 	h3BackoffShiftMax = 4
+
+	// ── I/O drain limits ───────────────────────────────────────────────────────
+	prewarmDrainLimit = 4 * 1024  // 4 KiB
+	errorDrainLimit   = 32 * 1024 // 32 KiB
 )
 
 // ── Package‑level sentinel errors (zero‑allocation returns) ──────────────────
@@ -245,11 +245,9 @@ func trimStringCache(cache *sync.Map, sizeCounter *atomic.Int64, maxSize int64) 
 	if size < maxSize {
 		return
 	}
-	if size%cacheTrimWindow != 0 {
-		return
+	if sizeCounter.CompareAndSwap(size, 0) {
+		cache.Clear()
 	}
-	cache.Clear()
-	sizeCounter.Store(0)
 }
 
 // appendFrom reads from r into buf, growing it as needed, and returns the
@@ -264,7 +262,7 @@ func appendFrom(buf []byte, r io.Reader) ([]byte, error) {
 			if c := cap(buf); c >= 8*1024 {
 				growth = min(c, 64*1024)
 			}
-			buf = append(buf, make([]byte, growth)...)[:len(buf)]
+			buf = slices.Grow(buf, growth)
 		}
 		n, err := r.Read(buf[len(buf):cap(buf)])
 		buf = buf[:len(buf)+n]
@@ -633,23 +631,30 @@ func (x *XTransport) markUpdatingCachedIP(host string) {
 func (x *XTransport) loadCachedAddrs(host string) (addrs []netip.Addr, expired, updating bool) {
 	x.cachedIPs.RLock()
 	item, ok := x.cachedIPs.cache[host]
+	var expiration, updatingUntil time.Time
+	var itemAddrs []netip.Addr
+	if ok && item != nil {
+		expiration = item.expiration
+		updatingUntil = item.updatingUntil
+		itemAddrs = item.addrs
+	}
 	x.cachedIPs.RUnlock()
 	if !ok || item == nil {
 		return nil, false, false
 	}
 	now := time.Now()
-	if !item.updatingUntil.IsZero() && now.Before(item.updatingUntil) {
+	if !updatingUntil.IsZero() && now.Before(updatingUntil) {
 		updating = true
 	}
-	if !item.expiration.IsZero() && now.After(item.expiration) {
+	if !expiration.IsZero() && now.After(expiration) {
 		expired = true
 	}
-	if len(item.addrs) == 0 {
+	if len(itemAddrs) == 0 {
 		return nil, expired, updating
 	}
 	// Zero-copy return: netip.Addr is a value type and writers replace the entire
 	// *CachedIPItem, so the stored slice is immutable — return it directly.
-	return item.addrs, expired, updating
+	return itemAddrs, expired, updating
 }
 
 func (x *XTransport) PurgeExpiredCache() (ipsPurged, altSvcPurged, muPurged int) {
@@ -670,18 +675,29 @@ func (x *XTransport) PurgeExpiredCache() (ipsPurged, altSvcPurged, muPurged int)
 	})
 	ipsPurged = before - len(x.cachedIPs.cache)
 
-	// Build live set for later mutex + prewarmer + dial-target cleanup
-	live := make(map[string]struct{}, len(x.cachedIPs.cache))
-	liveAddrs := make(map[netip.Addr]struct{})
+	type cachedSnapshot struct {
+		host  string
+		addrs []netip.Addr
+	}
+	snaps := make([]cachedSnapshot, 0, len(x.cachedIPs.cache))
 	for host, item := range x.cachedIPs.cache {
-		live[host] = struct{}{}
+		s := cachedSnapshot{host: host}
 		if item != nil {
-			for _, addr := range item.addrs {
-				liveAddrs[addr] = struct{}{}
-			}
+			s.addrs = item.addrs
 		}
+		snaps = append(snaps, s)
 	}
 	x.cachedIPs.Unlock()
+
+	// Build live set for later mutex + prewarmer + dial-target cleanup.
+	live := make(map[string]struct{}, len(snaps))
+	liveAddrs := make(map[netip.Addr]struct{})
+	for _, s := range snaps {
+		live[s.host] = struct{}{}
+		for _, addr := range s.addrs {
+			liveAddrs[addr] = struct{}{}
+		}
+	}
 
 	// Alt‑Svc cache — use isAltSvcExpired helper
 	x.altSupport.Lock()
@@ -760,6 +776,8 @@ func (x *XTransport) ResetCache() {
 	hostPortCacheSize.Store(0)
 
 	x.resolveMu.Clear()
+	x.prewarmed = hostPrewarmer{}
+	x.h3Health.Clear()
 
 	dlog.Debug("ResetCache: all IP, Alt‑Svc, mutex, and dial-target cache entries cleared")
 }
@@ -796,8 +814,8 @@ func tcpControlContext(_ context.Context, _, _ string, c syscall.RawConn) error 
 		// TCP_NOTSENT_LOWAT — prevents kernel-side send-buffer bloat
 		_ = unix.SetsockoptInt(ifd, unix.IPPROTO_TCP, unix.TCP_NOTSENT_LOWAT, tcpNotSentLowat)
 		// SO_SNDBUF / SO_RCVBUF — 256 KiB socket buffers reduce syscall frequency
-		_ = unix.SetsockoptInt(ifd, unix.SOL_SOCKET, unix.SO_SNDBUF, tcpSocketBufSize)
-		_ = unix.SetsockoptInt(ifd, unix.SOL_SOCKET, unix.SO_RCVBUF, tcpSocketBufSize)
+		_ = unix.SetsockoptInt(ifd, unix.SOL_SOCKET, unix.SO_SNDBUF, socketBufSize)
+		_ = unix.SetsockoptInt(ifd, unix.SOL_SOCKET, unix.SO_RCVBUF, socketBufSize)
 	})
 }
 
@@ -820,8 +838,8 @@ func setTCPOptions(conn net.Conn) {
 		ifd := int(fd)
 		_ = unix.SetsockoptInt(ifd, unix.IPPROTO_TCP, unix.TCP_QUICKACK, 1)
 		_ = unix.SetsockoptInt(ifd, unix.IPPROTO_TCP, unix.TCP_NOTSENT_LOWAT, tcpNotSentLowat)
-		_ = unix.SetsockoptInt(ifd, unix.SOL_SOCKET, unix.SO_SNDBUF, tcpSocketBufSize)
-		_ = unix.SetsockoptInt(ifd, unix.SOL_SOCKET, unix.SO_RCVBUF, tcpSocketBufSize)
+		_ = unix.SetsockoptInt(ifd, unix.SOL_SOCKET, unix.SO_SNDBUF, socketBufSize)
+		_ = unix.SetsockoptInt(ifd, unix.SOL_SOCKET, unix.SO_RCVBUF, socketBufSize)
 	})
 }
 
@@ -838,8 +856,8 @@ func setUDPOptions(conn *net.UDPConn) {
 		// interrupt + context-switch overhead on the receive path. Requires
 		// CAP_NET_ADMIN; silently ignored if kernel or driver does not support it.
 		_ = unix.SetsockoptInt(ifd, unix.SOL_SOCKET, unix.SO_BUSY_POLL, udpBusyPollMicros)
-		_ = unix.SetsockoptInt(ifd, unix.SOL_SOCKET, unix.SO_SNDBUF, tcpSocketBufSize)
-		_ = unix.SetsockoptInt(ifd, unix.SOL_SOCKET, unix.SO_RCVBUF, tcpSocketBufSize)
+		_ = unix.SetsockoptInt(ifd, unix.SOL_SOCKET, unix.SO_SNDBUF, socketBufSize)
+		_ = unix.SetsockoptInt(ifd, unix.SOL_SOCKET, unix.SO_RCVBUF, socketBufSize)
 	})
 }
 
@@ -876,7 +894,7 @@ func (x *XTransport) rebuildTransport() {
 		MaxReceiveBufferPerConnection: h2MaxReceiveBufferPerConn,
 		MaxReceiveBufferPerStream:     h2MaxReceiveBufferPerStream,
 		SendPingTimeout:               h2SendPingTimeout,
-		PingTimeout:                   h2PingTimeout,
+		PingTimeout:                   h2SendPingTimeout,
 		WriteByteTimeout:              h2WriteByteTimeout,
 		CountError: func(errType string) {
 			dlog.Debugf("HTTP/2 error: %s", errType)
@@ -978,7 +996,7 @@ func (x *XTransport) prewarmConnection(hostPort string) {
 			if err != nil {
 				dlog.Debugf("Prewarm: %s: %v (connection may still be cached)", hostPort, err)
 			} else {
-				_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4*1024))
+				_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, prewarmDrainLimit))
 				resp.Body.Close()
 				dlog.Debugf("Prewarmed HTTP/2 connection to %s (status %d)", hostPort, resp.StatusCode)
 			}
@@ -994,7 +1012,9 @@ func (x *XTransport) prewarmConnection(hostPort string) {
 			if !inCache || entry.port == 0 {
 				return
 			}
-			h3Req, h3Err := http.NewRequestWithContext(ctx, http.MethodHead,
+			h3Ctx, h3Cancel := context.WithTimeout(context.Background(), h2TLSHandshakeTimeout)
+			defer h3Cancel()
+			h3Req, h3Err := http.NewRequestWithContext(h3Ctx, http.MethodHead,
 				"https://"+hostPort+"/", nil)
 			if h3Err != nil {
 				return
@@ -1005,7 +1025,7 @@ func (x *XTransport) prewarmConnection(hostPort string) {
 				dlog.Debugf("Prewarm H3: %s: %v", hostPort, h3Err)
 				return
 			}
-			_, _ = io.Copy(io.Discard, io.LimitReader(h3Resp.Body, 4*1024))
+			_, _ = io.Copy(io.Discard, io.LimitReader(h3Resp.Body, prewarmDrainLimit))
 			h3Resp.Body.Close()
 			dlog.Debugf("Prewarmed HTTP/3 connection to %s (status %d)", hostPort, h3Resp.StatusCode)
 		}()
@@ -1126,7 +1146,7 @@ func (x *XTransport) buildH3DialFunc() func(context.Context, string, *tls.Config
 					nw = "udp6"
 				}
 			}
-			return udpTarget{host + ":" + strconv.Itoa(port), nw}
+			return udpTarget{formatHostPort(host, port), nw}
 		}
 
 		cachedAddrs, expired, updating := x.loadCachedAddrs(host)
@@ -1310,7 +1330,7 @@ func (x *XTransport) resolveUsingSystem(host string, returnIPv4, returnIPv6 bool
 		for _, a := range addrs {
 			ips = append(ips, a.IP)
 		}
-		return ips, SystemResolverIPTTL, err
+		return ips, SystemResolverIPTTL, nil
 	}
 	out := make([]net.IP, 0, len(addrs))
 	for _, a := range addrs {
@@ -1325,7 +1345,7 @@ func (x *XTransport) resolveUsingSystem(host string, returnIPv4, returnIPv6 bool
 	if len(out) == 0 {
 		return nil, SystemResolverIPTTL, err
 	}
-	return out, SystemResolverIPTTL, err
+	return out, SystemResolverIPTTL, nil
 }
 
 func (x *XTransport) resolveRRType(
@@ -1670,7 +1690,7 @@ func (x *XTransport) resolveAndUpdateCache(host string) error {
 		default:
 			dlog.Errorf("no IP address found for [%s]", host)
 		}
-		return nil
+		return fmt.Errorf("no IP address found for [%s]", host)
 	}
 
 	x.saveCachedIPs(host, ips, ttl)
@@ -1885,7 +1905,7 @@ func (x *XTransport) Fetch(
 			err = errEmptyResponse
 		case resp.StatusCode < 200 || resp.StatusCode > 299:
 			// Drain a small amount so the underlying connection can be reused.
-			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 32*1024))
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, errorDrainLimit))
 			err = errors.New(resp.Status)
 		}
 	} else {
@@ -1997,6 +2017,7 @@ outer:
 		return
 	}
 
+	now = time.Now()
 	x.altSupport.Lock()
 	// TOCTOU double-check under write lock: between the RLock read at the top
 	// of this function and this Lock, another goroutine could have written a
