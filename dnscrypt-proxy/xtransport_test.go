@@ -444,11 +444,12 @@ func TestTrimStringCache(t *testing.T) {
 		var cache sync.Map
 		var sizeCounter atomic.Int64
 		cache.Store(hostPortKey{host: "example.com", port: 443}, "example.com:443")
+		sizeCounter.Store(1)
 
-		trimStringCache(&cache, &sizeCounter, 2)
+		trimStringCache(&cache, &sizeCounter, 3)
 
-		if sizeCounter.Load() != 1 {
-			t.Fatalf("size counter = %d, want 1", sizeCounter.Load())
+		if sizeCounter.Load() != 2 {
+			t.Fatalf("size counter = %d, want 2", sizeCounter.Load())
 		}
 		found := false
 		cache.Range(func(_, _ any) bool {
@@ -498,6 +499,12 @@ func TestResetCacheClearsPrewarmAndH3Health(t *testing.T) {
 	hostPortCache.Store(hostPortKey{host: "example.com", port: 443}, "example.com:443")
 	dialTargetCacheSize.Store(1)
 	hostPortCacheSize.Store(1)
+	t.Cleanup(func() {
+		dialTargetCache.Clear()
+		hostPortCache.Clear()
+		dialTargetCacheSize.Store(0)
+		hostPortCacheSize.Store(0)
+	})
 
 	x.ResetCache()
 
