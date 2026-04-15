@@ -122,11 +122,18 @@ func (cw *ConfigWatcher) handleEvent(path string) {
 	dir := filepath.Dir(absPath)
 	cw.mu.RLock()
 	filesInDir := cw.filesByDir[dir]
-	cw.mu.RUnlock()
 	if len(filesInDir) == 0 {
+		cw.mu.RUnlock()
 		return
 	}
+	// Copy the file paths while holding the lock to avoid race with RemoveFile
+	filePaths := make([]string, 0, len(filesInDir))
 	for filePath := range filesInDir {
+		filePaths = append(filePaths, filePath)
+	}
+	cw.mu.RUnlock()
+
+	for _, filePath := range filePaths {
 		cw.scheduleCheck(filePath)
 	}
 }
