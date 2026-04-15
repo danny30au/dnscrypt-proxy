@@ -1,7 +1,7 @@
 package main
 
 import (
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"net/netip"
 
@@ -62,7 +62,7 @@ func (plugin *PluginECS) Eval(pluginsState *PluginsState, msg *dns.Msg) error {
 		msg.UDPSize = uint16(pluginsState.maxPayloadSize)
 	}
 
-	ipnet := plugin.nets[rand.Intn(len(plugin.nets))]
+	ipnet := plugin.nets[rand.IntN(len(plugin.nets))]
 	maskBits, addrBits := ipnet.Mask.Size()
 
 	family, addr, ok := ipNetToECSAddress(ipnet, addrBits)
