@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"os"
 	"path/filepath"
@@ -454,10 +454,10 @@ func (plugin *PluginForward) forwardQuery(pluginsState *PluginsState, msg *dns.M
 func (plugin *PluginForward) selectServer(item *SearchSequenceItem, qName string) (string, error) {
 	switch item.typ {
 	case Explicit:
-		return item.servers[rand.Intn(len(item.servers))], nil
+		return item.servers[rand.IntN(len(item.servers))], nil
 
 	case Bootstrap:
-		return plugin.bootstrapResolvers[rand.Intn(len(plugin.bootstrapResolvers))], nil
+		return plugin.bootstrapResolvers[rand.IntN(len(plugin.bootstrapResolvers))], nil
 
 	case DHCP:
 		return plugin.selectDHCPServer(qName)
@@ -480,7 +480,7 @@ func (plugin *PluginForward) selectDHCPServer(qName string) (string, error) {
 		}
 
 		if len(dhcpDNS) > 0 {
-			selectedIP := dhcpDNS[rand.Intn(len(dhcpDNS))]
+			selectedIP := dhcpDNS[rand.IntN(len(dhcpDNS))]
 			return net.JoinHostPort(selectedIP.String(), defaultDNSPort), nil
 		}
 	}
@@ -523,7 +523,7 @@ func (plugin *PluginForward) selectResolvconfServer(item *SearchSequenceItem, qN
 		item.rcLastFail.Store(0) // Clear failure state on successful read
 	}
 
-	nameserver := servers[rand.Intn(len(servers))]
+	nameserver := servers[rand.IntN(len(servers))]
 	normalized, err := normalizeIPAndOptionalPort(nameserver, defaultDNSPort)
 	if err != nil {
 		dlog.Warnf("Syntax error in address '%s' while resolving [%s]: %v", nameserver, qName, err)

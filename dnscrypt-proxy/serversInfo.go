@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math/bits"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"net/url"
 	"slices"
@@ -86,7 +86,7 @@ type LBStrategy interface {
 type LBStrategyP2 struct{}
 
 func (LBStrategyP2) getCandidate(serversCount int) int {
-	return rand.Intn(Min(serversCount, 2))
+	return rand.IntN(Min(serversCount, 2))
 }
 
 func (LBStrategyP2) getActiveCount(serversCount int) int {
@@ -96,7 +96,7 @@ func (LBStrategyP2) getActiveCount(serversCount int) int {
 type LBStrategyPN struct{ n int }
 
 func (s LBStrategyPN) getCandidate(serversCount int) int {
-	return rand.Intn(Min(serversCount, s.n))
+	return rand.IntN(Min(serversCount, s.n))
 }
 
 func (s LBStrategyPN) getActiveCount(serversCount int) int {
@@ -106,7 +106,7 @@ func (s LBStrategyPN) getActiveCount(serversCount int) int {
 type LBStrategyPH struct{}
 
 func (LBStrategyPH) getCandidate(serversCount int) int {
-	return rand.Intn((serversCount + 1) / 2)
+	return rand.IntN((serversCount + 1) / 2)
 }
 
 func (LBStrategyPH) getActiveCount(serversCount int) int {
@@ -126,7 +126,7 @@ func (LBStrategyFirst) getActiveCount(int) int {
 type LBStrategyRandom struct{}
 
 func (LBStrategyRandom) getCandidate(serversCount int) int {
-	return rand.Intn(serversCount)
+	return rand.IntN(serversCount)
 }
 
 func (LBStrategyRandom) getActiveCount(serversCount int) int {
@@ -141,7 +141,7 @@ func (LBStrategyWP2) getCandidate(serversCount int) int {
 	if serversCount <= 1 {
 		return 0
 	}
-	return rand.Intn(serversCount)
+	return rand.IntN(serversCount)
 }
 
 func (LBStrategyWP2) getActiveCount(serversCount int) int {
@@ -310,7 +310,7 @@ func (serversInfo *ServersInfo) estimatorUpdate(currentActive int) {
 	if activeCount == serversCount {
 		return
 	}
-	candidate := rand.Intn(serversCount-activeCount) + activeCount
+	candidate := rand.IntN(serversCount-activeCount) + activeCount
 	candidateRtt, currentActiveRtt := serversInfo.inner[candidate].rtt.Value(), serversInfo.inner[currentActive].rtt.Value()
 	if currentActiveRtt < 0 {
 		currentActiveRtt = candidateRtt
@@ -386,12 +386,12 @@ func (serversInfo *ServersInfo) getWeightedCandidate(serversCount int) int {
 	}
 
 	// Select two random servers
-	first := rand.Intn(serversCount)
-	second := rand.Intn(serversCount)
+	first := rand.IntN(serversCount)
+	second := rand.IntN(serversCount)
 
 	// Ensure we have two different servers
 	for second == first {
-		second = rand.Intn(serversCount)
+		second = rand.IntN(serversCount)
 	}
 
 	server1 := serversInfo.inner[first]
@@ -522,7 +522,7 @@ func findFarthestRoute(proxy *Proxy, name string, relayStamps []stamps.ServerSta
 			}
 			candidates = append(candidates, relayIdx)
 		}
-		return &relayStamps[candidates[rand.Intn(len(candidates))]]
+		return &relayStamps[candidates[rand.IntN(len(candidates))]]
 	} else if server.stamp.Proto != stamps.StampProtoTypeDNSCrypt {
 		return nil
 	}
@@ -571,7 +571,7 @@ func findFarthestRoute(proxy *Proxy, name string, relayStamps []stamps.ServerSta
 	if len(bestRelayIdxs) == 0 {
 		return nil
 	}
-	return &relayStamps[bestRelayIdxs[rand.Intn(len(bestRelayIdxs))]]
+	return &relayStamps[bestRelayIdxs[rand.IntN(len(bestRelayIdxs))]]
 }
 
 func relayProtoForServerProto(proto stamps.StampProtoType) (stamps.StampProtoType, error) {
@@ -642,7 +642,7 @@ func route(proxy *Proxy, name string, serverProto stamps.StampProtoType) (*Relay
 	}
 	var relayCandidateStamp *stamps.ServerStamp
 	if !wildcard || len(relayStamps) == 1 {
-		relayCandidateStamp = &relayStamps[rand.Intn(len(relayStamps))]
+		relayCandidateStamp = &relayStamps[rand.IntN(len(relayStamps))]
 	} else {
 		relayCandidateStamp = findFarthestRoute(proxy, name, relayStamps)
 	}
@@ -839,7 +839,7 @@ func dohNXTestPacket(msgID uint16) []byte {
 	qName := make([]byte, 16)
 	charset := "abcdefghijklmnopqrstuvwxyz"
 	for i := range qName {
-		qName[i] = charset[rand.Intn(len(charset))]
+		qName[i] = charset[rand.IntN(len(charset))]
 	}
 	msg := dns.NewMsg(string(qName)+".test.dnscrypt.", dns.TypeNS)
 	msg.ID = msgID
@@ -860,7 +860,7 @@ func plainNXTestPacket(msgID uint16) *dns.Msg {
 	qName := make([]byte, 16)
 	charset := "abcdefghijklmnopqrstuvwxyz"
 	for i := range qName {
-		qName[i] = charset[rand.Intn(len(charset))]
+		qName[i] = charset[rand.IntN(len(charset))]
 	}
 	msg := dns.NewMsg(string(qName)+".test.dnscrypt.", dns.TypeNS)
 	msg.ID = msgID
@@ -1009,7 +1009,7 @@ func _fetchODoHTargetInfo(proxy *Proxy, name string, stamp stamps.ServerStamp, i
 	}
 
 	dlog.Debugf("Pausing after ODoH configuration retrieval")
-	delay := time.Duration(rand.Intn(5*1000)) * time.Millisecond
+	delay := time.Duration(rand.IntN(5*1000)) * time.Millisecond
 	clocksmith.Sleep(time.Duration(delay))
 	dlog.Debugf("Pausing done")
 
