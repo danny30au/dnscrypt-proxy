@@ -41,7 +41,7 @@ type SearchSequenceItem struct {
 	typ        SearchSequenceItemType
 	servers    []string
 	resolvconf string
-	rcLastFail atomic.Int64 // unix timestamp of last failed resolv.conf read
+	rcLastFail *atomic.Int64 // unix timestamp of last failed resolv.conf read (pointer to allow safe struct copies)
 }
 
 // PluginForwardEntry represents a forwarding rule for a specific domain.
@@ -213,7 +213,7 @@ func (plugin *PluginForward) parseServerSequence(serversStr, domain string, line
 				return nil, false, err
 			}
 			if item != nil {
-				sequence = appendServerToSequence(sequence, *item)
+				sequence = appendServerToSequence(sequence, item)
 			}
 		}
 	}
@@ -243,6 +243,7 @@ func (plugin *PluginForward) parseServerSpecifier(server, domain string, lineNo 
 		return &SearchSequenceItem{
 			typ:        Resolvconf,
 			resolvconf: file,
+			rcLastFail: new(atomic.Int64),
 		}, nil
 	}
 
@@ -271,9 +272,9 @@ func isLastSequenceType(sequence []SearchSequenceItem, typ SearchSequenceItemTyp
 }
 
 // appendServerToSequence adds a server to the sequence, coalescing with existing Explicit items.
-func appendServerToSequence(sequence []SearchSequenceItem, item SearchSequenceItem) []SearchSequenceItem {
+func appendServerToSequence(sequence []SearchSequenceItem, item *SearchSequenceItem) []SearchSequenceItem {
 	if item.typ != Explicit {
-		return append(sequence, item)
+		return append(sequence, *item)
 	}
 
 	// Find existing Explicit item to append to
@@ -284,7 +285,7 @@ func appendServerToSequence(sequence []SearchSequenceItem, item SearchSequenceIt
 		}
 	}
 
-	return append(sequence, item)
+	return append(sequence, *item)
 }
 
 func (plugin *PluginForward) Drop() error {
@@ -490,16 +491,20 @@ func (plugin *PluginForward) selectDHCPServer(qName string) (string, error) {
 // selectResolvconfServer selects a server from a resolv.conf file.
 func (plugin *PluginForward) selectResolvconfServer(item *SearchSequenceItem, qName string) (string, error) {
 	// Check if we're in retry backoff period
-	if lastFail := item.rcLastFail.Load(); lastFail != 0 {
-		if time.Since(time.Unix(lastFail, 0)) < resolvconfRetryInterval {
-			return "", errors.New("resolv.conf in retry backoff")
+	if item.rcLastFail != nil {
+		if lastFail := item.rcLastFail.Load(); lastFail != 0 {
+			if time.Since(time.Unix(lastFail, 0)) < resolvconfRetryInterval {
+				return "", errors.New("resolv.conf in retry backoff")
+			}
 		}
 	}
 
 	servers, warnings, err := plugin.cachedResolvConf(item.resolvconf)
 	if err != nil {
 		dlog.Warnf("Failed to open '%s' while resolving [%s]: %v", item.resolvconf, qName, err)
-		item.rcLastFail.Store(time.Now().Unix())
+		if item.rcLastFail != nil {
+			item.rcLastFail.Store(time.Now().Unix())
+		}
 		return "", err
 	}
 
@@ -508,11 +513,15 @@ func (plugin *PluginForward) selectResolvconfServer(item *SearchSequenceItem, qN
 			dlog.Warn(w)
 		}
 		dlog.Warnf("No valid nameservers in '%s' while resolving [%s]", item.resolvconf, qName)
-		item.rcLastFail.Store(time.Now().Unix())
+		if item.rcLastFail != nil {
+			item.rcLastFail.Store(time.Now().Unix())
+		}
 		return "", errors.New("no valid nameservers in resolv.conf")
 	}
 
-	item.rcLastFail.Store(0) // Clear failure state on successful read
+	if item.rcLastFail != nil {
+		item.rcLastFail.Store(0) // Clear failure state on successful read
+	}
 
 	nameserver := servers[rand.Intn(len(servers))]
 	normalized, err := normalizeIPAndOptionalPort(nameserver, defaultDNSPort)

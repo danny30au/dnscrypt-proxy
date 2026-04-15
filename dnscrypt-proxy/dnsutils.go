@@ -575,10 +575,9 @@ func DNSExchange(
 //
 // Uses sync.WaitGroup.Go (Go 1.25+) for cleaner goroutine lifecycle management.
 //
-// PERF: uses a shallow struct-value copy of *query instead of query.Copy()
-// (deep clone). Each goroutine calls Pack() independently, writing only to
-// q.Data; the shared Question/Answer/Ns/Extra/Pseudo slice headers are not
-// mutated, so no data race occurs.
+// Uses query.Copy() to create independent copies for each goroutine. The Copy()
+// method performs a shallow copy of the slice headers (Question/Answer/etc.),
+// which is safe since each goroutine calls Pack() independently.
 func runExchange(
 	proxy *Proxy,
 	proto string,
@@ -602,23 +601,23 @@ func runExchange(
 
 	for try := range exchangeMaxTries {
 		if tryFragmentsSupport {
-			// PERF: shallow copy — avoids deep-cloning RR slices.
-			q := *query
+			// Use Copy() to avoid copying atomic fields that trigger go vet warnings.
+			q := query.Copy()
 			q.ID += uint16(launched)
 			launched++
 			delay := time.Duration(try) * fragmentProbeDelay
 			wg.Go(func() {
-				waitAndExchange(ctx, proxy, proto, &q, serverAddress, relay, fragmentProbeSize, false, 0, delay, channel)
+				waitAndExchange(ctx, proxy, proto, q, serverAddress, relay, fragmentProbeSize, false, 0, delay, channel)
 			})
 		}
 
-		// PERF: shallow copy for safe path.
-		q := *query
+		// Use Copy() to avoid copying atomic fields that trigger go vet warnings.
+		q := query.Copy()
 		q.ID += uint16(launched)
 		launched++
 		delay := time.Duration(try) * safePathDelay
 		wg.Go(func() {
-			waitAndExchange(ctx, proxy, proto, &q, serverAddress, relay, safePacketSize, true, 1, delay, channel)
+			waitAndExchange(ctx, proxy, proto, q, serverAddress, relay, safePacketSize, true, 1, delay, channel)
 		})
 	}
 
