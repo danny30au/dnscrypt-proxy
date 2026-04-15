@@ -29,6 +29,9 @@ func (plugin *PluginBlockIPv6) Reload() error {
 }
 
 func (plugin *PluginBlockIPv6) Eval(pluginsState *PluginsState, msg *dns.Msg) error {
+	if len(msg.Question) == 0 {
+		return nil
+	}
 	question := msg.Question[0]
 	if question.Header().Class != dns.ClassINET || dns.RRToType(question) != dns.TypeAAAA {
 		return nil

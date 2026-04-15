@@ -3,7 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"net/netip"
 	"strings"
@@ -117,10 +117,18 @@ func (plugin *PluginCloak) loadRules(lines string, patternMatcher *PatternMatche
 
 		var ptrLine string
 		if ipv4 := ip.To4(); ipv4 != nil {
-			reversed, _ := reverseAddr(ip.To4().String())
+			reversed, err := reverseAddr(ip.To4().String())
+			if err != nil {
+				dlog.Warnf("Failed to reverse IPv4 address at line %d: %v", lineNo+1, err)
+				continue
+			}
 			ptrLine = strings.TrimSuffix(reversed, ".")
 		} else {
-			reversed, _ := reverseAddr(cloakedName.ipv6[0].String())
+			reversed, err := reverseAddr(cloakedName.ipv6[0].String())
+			if err != nil {
+				dlog.Warnf("Failed to reverse IPv6 address at line %d: %v", lineNo+1, err)
+				continue
+			}
 			ptrLine = strings.TrimSuffix(reversed, ".")
 		}
 		ptrQueryLine := ptrEntryToQuery(ptrLine)
@@ -225,6 +233,9 @@ func (plugin *PluginCloak) SetConfigWatcher(watcher *ConfigWatcher) {
 }
 
 func (plugin *PluginCloak) Eval(pluginsState *PluginsState, msg *dns.Msg) error {
+	if len(msg.Question) == 0 {
+		return nil
+	}
 	question := msg.Question[0]
 	qtype := dns.RRToType(question)
 	qname := question.Header().Name

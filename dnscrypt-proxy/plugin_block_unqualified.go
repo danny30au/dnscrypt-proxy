@@ -29,6 +29,9 @@ func (plugin *PluginBlockUnqualified) Reload() error {
 }
 
 func (plugin *PluginBlockUnqualified) Eval(pluginsState *PluginsState, msg *dns.Msg) error {
+	if len(msg.Question) == 0 {
+		return nil
+	}
 	question := msg.Question[0]
 	qtype := dns.RRToType(question)
 	if question.Header().Class != dns.ClassINET || (qtype != dns.TypeA && qtype != dns.TypeAAAA) {
