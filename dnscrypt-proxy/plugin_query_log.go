@@ -58,6 +58,9 @@ func (plugin *PluginQueryLog) Eval(pluginsState *PluginsState, msg *dns.Msg) err
 		// Ignore internal flow.
 		return nil
 	}
+	if len(msg.Question) == 0 {
+		return nil
+	}
 	question := msg.Question[0]
 	qType, ok := dns.TypeToString[dns.RRToType(question)]
 	if !ok {

@@ -56,6 +56,9 @@ func (plugin *PluginFirefox) Eval(pluginsState *PluginsState, msg *dns.Msg) erro
 	if pluginsState.clientProto == "local_doh" {
 		return nil
 	}
+	if len(msg.Question) == 0 {
+		return nil
+	}
 	question := msg.Question[0]
 	qtype := dns.RRToType(question)
 	if question.Header().Class != dns.ClassINET || (qtype != dns.TypeA && qtype != dns.TypeAAAA) {
