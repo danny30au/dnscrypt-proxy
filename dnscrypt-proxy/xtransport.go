@@ -16,6 +16,7 @@ import (
 	"io"
 	"iter"
 	"maps"
+	"math"
 	"math/rand/v2"
 	"net"
 	"net/http"
@@ -48,7 +49,7 @@ var hasAESGCMHardwareSupport = (cpu.X86.HasAES && cpu.X86.HasPCLMULQDQ) ||
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 const (
-	ttlSentinel = ^uint32(0)
+	ttlSentinel uint32 = math.MaxUint32
 
 	DefaultBootstrapResolver    = "9.9.9.9:53"
 	DefaultKeepAlive            = 5 * time.Second
@@ -245,8 +246,32 @@ func trimStringCache(cache *sync.Map, sizeCounter *atomic.Int64, maxSize int64) 
 	if size < maxSize {
 		return
 	}
-	if sizeCounter.CompareAndSwap(size, 0) {
-		cache.Clear()
+	// Evict ~12.5% of maxSize (= maxSize/8) entries instead of clearing the whole
+	// cache. This avoids the thundering-herd re-allocation that a full Clear()
+	// causes. Only one goroutine proceeds when multiple race here; the others
+	// see a CAS failure and return immediately.
+	evictGoal := maxSize / 8
+	if evictGoal < 1 {
+		evictGoal = 1
+	}
+	if !sizeCounter.CompareAndSwap(size, size-evictGoal) {
+		return // another goroutine won the race
+	}
+	var evicted int64
+	cache.Range(func(key, _ any) bool {
+		if evicted >= evictGoal {
+			return false
+		}
+		cache.Delete(key)
+		evicted++
+		return true
+	})
+	// Correct for any shortfall (e.g. cache had fewer entries than evictGoal).
+	if delta := evictGoal - evicted; delta > 0 {
+		sizeCounter.Add(-delta)
+	}
+	if evicted > 0 {
+		cacheEvictions.Add(evicted)
 	}
 }
 
@@ -256,11 +281,14 @@ func trimStringCache(cache *sync.Map, sizeCounter *atomic.Int64, maxSize int64) 
 // allocation occurs.
 func appendFrom(buf []byte, r io.Reader) ([]byte, error) {
 	for {
-		// Exponential growth: start at 512 B, double up to 64 KiB per step.
+		// Doubling policy: start at 512 B, double up to 64 KiB per step.
+		// This matches bytes.Buffer's growth strategy and avoids the many
+		// small-step reallocations that occurred in the 0–8 KiB range with
+		// the old 512-byte fixed step.
 		if len(buf) == cap(buf) {
-			growth := 512
-			if c := cap(buf); c >= 8*1024 {
-				growth = min(c, 64*1024)
+			growth := max(512, cap(buf))
+			if growth > 64*1024 {
+				growth = 64 * 1024
 			}
 			buf = slices.Grow(buf, growth)
 		}
@@ -468,6 +496,13 @@ type XTransport struct {
 	// dial path; rebuilt only on config reload.
 	dialer net.Dialer
 
+	// rebuildMu guards the fields rebuilt by rebuildTransport:
+	// transport, h3Transport, httpClient, h3Client, tlsClientConfig,
+	// dialer, and headers. rebuildTransport holds the write lock for its
+	// entire execution; Fetch and prewarmConnection take a brief read lock
+	// to snapshot the fields they need, then release immediately.
+	rebuildMu sync.RWMutex
+
 	// ── H3 per-host health state ──────────────────────────────────────────────
 	// Tracks consecutive H3 failures per host and the active backoff window.
 	// Loaded lazily via LoadOrStore; cleared on full transport rebuild.
@@ -576,10 +611,19 @@ func (x *XTransport) saveCachedAddrs(host string, addrs []netip.Addr, ttl time.D
 	x.cachedIPs.Unlock()
 
 	if len(normalized) == 1 {
-		dlog.Debugf("[%s] cached IP [%s], valid for %v", host, normalized[0], ttl)
+		if ttl < 0 {
+			dlog.Debugf("[%s] cached IP [%s], no expiry", host, normalized[0])
+		} else {
+			dlog.Debugf("[%s] cached IP [%s], valid for %v", host, normalized[0], ttl)
+		}
 	} else {
-		dlog.Debugf("[%s] cached %d IPs (first: %s), valid for %v",
-			host, len(normalized), normalized[0], ttl)
+		if ttl < 0 {
+			dlog.Debugf("[%s] cached %d IPs (first: %s), no expiry",
+				host, len(normalized), normalized[0])
+		} else {
+			dlog.Debugf("[%s] cached %d IPs (first: %s), valid for %v",
+				host, len(normalized), normalized[0], ttl)
+		}
 	}
 }
 
@@ -864,6 +908,10 @@ func setUDPOptions(conn *net.UDPConn) {
 // ── Transport construction ────────────────────────────────────────────────────
 func (x *XTransport) rebuildTransport() {
 	dlog.Debug("Rebuilding transport")
+	// Hold the write lock for the entire rebuild so concurrent Fetch /
+	// prewarmConnection goroutines see a fully consistent set of fields.
+	x.rebuildMu.Lock()
+	defer x.rebuildMu.Unlock()
 	if x.transport != nil {
 		x.transport.CloseIdleConnections()
 	}
@@ -981,6 +1029,14 @@ func (x *XTransport) prewarmConnection(hostPort string) {
 				return
 			}
 
+			// Snapshot rebuild-protected fields to avoid racing with rebuildTransport.
+			x.rebuildMu.RLock()
+			headers := x.headers
+			httpClient := x.httpClient
+			h3Transport := x.h3Transport
+			h3Client := x.h3Client
+			x.rebuildMu.RUnlock()
+
 			ctx, cancel := context.WithTimeout(context.Background(), h2TLSHandshakeTimeout)
 			defer cancel()
 
@@ -990,9 +1046,9 @@ func (x *XTransport) prewarmConnection(hostPort string) {
 				dlog.Debugf("Prewarm: failed to build request for %s: %v", hostPort, err)
 				return
 			}
-			req.Header = x.headers.getPlain
+			req.Header = headers.getPlain
 
-			resp, err := x.httpClient.Do(req)
+			resp, err := httpClient.Do(req)
 			if err != nil {
 				dlog.Debugf("Prewarm: %s: %v (connection may still be cached)", hostPort, err)
 			} else {
@@ -1002,12 +1058,12 @@ func (x *XTransport) prewarmConnection(hostPort string) {
 			}
 
 			// Also warm H3 if transport is ready and Alt-Svc exists for the host.
-			if x.h3Transport == nil {
+			if h3Transport == nil {
 				return
 			}
 			host, _ := splitHostPort(hostPort)
 			x.altSupport.RLock()
-			entry, inCache := x.altSupport.cache[host]
+			entry, inCache := x.altSupport.cache[altSvcKey(host)]
 			x.altSupport.RUnlock()
 			if !inCache || entry.port == 0 {
 				return
@@ -1019,8 +1075,8 @@ func (x *XTransport) prewarmConnection(hostPort string) {
 			if h3Err != nil {
 				return
 			}
-			h3Req.Header = x.headers.getPlain
-			h3Resp, h3Err := x.h3Client.Do(h3Req)
+			h3Req.Header = headers.getPlain
+			h3Resp, h3Err := h3Client.Do(h3Req)
 			if h3Err != nil {
 				dlog.Debugf("Prewarm H3: %s: %v", hostPort, h3Err)
 				return
@@ -1041,8 +1097,23 @@ func splitHostPort(hostPort string) (host, port string) {
 	return hostPort, ""
 }
 
+// altSvcKey returns the canonical host key used for altSupport cache lookups.
+// It strips any port from urlHost so reads and writes never disagree.
+// Without this, url.Host values like "example.com:443" would miss entries
+// stored under the bare host "example.com", breaking prewarmConnection.
+func altSvcKey(urlHost string) string {
+	if h, _, err := net.SplitHostPort(urlHost); err == nil {
+		return h
+	}
+	return urlHost
+}
+
 func (x *XTransport) buildDialContext() func(context.Context, string, string) (net.Conn, error) {
 	useIPv4, useIPv6 := x.useIPv4, x.useIPv6
+	// Capture proxyDialer and dialer by value at build time so the closure
+	// never races with rebuildTransport on the dial hot-path.
+	proxyDialer := x.proxyDialer
+	dialer := x.dialer
 	return func(ctx context.Context, network, addrStr string) (net.Conn, error) {
 		host, port := ExtractHostAndPort(addrStr, stamps.DefaultPort)
 		portU16 := uint16(port & 0xffff)
@@ -1061,18 +1132,18 @@ func (x *XTransport) buildDialContext() func(context.Context, string, string) (n
 		}
 
 		dialOne := func(ctx context.Context, dialNet, target string) (net.Conn, error) {
-			if x.proxyDialer == nil {
-				return x.dialer.DialContext(ctx, dialNet, target)
+			if proxyDialer == nil {
+				return dialer.DialContext(ctx, dialNet, target)
 			}
 			// Proxy path: ControlContext cannot run (proxy owns the socket).
 			// Apply options post-dial; TCP_FASTOPEN_CONNECT is omitted as it
 			// is a no-op on already-connected sockets.
 			var conn net.Conn
 			var err error
-			if pdCtx, ok := (*x.proxyDialer).(netproxy.ContextDialer); ok {
+			if pdCtx, ok := (*proxyDialer).(netproxy.ContextDialer); ok {
 				conn, err = pdCtx.DialContext(ctx, dialNet, target)
 			} else {
-				conn, err = (*x.proxyDialer).Dial(dialNet, target)
+				conn, err = (*proxyDialer).Dial(dialNet, target)
 			}
 			if err == nil {
 				setTCPOptions(conn)
@@ -1111,6 +1182,16 @@ func (x *XTransport) buildDialContext() func(context.Context, string, string) (n
 }
 
 func (x *XTransport) buildH3DialFunc() func(context.Context, string, *tls.Config, *quic.Config) (*quic.Conn, error) {
+	// Capture fields at build time so the closure never races with
+	// rebuildTransport on the dial hot-path.
+	useIPv4, useIPv6 := x.useIPv4, x.useIPv6
+	baseTLSCfg := x.tlsClientConfig
+
+	// Per-ServerName TLS config cache: avoids cloning the entire config on
+	// every QUIC dial. The cache is closure-local so it is automatically
+	// discarded when rebuildTransport calls buildH3DialFunc again.
+	var tlsConfigCache sync.Map // map[string]*tls.Config
+
 	return func(ctx context.Context, addrStr string, _ *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
 		dlog.Debugf("H3 dial: [%s]", addrStr)
 		host, port := ExtractHostAndPort(addrStr, stamps.DefaultPort)
@@ -1139,8 +1220,8 @@ func (x *XTransport) buildH3DialFunc() func(context.Context, string, *tls.Config
 				return udpTarget{formatDialTarget(parsed, portU16), nw}
 			}
 			nw := "udp4"
-			if x.useIPv6 {
-				if x.useIPv4 {
+			if useIPv6 {
+				if useIPv4 {
 					nw = "udp"
 				} else {
 					nw = "udp6"
@@ -1162,10 +1243,18 @@ func (x *XTransport) buildH3DialFunc() func(context.Context, string, *tls.Config
 			targets = append(targets, udpEndpoint(netip.Addr{}))
 		}
 
-		var lastErr error
-		tlsCfg := x.tlsClientConfig.Clone()
-		tlsCfg.ServerName = host
+		// Retrieve a cached TLS config for this ServerName; clone on first use.
+		var tlsCfg *tls.Config
+		if v, ok := tlsConfigCache.Load(host); ok {
+			tlsCfg = v.(*tls.Config)
+		} else {
+			cloned := baseTLSCfg.Clone()
+			cloned.ServerName = host
+			v, _ = tlsConfigCache.LoadOrStore(host, cloned)
+			tlsCfg = v.(*tls.Config)
+		}
 
+		var lastErr error
 		for i, t := range targets {
 			udpAddr, err := net.ResolveUDPAddr(t.network, t.addr)
 			if err != nil {
@@ -1370,23 +1459,21 @@ func (x *XTransport) resolveRRType(
 
 	minTTL = ttlSentinel
 	for _, answer := range in.Answer {
-		if dns.RRToType(answer) != rrType {
+		var ip net.IP
+		switch rr := answer.(type) {
+		case *dns.A:
+			if rrType == dns.TypeA {
+				ip = rr.A.Addr.AsSlice()
+			}
+		case *dns.AAAA:
+			if rrType == dns.TypeAAAA {
+				ip = rr.AAAA.Addr.AsSlice()
+			}
+		}
+		if ip == nil {
 			continue
 		}
-		switch rrType {
-		case dns.TypeA:
-			if a, ok := answer.(*dns.A); ok {
-				ips = append(ips, a.A.Addr.AsSlice())
-			} else {
-				continue
-			}
-		case dns.TypeAAAA:
-			if aaaa, ok := answer.(*dns.AAAA); ok {
-				ips = append(ips, aaaa.AAAA.Addr.AsSlice())
-			} else {
-				continue
-			}
-		}
+		ips = append(ips, ip)
 		if ttl := answer.Header().TTL; ttl < minTTL {
 			minTTL = ttl
 		}
@@ -1721,7 +1808,18 @@ func (x *XTransport) Fetch(
 		return nil, 0, nil, 0, errors.New("empty host in URL")
 	}
 
-	client := &x.httpClient
+	// Snapshot all rebuild-protected fields under a brief read lock so they
+	// remain consistent even if rebuildTransport runs concurrently.
+	x.rebuildMu.RLock()
+	localHTTPClient := x.httpClient
+	localH3Client := x.h3Client
+	h3Transport := x.h3Transport
+	localHeaders := x.headers
+	localTransport := x.transport
+	x.rebuildMu.RUnlock()
+
+	client := &localHTTPClient
+	usedH3 := false
 
 	host, port := ExtractHostAndPort(url.Host, 443)
 	if x.proxyDialer == nil && strings.HasSuffix(host, ".onion") {
@@ -1733,7 +1831,7 @@ func (x *XTransport) Fetch(
 	x.prewarmConnection(formatHostPort(host, port))
 
 	hasAltSupport := false
-	if x.h3Transport != nil {
+	if h3Transport != nil {
 		// Cache the backoff result to avoid calling isH3InBackoff twice for
 		// the same host within a single request.
 		h3InBackoff := x.isH3InBackoff(url.Host)
@@ -1741,11 +1839,12 @@ func (x *XTransport) Fetch(
 			// Respect H3 health backoff even in probe mode to avoid hammering
 			// a transiently broken QUIC endpoint.
 			if !h3InBackoff {
-				client = &x.h3Client
+				client = &localH3Client
+				usedH3 = true
 			}
 		} else {
 			x.altSupport.RLock()
-			entry, inCache := x.altSupport.cache[url.Host]
+			entry, inCache := x.altSupport.cache[altSvcKey(url.Host)]
 			x.altSupport.RUnlock()
 			if inCache {
 				hasAltSupport = true
@@ -1755,7 +1854,8 @@ func (x *XTransport) Fetch(
 				case entry.port > 0 && int(entry.port) == port && !h3InBackoff:
 					// Use H3 only when within its Alt-Svc advertisement AND not in
 					// a per-host backoff window caused by repeated H3 failures.
-					client = &x.h3Client
+					client = &localH3Client
+					usedH3 = true
 				case negativeExpired:
 					hasAltSupport = false
 				}
@@ -1767,13 +1867,13 @@ func (x *XTransport) Fetch(
 	var header http.Header
 	switch {
 	case method == http.MethodPost && contentType == "application/dns-message":
-		header = x.headers.postDNS
+		header = localHeaders.postDNS
 	case method == http.MethodPost && contentType == "application/oblivious-dns-message":
-		header = x.headers.postODNS
+		header = localHeaders.postODNS
 	case compress && body == nil:
-		header = x.headers.getGzip
+		header = localHeaders.getGzip
 	default:
-		header = x.headers.getPlain
+		header = localHeaders.getPlain
 	}
 
 	// If custom accept is different from what's pre-built, we need to clone
@@ -1844,10 +1944,9 @@ func (x *XTransport) Fetch(
 	resp, err := client.Do(req)
 	rtt := time.Since(start)
 
-	// Track whether the initial request used H3 so we can update its health state.
-	usedH3 := client == &x.h3Client
+	// usedH3 is already set explicitly above where we chose the H3 client.
 
-	if err != nil && client == &x.h3Client {
+	if err != nil && usedH3 {
 		// Close any non-nil H3 response body before resp is overwritten.
 		if resp != nil {
 			resp.Body.Close()
@@ -1859,13 +1958,13 @@ func (x *XTransport) Fetch(
 		x.recordH3Failure(url.Host)
 		negativeUntil := time.Now().Add(altSvcNegativeTTL)
 		x.altSupport.Lock()
-		x.altSupport.cache[url.Host] = altSvcEntry{port: 0, validTo: negativeUntil}
+		x.altSupport.cache[altSvcKey(url.Host)] = altSvcEntry{port: 0, validTo: negativeUntil}
 		x.altSupport.Unlock()
 
 		// Build a fresh *http.Request for the H2 retry: reusing the original req
 		// after Do() violates the net/http contract.
 		usedH3 = false // fallback occurred; H3 did not produce the response
-		client = &x.httpClient
+		client = &localHTTPClient
 		req, err = newRequest()
 		if err != nil {
 			return nil, 0, nil, 0, err
@@ -1910,13 +2009,13 @@ func (x *XTransport) Fetch(
 		}
 	} else {
 		dlog.Debugf("HTTP error [%s]: %v — closing idle connections", url.Host, err)
-		x.transport.CloseIdleConnections()
+		localTransport.CloseIdleConnections()
 	}
 	if err != nil {
 		dlog.Debugf("[%s]: %v", req.URL, err)
 		return nil, statusCode, nil, rtt, err
 	}
-	if x.h3Transport != nil && !hasAltSupport {
+	if h3Transport != nil && !hasAltSupport {
 		x.parseAndCacheAltSvc(url.Host, port, resp.Header)
 	}
 	tlsState := resp.TLS
@@ -1953,19 +2052,32 @@ func (x *XTransport) Fetch(
 	buf := (*bufp)[:0]
 	buf, err = appendFrom(buf, io.LimitReader(bodyReader, MaxHTTPBodyLength))
 	if err != nil {
-		*bufp = buf
-		httpResponseBufPool.Put(bufp)
+		// Only return the buffer to the pool if it hasn't grown excessively large
+		// (which would permanently inflate RSS via the pool).
+		if cap(buf) <= 64*1024 {
+			*bufp = buf[:0]
+			httpResponseBufPool.Put(bufp)
+		}
 		return nil, statusCode, tlsState, rtt, err
 	}
 	// Make an owned copy so the pooled buffer can be returned immediately.
 	bin := make([]byte, len(buf))
 	copy(bin, buf)
-	*bufp = buf
-	httpResponseBufPool.Put(bufp)
+	// Only return the buffer to the pool if its capacity is still reasonable.
+	// Buffers grown by rare large responses are dropped so they can be GC'd
+	// rather than permanently occupying pool slots and inflating RSS.
+	if cap(buf) <= 64*1024 {
+		*bufp = buf[:0]
+		httpResponseBufPool.Put(bufp)
+	}
 	return bin, statusCode, tlsState, rtt, nil
 }
 
-func (x *XTransport) parseAndCacheAltSvc(host string, port int, header http.Header) {
+func (x *XTransport) parseAndCacheAltSvc(urlHost string, port int, header http.Header) {
+	// Normalize to bare host so the cache key is consistent with reads in
+	// Fetch and prewarmConnection regardless of whether urlHost has a port.
+	host := altSvcKey(urlHost)
+
 	now := time.Now()
 	x.altSupport.RLock()
 	existing, inCache := x.altSupport.cache[host]
@@ -1987,11 +2099,13 @@ func (x *XTransport) parseAndCacheAltSvc(host string, port int, header http.Head
 outer:
 	for i, entry := range alt {
 		if i >= 8 {
+			dlog.Debugf("Alt-Svc: truncating after 8 header values for [%s]", host)
 			break
 		}
 		j := 0
 		for field := range strings.SplitSeq(entry, ";") {
 			if j >= 16 {
+				dlog.Debugf("Alt-Svc: truncating after 16 fields in entry %d for [%s]", i, host)
 				break
 			}
 			j++
