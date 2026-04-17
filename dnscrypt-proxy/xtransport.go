@@ -268,7 +268,7 @@ func trimStringCache(cache *sync.Map, sizeCounter *atomic.Int64, maxSize int64) 
 	})
 	// Correct for any shortfall (e.g. cache had fewer entries than evictGoal).
 	if delta := evictGoal - evicted; delta > 0 {
-		sizeCounter.Add(-delta)
+		sizeCounter.Add(delta)
 	}
 	if evicted > 0 {
 		cacheEvictions.Add(evicted)
