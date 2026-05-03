@@ -31,8 +31,8 @@ github.com/davecgh/go-spew/spew
 # github.com/dchest/safefile v0.0.0-20151022103144-855e8d98f185
 ## explicit
 github.com/dchest/safefile
-# github.com/fsnotify/fsnotify v1.9.0
-## explicit; go 1.17
+# github.com/fsnotify/fsnotify v1.10.0
+## explicit; go 1.23
 github.com/fsnotify/fsnotify
 github.com/fsnotify/fsnotify/internal
 # github.com/gorilla/websocket v1.5.3
