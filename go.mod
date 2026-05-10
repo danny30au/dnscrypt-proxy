@@ -3,7 +3,7 @@ module github.com/dnscrypt/dnscrypt-proxy
 go 1.26.2
 
 require (
-	codeberg.org/miekg/dns v0.6.73
+	codeberg.org/miekg/dns v0.6.75
 	github.com/BurntSushi/toml v1.6.0
 	github.com/VividCortex/ewma v1.2.0
 	github.com/coreos/go-systemd v0.0.0-20191104093116-d3cd4ed1dbcf
@@ -28,7 +28,7 @@ require (
 	golang.org/x/crypto v0.50.0
 	golang.org/x/net v0.53.0
 	golang.org/x/sync v0.20.0
-	golang.org/x/sys v0.43.0
+	golang.org/x/sys v0.44.0
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 )
 
