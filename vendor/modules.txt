@@ -1,4 +1,4 @@
-# codeberg.org/miekg/dns v0.6.73
+# codeberg.org/miekg/dns v0.6.75
 ## explicit; go 1.25.0
 codeberg.org/miekg/dns
 codeberg.org/miekg/dns/deleg
@@ -150,7 +150,7 @@ golang.org/x/net/proxy
 # golang.org/x/sync v0.20.0
 ## explicit; go 1.25.0
 golang.org/x/sync/errgroup
-# golang.org/x/sys v0.43.0
+# golang.org/x/sys v0.44.0
 ## explicit; go 1.25.0
 golang.org/x/sys/cpu
 golang.org/x/sys/unix
