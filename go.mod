@@ -1,6 +1,6 @@
 module github.com/dnscrypt/dnscrypt-proxy
 
-go 1.26.2
+go 1.26.3
 
 require (
 	codeberg.org/miekg/dns v0.6.75
