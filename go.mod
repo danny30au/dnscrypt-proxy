@@ -26,7 +26,7 @@ require (
 	github.com/powerman/check v1.9.1
 	github.com/quic-go/quic-go v0.60.0
 	golang.org/x/crypto v0.53.0
-	golang.org/x/net v0.55.0
+	golang.org/x/net v0.56.0
 	golang.org/x/sync v0.21.0
 	golang.org/x/sys v0.46.0
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
