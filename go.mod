@@ -21,14 +21,14 @@ require (
 	github.com/jedisct1/go-minisign v0.0.0-20241212093149-d2f9f49435c7
 	github.com/jedisct1/go-sieve-cache v0.1.9
 	github.com/k-sone/critbitgo v1.4.0
-	github.com/kardianos/service v1.2.4
+	github.com/kardianos/service v1.3.0
 	github.com/lifenjoiner/dhcpdns v0.0.7
 	github.com/powerman/check v1.9.1
 	github.com/quic-go/quic-go v0.60.0
 	golang.org/x/crypto v0.53.0
 	golang.org/x/net v0.56.0
-	golang.org/x/sync v0.21.0
-	golang.org/x/sys v0.46.0
+	golang.org/x/sync v0.22.0
+	golang.org/x/sys v0.47.0
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 )
 
