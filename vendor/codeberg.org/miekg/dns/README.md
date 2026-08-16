@@ -57,11 +57,12 @@ For developers please read the
 - Small API.
   - Package _dnsutil_ contains functions that help programmers, but are not necessarily in scope the _dns_ package.
   - Package _dnstest_ contains functions and types that help you test, similar to the _httptest_ package.
-  - Package _svcb_ holds all details of the SVCB/HTTPS record.
+  - Package _dnsjson_ contains types for DNS RRs in JSON (RFC 8427).
+  - Package _svcb_ holds all details of the SVCB/HTTPS record (RFC 9460).
   - Pacakge _deleg_ holds details for the DELEG record.
   - Many helper/debug functions are moved into _internal_ packages, making the top-level much, much cleaner.
 - Fast.
-  - recvmmsg(2) and TCP pipe=lining support.
+  - recvmmsg(2) and TCP pipe-lining support.
   - The `cmd/reflect` server does ~420K/340K qps UDP/TCP respectively on the right hardware.
     - Since a46996c I can get ~400K (UDP) qps on my laptop (M2/Asahi Linux), also see 1766e44, 86b53fe and 06e5e0f.
     - On my Dell XPS 17 (Intel) it is similar-ish (~310K/250K qps UDP/TCP).
@@ -207,6 +208,7 @@ _all of them_ and _then some_
 - 7871 - EDNS0 Client Subnet
 - 7873 - Domain Name System (DNS) Cookies
 - 8080 - EdDSA for DNSSEC
+- 8427 - Representing DNS Messages in JSON
 - 8482 - Minimal Answers for ANY
 - 8484 - DOH
 - 8499 - DNS Terminology
@@ -223,6 +225,6 @@ _all of them_ and _then some_
 - 9606 - DNS Resolver Information
 - 9660 - Zone version
 - 9715 - IP Fragmentation Avoidance in DNS over UDP
+- 9824 - Compact Denial of Existence in DNSSEC
 - 9859 - DSYNC RR
-- draft-ietf-compact-denial - CO bit
 - draft-ietf-deleg - DELEG RR

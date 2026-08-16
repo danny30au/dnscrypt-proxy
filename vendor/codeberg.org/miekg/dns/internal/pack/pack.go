@@ -165,6 +165,10 @@ func AAAA(aaaa netip.Addr, msg []byte, off int) (int, error) {
 	if off+net.IPv6len > len(msg) {
 		return len(msg), &Error{"overflow AAAA Addr"}
 	}
+	if !aaaa.Is6() {
+		return len(msg), &Error{"bad AAAA Addr"}
+	}
+
 	val := aaaa.As16()
 	_ = msg[off+net.IPv6len-1]
 	msg[off] = val[0]
