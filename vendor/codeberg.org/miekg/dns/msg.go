@@ -311,6 +311,7 @@ func (m *Msg) unpackQuestion(msg *cryptobyte.String, msgBuf []byte) (RR, error) 
 	if !msg.Empty() && !msg.ReadUint16(&qclass) {
 		return nil, unpack.Errorf("overflow %s", "Question class")
 	}
+	m.qclass = qclass
 
 	var rr RR
 	if newFn, ok := TypeToRR[qtype]; ok {
@@ -356,7 +357,8 @@ func unpackRRs(cnt uint16, msg *cryptobyte.String, msgBuf []byte) ([]RR, error) 
 	return dst, nil
 }
 
-// Unpack unpacks a binary message that sits in m.Data to a Msg structure.
+// Unpack unpacks a binary message that sits in m.Data to a Msg structure. Multiple OPT, TSIG or SIG RRs in
+// the Additional (Extra) section return an error.
 func (m *Msg) Unpack() (err error) {
 	s := cryptobyte.String(m.Data)
 	var counts uint64 // read all counters into 64 bits and slice the 16 bits values out of it
@@ -381,7 +383,7 @@ func (m *Msg) Unpack() (err error) {
 
 	if m.offset > MsgHeaderSize {
 		if !s.Skip(int(m.offset - MsgHeaderSize)) {
-			return fmt.Errorf("overflow %s", "MsgHeader")
+			return unpack.Errorf("overflow %s", "MsgHeader")
 		}
 		goto Rest
 	}
@@ -412,11 +414,16 @@ Rest:
 	}
 
 	// Check for the OPT RR and remove it entirely, unpack the OPT for option codes and put those in the Pseudo
-	// section. We will only check one OPT, any others will be left in Extra.
-Extra1:
+	// section. The last OPT RR will be used, multiple OPT RRs triggers an error. Multiple TISG/SIGs also
+	// create an error.
+	var op, ts, si uint16 = 0, 0, 0
+	m.Pseudo = make([]RR, 0, 3)
 	for i := len(m.Extra) - 1; i >= 0; i-- {
 		switch opt := m.Extra[i].(type) {
 		case *OPT:
+			if op > 0 {
+				return unpack.Errorf("multiple OPT in Extra")
+			}
 			m.Security = opt.Security()
 			m.CompactAnswers = opt.CompactAnswers()
 			m.Delegation = opt.Delegation()
@@ -425,23 +432,31 @@ Extra1:
 			// RFC 6891 mandates that the payload size in an OPT record less than 512 (MinMsgSize) bytes must be treated as equal to 512 bytes.
 			m.UDPSize = max(opt.UDPSize(), MinMsgSize)
 
-			m.Pseudo = make([]RR, len(opt.Options), len(opt.Options)+1) // +1 for tsig/sig zero, avoid 2x in a append
 			for j := range opt.Options {
-				m.Pseudo[j] = RR(opt.Options[j])
+				m.Pseudo = append(m.Pseudo, RR(opt.Options[j]))
 			}
+
 			m.Extra[i] = m.Extra[len(m.Extra)-1] // opt's place switch with last rr
 			m.Extra = m.Extra[:len(m.Extra)-1]   // remove cruft
-			break Extra1
-		}
-	}
-Extra2:
-	for i := len(m.Extra) - 1; i >= 0; i-- {
-		switch m.Extra[i].(type) {
-		case *TSIG, *SIG:
+			op++
+		case *TSIG:
+			if ts > 0 {
+				return unpack.Errorf("multiple TSIG in Extra")
+			}
 			m.Pseudo = append(m.Pseudo, m.Extra[i])
-			m.Extra[i] = m.Extra[len(m.Extra)-1] // sig/tsig's place switch with last rr
-			m.Extra = m.Extra[:len(m.Extra)-1]   // remove cruft
-			break Extra2
+
+			m.Extra[i] = m.Extra[len(m.Extra)-1]
+			m.Extra = m.Extra[:len(m.Extra)-1]
+			ts++
+		case *SIG:
+			if si > 0 {
+				return unpack.Errorf("multiple SIG in Extra")
+			}
+			m.Pseudo = append(m.Pseudo, m.Extra[i])
+
+			m.Extra[i] = m.Extra[len(m.Extra)-1]
+			m.Extra = m.Extra[:len(m.Extra)-1]
+			si++
 		}
 	}
 
@@ -453,8 +468,7 @@ Extra2:
 
 // Convert a complete message to a string with dig-like output. String also looks at the [Msg.Options] and
 // only prints up to that point, i.e. options set to [MsgOptionUnpackHeader] means String will only return the
-// header. The string format isn't fixed and can change in future released, [dnsutil.StringToMsg] is
-// guaranteed to work.
+// header. The string format isn't fixed and can change in future releases.
 func (m *Msg) String() string {
 	if m == nil {
 		return "<nil> Msg"
@@ -704,18 +718,12 @@ func (m *Msg) WriteTo(w io.Writer) (int64, error) {
 		if sess != nil {
 			oob := sourceFromOOB(sess.OOB)
 			n, _, err := sock.WriteMsgUDP(m.Data, oob, sess.Addr)
-			if m.msgPool != nil && !m.hijacked.Load() {
-				m.msgPool.Put(m.Data)
-				m.Data, m.msgPool = nil, nil
-			}
+			msgPut(m)
 			return int64(n), err
 		}
 
 		n, err := r.Conn().Write(m.Data)
-		if m.msgPool != nil && !m.hijacked.Load() {
-			m.msgPool.Put(m.Data)
-			m.Data, m.msgPool = nil, nil
-		}
+		msgPut(m)
 		return int64(n), err
 	}
 
@@ -723,11 +731,20 @@ func (m *Msg) WriteTo(w io.Writer) (int64, error) {
 	binary.BigEndian.PutUint16(l, uint16(len(m.Data)))
 	l = append(l, m.Data...)
 	n, err := r.Write(l)
-	if m.msgPool != nil && !m.hijacked.Load() {
-		m.msgPool.Put(m.Data)
-		m.Data, m.msgPool = nil, nil
-	}
+	msgPut(m)
 	return int64(n), err
+}
+
+// msgPut puts the message's buffer back in the pool, if desired.
+func msgPut(m *Msg) {
+	if m.msgPool == nil {
+		return
+	}
+	if m.hijacked.Load() {
+		return
+	}
+	m.msgPool.Put(m.Data)
+	m.Data, m.msgPool = nil, nil
 }
 
 // ReadFrom reads from r. When r is a *net.TCPConn, first 2 bytes of length are read, then m.Data is *resized*
@@ -742,16 +759,13 @@ func (m *Msg) ReadFrom(r io.Reader) (int64, error) {
 
 	if sock, ok := r.(*net.UDPConn); ok {
 		n, err := sock.Read(m.Data)
-		if err != nil {
-			return 0, err
-		}
 		m.Data = m.Data[:n]
-		return int64(n), nil
+		return int64(n), err
 	}
 
 	// When doing io.Copy that underlaying type we get from net is net.tcpConnWithoutWriteTo, not a
 	// net.TCPConn.For udp this seems not to be the case, so the fallthrough when things are not UDP like
-	// is too assume TCP.
+	// is to assume TCP.
 
 	l := uint16(0)
 	if err := binary.Read(r, binary.BigEndian, &l); err != nil {
@@ -760,7 +774,7 @@ func (m *Msg) ReadFrom(r io.Reader) (int64, error) {
 	li := int(l)
 	if li < MsgHeaderSize {
 		io.Copy(io.Discard, io.LimitReader(r, int64(li))) // discard the remaining octets
-		return 0, fmt.Errorf("dns: message size %d, can not be smaller than %d", li, MsgHeaderSize)
+		return int64(li), fmt.Errorf("dns: message size %d, can not be smaller than %d", li, MsgHeaderSize)
 	}
 
 	if len(m.Data) < li {
@@ -769,10 +783,10 @@ func (m *Msg) ReadFrom(r io.Reader) (int64, error) {
 		m.Data = m.Data[:li]
 	}
 	n, err := io.ReadFull(r, m.Data)
-	if err == nil && n != li {
-		return 0, fmt.Errorf("dns: message size %d does not match prefix %d", li, n)
-	}
 	m.Data = m.Data[:n]
+	if err == nil && n != li {
+		return int64(n), fmt.Errorf("dns: message size %d does not match prefix %d", li, n)
+	}
 	return int64(n), err
 }
 
@@ -810,8 +824,8 @@ func (m *Msg) RRs() iter.Seq[RR] {
 
 // Copy returns a shallow copy of the message, specifically the RR contained in the message are copied by
 // reference, not via a deep copy. If m was hijacked via [Msg.Hijack] the returned Msg will not be hijacked.
-// The msgPool of m will be copied, meaning the new message when traversing a default [dns.ResponseWriter]
-// will have it's buffer returned to the servers msg pool.
+// The msgPool of m will not be copied, meaning the new message's buffer will not be returned to the pool, but
+// be garbage collected.
 func (m *Msg) Copy() *Msg {
 	return &Msg{
 		MsgHeader: m.MsgHeader,
@@ -821,13 +835,12 @@ func (m *Msg) Copy() *Msg {
 		Extra:     m.Extra,
 		Pseudo:    m.Pseudo,
 		Data:      m.Data,
-		msgPool:   m.msgPool,
 	}
 }
 
 // NewMsg returns a new message with the question section sets to z (z is made fully qualified) and the type t. If the type isn't know nil
-// is returned, the recursion desired bit is set.
-func NewMsg(z string, t uint16) *Msg {
+// is returned, the recursion desired bit is set. If c is given it is used as the class.
+func NewMsg(z string, t uint16, c ...uint16) *Msg {
 	var rr RR
 	newFn, ok := TypeToRR[t]
 	if !ok {
@@ -839,6 +852,9 @@ func NewMsg(z string, t uint16) *Msg {
 	rr = newFn()
 	rr.Header().Name = dnsutilFqdn(z)
 	rr.Header().Class = ClassINET
+	if len(c) > 0 {
+		rr.Header().Class = c[0]
+	}
 	m.Question = []RR{rr}
 	return m
 }

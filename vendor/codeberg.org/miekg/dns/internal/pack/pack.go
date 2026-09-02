@@ -165,6 +165,10 @@ func AAAA(aaaa netip.Addr, msg []byte, off int) (int, error) {
 	if off+net.IPv6len > len(msg) {
 		return len(msg), &Error{"overflow AAAA Addr"}
 	}
+	if !aaaa.Is6() {
+		return len(msg), &Error{"bad AAAA Addr"}
+	}
+
 	val := aaaa.As16()
 	_ = msg[off+net.IPv6len-1]
 	msg[off] = val[0]
@@ -253,7 +257,8 @@ func Name(s string, msg []byte, off int, compression map[string]uint16, compress
 	return off + 1, nil
 }
 
-// MName packs the string s into msg taking escaped dots into account.
+// MName packs the string s into msg taking escaped dots into account. Only xxx\.yyy is allowed, \. can never
+// be at the start of the string.
 func MName(s string, msg []byte, off int) (off1 int, err error) {
 	lenmsg := len(msg)
 	ls := len(s)
@@ -263,6 +268,9 @@ func MName(s string, msg []byte, off int) (off1 int, err error) {
 		return off + 1, nil
 	}
 	if ls > 1 && s[0] == '.' { // leading dots are not legal except for the root zone
+		return len(msg), &Error{"leading dot in mname"}
+	}
+	if ls > 2 && s[0] == '\\' && s[1] == '.' { // disallow \. too
 		return len(msg), &Error{"leading dot in mname"}
 	}
 	if ls > 0 && s[ls-1] != '.' {
