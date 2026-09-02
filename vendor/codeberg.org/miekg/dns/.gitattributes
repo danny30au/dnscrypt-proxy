@@ -4,3 +4,4 @@ cmd/atomdns/man/*.5 linguist-generated=true
 z*.go linguist-generated=true
 **/z*.go linguist-generated=true
 zednspack.go !linguist-generated
+cmd/atomdns/internal/conffile/zoneclass.go !linguist-generated
