@@ -180,7 +180,8 @@ type MsgHeader struct {
 
 	// optimization to put the qtype directly in the message, shortcuts needing to actually have a question
 	// section (this will then be zero) and avoid RRToType which is slightly slower in the hot path.
-	qtype uint16
+	qtype  uint16
+	qclass uint16
 	// Option is a bit mask of options that control the unpacking. When zero the entire message is unpacked.
 	Options MsgOption
 
@@ -206,7 +207,7 @@ type MsgHeader struct {
 
 	// Extended DNS
 	Security       bool // Security is the DNSSEC OK bit, see RFC 403{3,4,5}.
-	CompactAnswers bool // Compact Answers OK, https://datatracker.ietf.org/doc/draft-ietf-dnsop-compact-denial-of-existence/.
+	CompactAnswers bool // Compact Answers OK, see RFC 9824.
 	Delegation     bool // Delegation is the DELEG OK bit, see https://datatracker.ietf.org/doc/draft-ietf-deleg/.
 
 }
@@ -325,11 +326,10 @@ func (rr *RFC3597) ToRFC3597(r RR) error {
 		return err
 	}
 	buf = buf[:off]
-
 	*rr = RFC3597{Hdr: *r.Header()}
-	rr.RRType = uint16(off - headerEnd)
+	rr.RRType = RRToType(r)
 
-	if rr.RRType == 0 {
+	if off-headerEnd == 0 { // rdlength
 		return nil
 	}
 

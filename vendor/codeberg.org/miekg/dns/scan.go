@@ -101,6 +101,9 @@ type ttlState struct {
 //
 //	mx := dnstest.New("miek.nl.  IN MX 10 mx.miek.nl.")
 func New(s string) (RR, error) {
+	if s == "" {
+		return nil, &Error{err: "bad RR"}
+	}
 	return read(dnsstring.NewReader(s), "")
 }
 
