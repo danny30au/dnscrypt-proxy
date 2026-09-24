@@ -3,6 +3,7 @@ package dns
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -14,7 +15,7 @@ import (
 // Default maximum number of TCP queries before we close the socket.
 const MaxTCPQueries = 1024
 
-// ListenAndServe Starts a server on address and network specified and invokes handler for incoming queries.
+// ListenAndServe starts a server on address and network specified and invokes handler for incoming queries.
 func ListenAndServe(addr, network string, handler Handler) error {
 	server := NewServer()
 	server.Addr = addr
@@ -29,21 +30,25 @@ type MsgAcceptAction int
 // Allowed returned values from a MsgAcceptFunc.
 const (
 	MsgAccept               MsgAcceptAction = iota // Accept the message.
-	MsgReject                                      // Reject the message with a RcodeFormatError.
-	MsgRejectNotImplemented                        // Reject the message with a RcodeNotImplemented.
+	MsgReject                                      // Reject the message with a [RcodeFormatError].
+	MsgRejectNotImplemented                        // Reject the message with a [RcodeNotImplemented].
+	MsgRejectRefused                               // Reject the message with a [RcodeRefused].
 	MsgIgnore                                      // Ignore the message and send nothing back.
 )
 
-// MsgAcceptFunc is used early in the server code to accept or reject a message with RcodeFormatError.
+// MsgAcceptFunc is used early in the server code to accept or reject a message with RcodeFormatError or
+// other response code.
 // It returns a MsgAcceptAction to indicate what should happen with the message. Only the header of the
-// message is unpacked when this function is called.
+// message is unpacked when this function is called. Note that this function must at least check if there
+// is a single question in the question section of the message.
 type MsgAcceptFunc func(m *Msg) MsgAcceptAction
 
 // DefaultMsgAcceptFunc checks the request and will reject if:
 //
 //   - Isn't a request, returns [MsgIgnore].
 //   - Has an opcode that isn't recognized, returns [MsgIgnore].
-//   - Has more than a single "RR" in the question section, return [MsgReject].
+//   - Has more than a single "RR" in the question section, returns [MsgReject].
+//   - Is a query for RRSIGs, returns [MsgRejectRefused].
 func DefaultMsgAcceptFunc(m *Msg) MsgAcceptAction {
 	// see dnshttp.DefaultMsgAcceptFunc where this code is duplicated.
 	if m.Response {
@@ -55,12 +60,15 @@ func DefaultMsgAcceptFunc(m *Msg) MsgAcceptAction {
 	if len(m.Question) != 1 {
 		return MsgReject
 	}
+	if _, ok := m.Question[0].(*RRSIG); ok {
+		return MsgRejectRefused
+	}
 	return MsgAccept
 }
 
 // InvalidMsgFunc is a listener hook for observing incoming messages that were discarded
 // because they could not be parsed or an earlier error in the server.
-// Every message that is read by a Reader will eventually be provided to the Handler, or passed to this function.
+// Every message that is read by a Reader will eventually be provided to the [Handler], or passed to this function.
 type InvalidMsgFunc func(m *Msg, err error)
 
 // DefaultMsgInvalidFunc is the default function used in case no InvalidMsgFunc is set. It is defined to be a noop.
@@ -87,7 +95,8 @@ type Server struct {
 	PacketConn net.PacketConn
 	// Handler to invoke, dns.DefaultServeMux if nil.
 	Handler Handler
-	// Default buffer size to use to read incoming UDP messages. If not set it defaults to MinMsgSize (512 B).
+	// Default buffer size to use to read incoming UDP messages. If not set it defaults to DefaultMsgSize
+	// (1400 B).
 	UDPSize int
 	// The read timeout vaule for new connections, defaults to 2 * time.Second.
 	ReadTimeout time.Duration
@@ -98,7 +107,8 @@ type Server struct {
 	MaxTCPQueries int
 
 	// AcceptMsgFunc will check the incoming message and will reject it early in the process. Defaults to
-	// [DefaultMsgAcceptFunc].
+	// [DefaultMsgAcceptFunc]. If you use a custom MsgAcceptFunc it should at minimum check if there a single
+	// question in the question section.
 	MsgAcceptFunc MsgAcceptFunc
 	// MsgInvalidFunc is optional, it will be called if a message is received but cannot be parsed.
 	MsgInvalidFunc InvalidMsgFunc
@@ -109,7 +119,8 @@ type Server struct {
 	// this function to return before stopping the server.
 	NotifyShutdownFunc func(context.Context)
 
-	// MsgPool is the default [Pooler] used for allocation.
+	// MsgPool is the default [Pooler] used for allocations. When creating a non-default pool it must be at
+	// least as large as the configured UDPSize.
 	MsgPool pool.Pooler
 
 	ctx      context.Context // server wide context to signal shutdown to running handlers
@@ -137,7 +148,7 @@ func NewServer() *Server {
 
 func (srv *Server) init() {
 	if srv.UDPSize == 0 {
-		srv.UDPSize = MinMsgSize
+		srv.UDPSize = DefaultMsgSize
 	}
 	if srv.MsgInvalidFunc == nil {
 		srv.MsgInvalidFunc = DefaultMsgInvalidFunc
@@ -172,6 +183,13 @@ func (srv *Server) ListenAndServe() error {
 	}
 	srv.init()
 
+	buf := srv.MsgPool.Get()
+	if len(buf) < srv.UDPSize {
+		srv.once.Do(func() { close(srv.exited) })
+		return &Error{err: fmt.Sprintf("MsgPool size (%d) should be larger or equal to UDPSize (%d)", len(buf), srv.UDPSize)}
+	}
+	srv.MsgPool.Put(buf)
+
 	if srv.Listener != nil {
 		srv.listenTCP(srv.Listener)
 		return nil
@@ -185,6 +203,7 @@ func (srv *Server) ListenAndServe() error {
 	case "tcp", "tcp4", "tcp6":
 		l, err := listenTCP(srv.Net, addr, srv.ReusePort, srv.ReuseAddr)
 		if err != nil {
+			srv.once.Do(func() { close(srv.exited) })
 			return err
 		}
 		if srv.TLSConfig != nil {
@@ -194,11 +213,12 @@ func (srv *Server) ListenAndServe() error {
 		if srv.ListenFunc != nil {
 			srv.ListenFunc(srv)
 		}
-		srv.listenTCP(l)
+		srv.listenTCP(srv.Listener)
 		return nil
 	case "udp", "udp4", "udp6":
 		l, err := listenUDP(srv.Net, addr, srv.ReusePort, srv.ReuseAddr)
 		if err != nil {
+			srv.once.Do(func() { close(srv.exited) })
 			return err
 		}
 		u := l.(*net.UDPConn)
@@ -210,7 +230,7 @@ func (srv *Server) ListenAndServe() error {
 		if srv.ListenFunc != nil {
 			srv.ListenFunc(srv)
 		}
-		srv.listenUDP(u)
+		srv.listenUDP(srv.PacketConn)
 		return nil
 	}
 	return &Error{err: "bad network"}
@@ -307,6 +327,7 @@ func (srv *Server) serveTCP(wg *sync.WaitGroup, conn net.Conn) {
 		readtimeout = srv.IdleTimeout
 	}
 
+	hijacked = hijacked || w.hijacked.Load()
 	if !hijacked {
 		w.Close()
 	}
@@ -319,23 +340,31 @@ func (srv *Server) serveDNS(w *response, r *Msg) {
 
 	if err := r.Unpack(); err != nil {
 		srv.MsgInvalidFunc(r, err)
+		msgPut(r)
 		return
 	}
 
 	switch action := srv.MsgAcceptFunc(r); action {
 	case MsgIgnore:
+		msgPut(r)
 		return
 
-	case MsgReject, MsgRejectNotImplemented:
+	case MsgReject, MsgRejectNotImplemented, MsgRejectRefused:
 		r.Rcode = RcodeFormatError
 		if action == MsgRejectNotImplemented {
 			r.Rcode = RcodeNotImplemented
+		}
+		if action == MsgRejectRefused {
+			r.Rcode = RcodeRefused
 		}
 		r.Authoritative = false
 		r.Response = true
 		r.Zero = false
 		r.Reset()
-		r.Pack()
+		if err := r.Pack(); err != nil { // the message is such garbage that we should not reply
+			msgPut(r)
+			return
+		}
 
 		io.Copy(w, r)
 		return
