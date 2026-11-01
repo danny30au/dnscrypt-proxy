@@ -5,15 +5,15 @@ import (
 
 	"codeberg.org/miekg/dns/internal/pack"
 	"codeberg.org/miekg/dns/internal/unpack"
-	"golang.org/x/crypto/cryptobyte"
+	"codeberg.org/miekg/dns/pkg/dnsnet"
 )
 
-func Unpack(s *cryptobyte.String) ([]Pair, error) {
+func Unpack(s *dnsnet.String) ([]Pair, error) {
 	var pairs []Pair
 	key := uint16(0)
 	for !s.Empty() {
-		var data cryptobyte.String
-		if !s.ReadUint16(&key) || !s.ReadUint16LengthPrefixed(&data) {
+		var data dnsnet.String
+		if !s.ReadUint16(&key) || !s.ReadUint16LengthPrefixed(&data.String) {
 			return nil, unpack.ErrOverflow
 		}
 		pairFn := KeyToPair(key)
@@ -21,9 +21,11 @@ func Unpack(s *cryptobyte.String) ([]Pair, error) {
 			return nil, unpack.Errorf("bad SVCB key")
 		}
 		pair := pairFn()
-
 		if err := _unpack(pair, &data); err != nil {
 			return nil, err
+		}
+		if !data.Empty() {
+			return nil, unpack.ErrTrailingData
 		}
 		pairs = append(pairs, pair)
 	}

@@ -8,7 +8,7 @@ import (
 	"strconv"
 
 	"codeberg.org/miekg/dns/internal/reverse"
-	"golang.org/x/crypto/cryptobyte"
+	"codeberg.org/miekg/dns/pkg/dnsnet"
 )
 
 // ENDS0 option codes. See https://www.iana.org/assignments/dns-parameters#dns-parameters-11.
@@ -186,7 +186,12 @@ type EXPIRE struct {
 	Expire uint32
 }
 
-func (o *EXPIRE) Len() int    { return tlv + 4 }
+func (o *EXPIRE) Len() int {
+	if o.Expire == 0 {
+		return tlv
+	}
+	return tlv + 4
+}
 func (o *EXPIRE) Data() RDATA { return o }
 func (o *EXPIRE) String() string {
 	sb := sprintOptionHeader(o)
@@ -391,6 +396,8 @@ func (o *ESU) String() string {
 //
 // Or if you know your binary: &ZONEVERSION{Labels: 8, Type: 0, Version: {1,2,3,4}}
 //
+// A client signals interest by sending an empty ZONEVERSION in a request (RFC 9660 Section 3.1).
+//
 // This record must be put in the pseudo section.
 type ZONEVERSION struct {
 	Labels  uint8
@@ -398,12 +405,24 @@ type ZONEVERSION struct {
 	Version []byte
 }
 
-func (o *ZONEVERSION) Len() int    { return tlv + 2 + len(o.Version) }
+func (o *ZONEVERSION) Len() int {
+	if o.empty() {
+		return tlv
+	}
+	return tlv + 2 + len(o.Version)
+}
+
 func (o *ZONEVERSION) Data() RDATA { return o }
 
 // Strings outputs "ZONEVERSION 4 SOA-SERIAL 1002" as the presentation format.
 func (o *ZONEVERSION) String() string {
 	sb := sprintOptionHeader(o)
+	if o.empty() {
+		s := sb.String()
+		builderPool.Put(*sb)
+		return s
+	}
+
 	sb.WriteString(strconv.Itoa(int(o.Labels)))
 	sb.WriteByte(' ')
 	switch o.Type {
@@ -426,6 +445,9 @@ func (o *ZONEVERSION) String() string {
 	return s
 }
 
+// empty() returns true if ZONEVERSION is the empty one clients use to signal interest.
+func (o *ZONEVERSION) empty() bool { return o.Labels == 0 && o.Type == 0 && len(o.Version) == 0 }
+
 // MQQUERY implements the EDNS0 MQTYPE-Query option (RFC 10029).
 //
 // This record must be put in the pseudo section.
@@ -446,7 +468,7 @@ func (o *MQQUERY) String() string {
 		sb.WriteString(typeToString(o.Types[0]))
 		return sb.String()
 	default:
-		typeToString(o.Types[0])
+		sb.WriteString(typeToString(o.Types[0]))
 	}
 	for _, t := range o.Types[1:] {
 		sb.WriteByte(' ')
@@ -601,7 +623,7 @@ var ExtendedErrorToString = map[uint16]string{
 // StringToExtendedError is a map from human readable descriptions to extended error info codes.
 var StringToExtendedError = reverse.Map(ExtendedErrorToString)
 
-func unpackOptionCode(option EDNS0, s *cryptobyte.String) error {
+func unpackOptionCode(option EDNS0, s *dnsnet.String) error {
 	switch x := option.(type) {
 	case *LLQ:
 		return x.unpack(s)
@@ -643,7 +665,7 @@ func unpackOptionCode(option EDNS0, s *cryptobyte.String) error {
 		return x.unpack(s)
 	}
 	if x, ok := option.(Packer); ok {
-		msg := []byte(*s)
+		msg := []byte(s.String)
 		return x.Unpack(msg)
 	}
 	return fmt.Errorf("dns: no option unpack defined")
