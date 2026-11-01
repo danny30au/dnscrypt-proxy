@@ -98,9 +98,10 @@ type Server struct {
 	// Default buffer size to use to read incoming UDP messages. If not set it defaults to DefaultMsgSize
 	// (1400 B).
 	UDPSize int
-	// The read timeout vaule for new connections, defaults to 2 * time.Second.
+	// The read timeout vaule for reading of a connection, defaults to 500 * [time.Millisecond].
 	ReadTimeout time.Duration
-	// TCP idle timeout for multiple queries, if nil, defaults to 8 * time.Second (RFC 5966).
+	// TCP idle timeout for multiple queries, if nil, defaults to 3 * [time.Second] (RFC 5966 recommends in
+	// the "order of seconds").
 	IdleTimeout time.Duration
 	// Maximum number of TCP queries before we close the socket. Default is [MaxTCPQueries], unlimited if -1.
 	// See [ResponseWriter.Hijack] on how a handler can bypass this.
@@ -127,8 +128,6 @@ type Server struct {
 	cancel   context.CancelFunc
 	exited   chan struct{}
 	shutdown chan bool
-
-	once sync.Once
 
 	// Whether to set the SO_REUSEPORT socket option, allowing multiple listeners to be bound to a single address.
 	// It is only supported on certain GOOSes and when using ListenAndServe.
@@ -160,10 +159,10 @@ func (srv *Server) init() {
 		srv.Handler = DefaultServeMux
 	}
 	if srv.ReadTimeout == 0 {
-		srv.ReadTimeout = 2 * time.Second
+		srv.ReadTimeout = 500 * time.Millisecond
 	}
 	if srv.IdleTimeout == 0 {
-		srv.IdleTimeout = 8 * time.Second
+		srv.IdleTimeout = 3 * time.Second
 	}
 	if srv.MsgPool == nil {
 		srv.MsgPool = pool.New(srv.UDPSize)
@@ -176,17 +175,23 @@ func (srv *Server) init() {
 
 // ListenAndServe starts a nameserver on the configured address in *Server. If TLS config is available a TLS
 // listener will be started.
-func (srv *Server) ListenAndServe() error {
+func (srv *Server) ListenAndServe() (err error) {
 	addr := srv.Addr
 	if addr == "" {
 		addr = ":domain"
 	}
 	srv.init()
 
+	defer func() {
+		if err != nil {
+			close(srv.exited)
+		}
+	}()
+
 	buf := srv.MsgPool.Get()
 	if len(buf) < srv.UDPSize {
-		srv.once.Do(func() { close(srv.exited) })
-		return &Error{err: fmt.Sprintf("MsgPool size (%d) should be larger or equal to UDPSize (%d)", len(buf), srv.UDPSize)}
+		err = &Error{err: fmt.Sprintf("MsgPool size (%d) should be larger or equal to UDPSize (%d)", len(buf), srv.UDPSize)}
+		return err
 	}
 	srv.MsgPool.Put(buf)
 
@@ -201,9 +206,8 @@ func (srv *Server) ListenAndServe() error {
 
 	switch srv.Net {
 	case "tcp", "tcp4", "tcp6":
-		l, err := listenTCP(srv.Net, addr, srv.ReusePort, srv.ReuseAddr)
-		if err != nil {
-			srv.once.Do(func() { close(srv.exited) })
+		var l net.Listener
+		if l, err = listenTCP(srv.Net, addr, srv.ReusePort, srv.ReuseAddr); err != nil {
 			return err
 		}
 		if srv.TLSConfig != nil {
@@ -216,13 +220,12 @@ func (srv *Server) ListenAndServe() error {
 		srv.listenTCP(srv.Listener)
 		return nil
 	case "udp", "udp4", "udp6":
-		l, err := listenUDP(srv.Net, addr, srv.ReusePort, srv.ReuseAddr)
-		if err != nil {
-			srv.once.Do(func() { close(srv.exited) })
+		var l net.PacketConn
+		if l, err = listenUDP(srv.Net, addr, srv.ReusePort, srv.ReuseAddr); err != nil {
 			return err
 		}
 		u := l.(*net.UDPConn)
-		if err := setUDPSocketOptions(u); err != nil {
+		if err = setUDPSocketOptions(u); err != nil {
 			u.Close()
 			return err
 		}
@@ -233,7 +236,8 @@ func (srv *Server) ListenAndServe() error {
 		srv.listenUDP(srv.PacketConn)
 		return nil
 	}
-	return &Error{err: "bad network"}
+	err = &Error{err: "bad network"}
+	return err
 }
 
 // Shutdown shuts down a server. After a call to Shutdown, ListenAndServe will return.
@@ -273,7 +277,7 @@ func (srv *Server) listenTCP(ln net.Listener) {
 		case <-srv.shutdown:
 			ln.Close()
 			wg.Wait() // this has a data race because we slump &wg in the server... this _only_ this on shutdown though...
-			srv.once.Do(func() { close(srv.exited) })
+			close(srv.exited)
 			return
 		}
 	}
@@ -304,16 +308,11 @@ func (srv *Server) serveTCP(wg *sync.WaitGroup, conn net.Conn) {
 
 		r := &Msg{Data: srv.MsgPool.Get()}
 		if _, err := r.ReadFrom(conn); err != nil {
-			if isEOFOrClosedNetwork(err) {
-				srv.MsgPool.Put(r.Data)
-				break
-			}
-			srv.MsgInvalidFunc(r, err)
 			srv.MsgPool.Put(r.Data)
-			continue
+			break
 		}
 
-		wg.Add(1)
+		wg.Add(1) // no wg.Go to prevent defer usage
 		go func() {
 			srv.serveDNS(w, r)
 			wg.Done()

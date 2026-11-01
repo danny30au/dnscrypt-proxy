@@ -12,8 +12,9 @@ import (
 
 	"codeberg.org/miekg/dns/internal/pack"
 	"codeberg.org/miekg/dns/internal/unpack"
+	"codeberg.org/miekg/dns/pkg/dnsnet"
+	"codeberg.org/miekg/dns/pkg/pool"
 	"codeberg.org/miekg/dns/rdata"
-	"golang.org/x/crypto/cryptobyte"
 )
 
 // ID by default returns a 16-bit random number to be used as a message id. The
@@ -118,23 +119,20 @@ func packRR(rr RR, msg []byte, off int, compression map[string]uint16) (headerEn
 	return headerEnd, len(msg), pack.Errorf("inconsistent rdata length")
 }
 
-func unpackRR(msg *cryptobyte.String, msgBuf []byte) (RR, error) {
+func unpackRR(msg *dnsnet.String, msgBuf []byte) (RR, error) {
 	h := &Header{}
 	typ, rdlength, err := unpackHeader(h, msg, msgBuf)
 	if err != nil {
 		return nil, err
 	}
 
-	// Directly use the existing buffer by slicing the cryptobyte.String
-	// 1. Verify sufficient bytes remain
-	if len(*msg) < int(rdlength) {
+	if len(msg.String) < int(rdlength) {
 		return nil, unpack.ErrTruncatedMessage
 	}
-
-	// was: msg.ReadBytes(&data, int(rdlength)), but we want to save the buffer we allocated for that.
-	data := (*msg)[:rdlength]
-	*msg = (*msg)[rdlength:]
-	msgBuf = msgBuf[:unpack.Offset(*msg, msgBuf)]
+	// Narrow msg to the rdata while it is unpacked.
+	rest := msg.String[rdlength:]
+	msg.String = msg.String[:rdlength]
+	msgBuf = msgBuf[:unpack.Offset(rest, msgBuf)]
 
 	var rr RR
 	if newFn, ok := TypeToRR[typ]; ok {
@@ -144,15 +142,11 @@ func unpackRR(msg *cryptobyte.String, msgBuf []byte) (RR, error) {
 		rr = &RFC3597{Hdr: *h, RRType: typ}
 	}
 
-	if rdlength == 0 {
-		return rr, nil
+	if rdlength > 0 {
+		err = zunpack(rr, msg, msgBuf)
 	}
-
-	if err := zunpack(rr, cryptobyte.String(data), msgBuf); err != nil {
-		return rr, err
-	}
-
-	return rr, nil
+	msg.String = rest
+	return rr, err
 }
 
 // Reset resets the message's answer, ns, extra and pseudo sections to a zero length slice, thereby emptying
@@ -216,30 +210,30 @@ func (m *Msg) Pack() error {
 		return pack.Errorf(": %s", "MsgHeader")
 	}
 
-	// Is this compressible?
-	var compression map[string]uint16
-	if l := len(m.Answer) + len(m.Ns) + len(m.Extra); l > 0 {
-		compression = make(map[string]uint16, l+3) // 3 is randomly chosen, as that much rdata might be compressable...
-	}
+	compression := compressionPool.Get()
 
 	for i := range m.Question {
 		if off, err = packQuestion(m.Question[i], m.Data, off, compression); err != nil {
+			compressionPool.Put(compression)
 			return err
 		}
 	}
 
 	for i := range m.Answer {
 		if _, off, err = packRR(m.Answer[i], m.Data, off, compression); err != nil {
+			compressionPool.Put(compression)
 			return err
 		}
 	}
 	for i := range m.Ns {
 		if _, off, err = packRR(m.Ns[i], m.Data, off, compression); err != nil {
+			compressionPool.Put(compression)
 			return err
 		}
 	}
 	for i := range m.Extra {
 		if _, off, err = packRR(m.Extra[i], m.Data, off, compression); err != nil {
+			compressionPool.Put(compression)
 			return err
 		}
 	}
@@ -290,6 +284,7 @@ func (m *Msg) Pack() error {
 		// Also OPT may be anywhere in m.Extra, here it will be first.
 		if len(opt.Hdr.Name) != 0 {
 			if _, off, err = packRR(opt, m.Data, off, nil); err != nil {
+				compressionPool.Put(compression)
 				return err
 			}
 		}
@@ -298,15 +293,17 @@ func (m *Msg) Pack() error {
 	// records that really need to be last, TSIG or SGI0. "Checked" above, we just assume it is the last.
 	if tsigOrsig0 {
 		if _, off, err = packRR(m.Pseudo[len(m.Pseudo)-1], m.Data, off, compression); err != nil {
+			compressionPool.Put(compression)
 			return err
 		}
 	}
+	compressionPool.Put(compression)
 	m.Data = m.Data[:off]
 	return nil
 }
 
 // We only allow a single question in the question section.
-func (m *Msg) unpackQuestion(msg *cryptobyte.String, msgBuf []byte) (RR, error) {
+func (m *Msg) unpackQuestion(msg *dnsnet.String, msgBuf []byte) (RR, error) {
 	name, err := unpack.Name(msg, msgBuf)
 	if err != nil {
 		return nil, err
@@ -328,7 +325,7 @@ func (m *Msg) unpackQuestion(msg *cryptobyte.String, msgBuf []byte) (RR, error) 
 	return rr, nil
 }
 
-func (m *Msg) unpackQuestions(cnt uint16, msg *cryptobyte.String, msgBuf []byte) ([]RR, error) {
+func (m *Msg) unpackQuestions(cnt uint16, msg *dnsnet.String, msgBuf []byte) ([]RR, error) {
 	// We don't preallocate dst according to cnt as that value may be attacker
 	// controlled. A malicious adversary could send us as 12-byte packet
 	// containing only the header that claims to contain 65535 questions. As
@@ -345,7 +342,7 @@ func (m *Msg) unpackQuestions(cnt uint16, msg *cryptobyte.String, msgBuf []byte)
 	return dst, nil
 }
 
-func unpackRRs(cnt uint16, msg *cryptobyte.String, msgBuf []byte) ([]RR, error) {
+func unpackRRs(cnt uint16, msg *dnsnet.String, msgBuf []byte) ([]RR, error) {
 	if cnt == 0 {
 		return nil, nil
 	}
@@ -364,7 +361,10 @@ func unpackRRs(cnt uint16, msg *cryptobyte.String, msgBuf []byte) ([]RR, error) 
 
 // Unpack unpacks a binary message that sits in m.Data to a Msg structure.
 func (m *Msg) Unpack() (err error) {
-	s := cryptobyte.String(m.Data)
+	if len(m.Data) < MsgHeaderSize {
+		return fmt.Errorf("dns: message size can not be smaller than %d", MsgHeaderSize)
+	}
+	s := dnsnet.New(m.Data)
 	var (
 		counts uint64 // read all counters into 64 bits and slice the 16 bits values out of it
 		bits   uint16
@@ -398,7 +398,7 @@ func (m *Msg) Unpack() (err error) {
 		return err
 	}
 	if m.Options > 0 && m.Options <= MsgOptionUnpackQuestion {
-		m.offset = uint16(len(m.Data) - len(s))
+		m.offset = uint16(len(m.Data) - len(s.String))
 		return nil
 	}
 
@@ -461,7 +461,7 @@ Rest:
 		}
 	}
 	if !s.Empty() {
-		return unpack.Errorf("%d more octets", len(s))
+		return unpack.Errorf("%d more octets", len(s.String))
 	}
 
 	// TODO(miek): might it be possible, to do this in the loop - I've tried, but switching elements while
@@ -629,9 +629,8 @@ func (m *Msg) Len() int {
 	l := MsgHeaderSize
 
 	for i := range m.Question {
-		// See Header.Len() too, we always add a +1, even if the name is the root label.
 		// 4 is for the type and class
-		l += len(m.Question[i].Header().Name) + 1 + 4
+		l += len(m.Question[i].Header().Name) + dnsutilIsRoot(m.Question[i].Header().Name) + 4
 		break
 	}
 	for i := range m.Answer {
@@ -702,11 +701,6 @@ func (m *Msg) Read(p []byte) (n int, err error) {
 // If the message has not be hijacked, and m was create by the server, the Data buffer is returned
 // to the server's pool and zeroed out in m.
 func (m *Msg) WriteTo(w io.Writer) (int64, error) {
-	r, ok := w.(ResponseWriter)
-	if !ok {
-		return 0, fmt.Errorf("dns: writer is not a ResponseWriter")
-	}
-
 	if len(m.Data) == 0 {
 		if err := m.Pack(); err != nil {
 			return 0, err
@@ -716,6 +710,8 @@ func (m *Msg) WriteTo(w io.Writer) (int64, error) {
 	if rc, ok := w.(ResponseController); ok {
 		rc.SetWriteDeadline()
 	}
+
+	r := w.(ResponseWriter) // panic if wrong, saves an if here, assume this always to be true
 
 	if sock, ok := r.Conn().(*net.UDPConn); ok {
 		sess := r.Session()
@@ -736,6 +732,10 @@ func (m *Msg) WriteTo(w io.Writer) (int64, error) {
 	l = append(l, m.Data...)
 	n, err := r.Write(l)
 	msgPut(m)
+	if err != nil {
+		// hit deadline or other troubles, close this conn.
+		r.Close()
+	}
 	return int64(n), err
 }
 
@@ -767,29 +767,21 @@ func (m *Msg) ReadFrom(r io.Reader) (int64, error) {
 		return int64(n), err
 	}
 
-	// When doing io.Copy that underlaying type we get from net is net.tcpConnWithoutWriteTo, not a
-	// net.TCPConn.For udp this seems not to be the case, so the fallthrough when things are not UDP like
-	// is to assume TCP.
-
-	l := uint16(0)
-	if err := binary.Read(r, binary.BigEndian, &l); err != nil {
-		return 0, err
+	var l [2]byte
+	if n, err := io.ReadFull(r, l[:]); err != nil {
+		return int64(n), err
 	}
-	if l < MsgHeaderSize {
-		// ignore remaining data
-		return int64(l), fmt.Errorf("dns: message size %d, can not be smaller than %d", l, MsgHeaderSize)
-	}
+	ln := int(binary.BigEndian.Uint16(l[:]))
 
-	li := int(l)
-	if len(m.Data) < li {
-		m.Data = append(m.Data, make([]byte, li-len(m.Data))...)
+	if len(m.Data) < ln {
+		m.Data = append(m.Data, make([]byte, ln-len(m.Data))...)
 	} else {
-		m.Data = m.Data[:li]
+		m.Data = m.Data[:ln]
 	}
 	n, err := io.ReadFull(r, m.Data)
 	m.Data = m.Data[:n]
-	if err == nil && n != li {
-		return int64(n), fmt.Errorf("dns: message size %d does not match prefix %d", li, n)
+	if err == nil && n != ln {
+		return int64(n), fmt.Errorf("dns: message size %d does not match prefix %d", ln, n)
 	}
 	return int64(n), err
 }
@@ -862,3 +854,5 @@ func NewMsg(z string, t uint16, c ...uint16) *Msg {
 	m.Question = []RR{rr}
 	return m
 }
+
+var compressionPool = pool.NewCompression()

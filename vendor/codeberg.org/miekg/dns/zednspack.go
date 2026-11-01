@@ -1,6 +1,7 @@
 package dns
 
-// should be generated, it is not...
+// Should be generated, it is not... and while adding to this file, it seems auto generating
+// becomes more and more a distant dream.
 
 import (
 	"encoding/hex"
@@ -9,7 +10,7 @@ import (
 
 	"codeberg.org/miekg/dns/internal/pack"
 	"codeberg.org/miekg/dns/internal/unpack"
-	"golang.org/x/crypto/cryptobyte"
+	"codeberg.org/miekg/dns/pkg/dnsnet"
 )
 
 func (o *LLQ) pack(msg []byte, off int) (off1 int, err error) {
@@ -36,7 +37,7 @@ func (o *LLQ) pack(msg []byte, off int) (off1 int, err error) {
 	return off, nil
 }
 
-func (o *LLQ) unpack(s *cryptobyte.String) error {
+func (o *LLQ) unpack(s *dnsnet.String) error {
 	if !s.ReadUint16(&o.Version) {
 		return unpack.ErrOverflow
 	}
@@ -67,7 +68,7 @@ func (o *UPDATELEASE) pack(msg []byte, off int) (int, error) {
 	return off, nil
 }
 
-func (o *UPDATELEASE) unpack(s *cryptobyte.String) error {
+func (o *UPDATELEASE) unpack(s *dnsnet.String) error {
 	if !s.ReadUint32(&o.Lease) {
 		return unpack.ErrOverflow
 	}
@@ -77,8 +78,8 @@ func (o *UPDATELEASE) unpack(s *cryptobyte.String) error {
 	return nil
 }
 
-func (o *NSID) unpack(s *cryptobyte.String) error {
-	o.Nsid = hex.EncodeToString(*s)
+func (o *NSID) unpack(s *dnsnet.String) error {
+	o.Nsid = hex.EncodeToString(s.String)
 	return nil
 }
 
@@ -90,13 +91,13 @@ func (o *COOKIE) pack(msg []byte, off int) (int, error) {
 	return hex.Decode(msg[off:], []byte(o.Cookie))
 }
 
-func (o *COOKIE) unpack(s *cryptobyte.String) error {
-	o.Cookie = hex.EncodeToString(*s)
+func (o *COOKIE) unpack(s *dnsnet.String) error {
+	o.Cookie = hex.EncodeToString(s.String)
 	return nil
 }
 
-func (o *PADDING) unpack(s *cryptobyte.String) error {
-	o.Padding = hex.EncodeToString(*s)
+func (o *PADDING) unpack(s *dnsnet.String) error {
+	o.Padding = hex.EncodeToString(s.String)
 	return nil
 }
 
@@ -113,7 +114,7 @@ func (o *DAU) pack(msg []byte, off int) (off1 int, err error) {
 	return off, nil
 }
 
-func (o *DAU) unpack(s *cryptobyte.String) error {
+func (o *DAU) unpack(s *dnsnet.String) error {
 	for !s.Empty() {
 		var a uint8
 		s.ReadUint8(&a)
@@ -131,7 +132,7 @@ func (o *DHU) pack(msg []byte, off int) (off1 int, err error) {
 	return off, nil
 }
 
-func (o *DHU) unpack(s *cryptobyte.String) error {
+func (o *DHU) unpack(s *dnsnet.String) error {
 	for !s.Empty() {
 		var a uint8
 		s.ReadUint8(&a)
@@ -149,7 +150,7 @@ func (o *N3U) pack(msg []byte, off int) (off1 int, err error) {
 	return off, nil
 }
 
-func (o *N3U) unpack(s *cryptobyte.String) error {
+func (o *N3U) unpack(s *dnsnet.String) error {
 	for !s.Empty() {
 		var a uint8
 		s.ReadUint8(&a)
@@ -158,11 +159,11 @@ func (o *N3U) unpack(s *cryptobyte.String) error {
 	return nil
 }
 
-func (o *EDE) unpack(s *cryptobyte.String) (err error) {
+func (o *EDE) unpack(s *dnsnet.String) (err error) {
 	if !s.ReadUint16(&o.InfoCode) {
 		return unpack.ErrOverflow
 	}
-	if o.ExtraText, err = unpack.StringAny(s, len(*s)); err != nil {
+	if o.ExtraText, err = unpack.StringAny(s, len(s.String)); err != nil {
 		return unpack.Errorf("overflow EDE option")
 	}
 	return nil
@@ -177,8 +178,8 @@ func (o *EDE) pack(msg []byte, off int) (int, error) {
 	return off + len(o.ExtraText), nil
 }
 
-func (e *REPORTING) unpack(s *cryptobyte.String) (err error) {
-	e.AgentDomain, err = unpack.Name(s, nil) // TODO: unpackNAme with nil buffer, no compression pointers..
+func (e *REPORTING) unpack(s *dnsnet.String) (err error) {
+	e.AgentDomain, err = unpack.Name(s, nil)
 	if err != nil {
 		return unpack.Errorf("overflow REPORTING AgentDomain")
 	}
@@ -196,7 +197,7 @@ func (o *EXPIRE) pack(msg []byte, off int) (int, error) {
 	return pack.Uint32(o.Expire, msg, off)
 }
 
-func (o *EXPIRE) unpack(s *cryptobyte.String) error {
+func (o *EXPIRE) unpack(s *dnsnet.String) error {
 	if s.Empty() { // zero-length EXPIRE query, see RFC 7314 Section 2
 		o.Expire = 0
 		return nil
@@ -214,7 +215,7 @@ func (o *TCPKEEPALIVE) pack(msg []byte, off int) (int, error) {
 	return off, nil
 }
 
-func (o *TCPKEEPALIVE) unpack(s *cryptobyte.String) error {
+func (o *TCPKEEPALIVE) unpack(s *dnsnet.String) error {
 	if s.Empty() {
 		return nil
 	}
@@ -277,7 +278,7 @@ func (o *SUBNET) pack(msg []byte, off int) (int, error) {
 	return off, nil
 }
 
-func (o *SUBNET) unpack(s *cryptobyte.String) (err error) {
+func (o *SUBNET) unpack(s *dnsnet.String) (err error) {
 	if !s.ReadUint16(&o.Family) {
 		return unpack.ErrOverflow
 	}
@@ -287,7 +288,7 @@ func (o *SUBNET) unpack(s *cryptobyte.String) (err error) {
 	if !s.ReadUint8(&o.Scope) {
 		return unpack.ErrOverflow
 	}
-	n := o.Netmask / 8
+	n := int((o.Netmask + 7) / 8)
 	switch o.Family {
 	case 0:
 		// TODO(miek): make something that does not do a full parse.
@@ -326,12 +327,15 @@ func (o *ESU) pack(msg []byte, off int) (int, error) {
 	return pack.StringAny(o.URI, msg, off)
 }
 
-func (o *ESU) unpack(s *cryptobyte.String) (err error) {
-	o.URI, err = unpack.StringAny(s, len(*s))
+func (o *ESU) unpack(s *dnsnet.String) (err error) {
+	o.URI, err = unpack.StringAny(s, len(s.String))
 	return err
 }
 
 func (o *ZONEVERSION) pack(msg []byte, off int) (int, error) {
+	if o.empty() {
+		return off, nil
+	}
 	off, err := pack.Uint8(o.Labels, msg, off)
 	if err != nil {
 		return off, err
@@ -343,14 +347,17 @@ func (o *ZONEVERSION) pack(msg []byte, off int) (int, error) {
 	return pack.StringAny(string(o.Version), msg, off)
 }
 
-func (o *ZONEVERSION) unpack(s *cryptobyte.String) (err error) {
+func (o *ZONEVERSION) unpack(s *dnsnet.String) (err error) {
+	if s.Empty() {
+		return nil
+	}
 	if !s.ReadUint8(&o.Labels) {
 		return unpack.ErrOverflow
 	}
 	if !s.ReadUint8(&o.Type) {
 		return unpack.ErrOverflow
 	}
-	v, err := unpack.StringAny(s, len(*s))
+	v, err := unpack.StringAny(s, len(s.String))
 	o.Version = []byte(v)
 	return err
 }
@@ -359,8 +366,8 @@ func (o *ERFC3597) pack(msg []byte, off int) (int, error) {
 	return hex.Decode(msg[off:], []byte(o.Code))
 }
 
-func (o *ERFC3597) unpack(s *cryptobyte.String) error {
-	o.Code = hex.EncodeToString(*s)
+func (o *ERFC3597) unpack(s *dnsnet.String) error {
+	o.Code = hex.EncodeToString(s.String)
 	return nil
 }
 
@@ -374,7 +381,7 @@ func (o *MQRESPONSE) pack(msg []byte, off int) (int, error) {
 	return off, nil
 }
 
-func (o *MQRESPONSE) unpack(s *cryptobyte.String) error {
+func (o *MQRESPONSE) unpack(s *dnsnet.String) error {
 	for !s.Empty() {
 		var t uint16
 		if !s.ReadUint16(&t) {
@@ -395,7 +402,7 @@ func (o *MQQUERY) pack(msg []byte, off int) (int, error) {
 	return off, nil
 }
 
-func (o *MQQUERY) unpack(s *cryptobyte.String) error {
+func (o *MQQUERY) unpack(s *dnsnet.String) error {
 	for !s.Empty() {
 		var t uint16
 		if !s.ReadUint16(&t) {
@@ -416,7 +423,7 @@ func (o *KEYTAG) pack(msg []byte, off int) (int, error) {
 	return off, nil
 }
 
-func (o *KEYTAG) unpack(s *cryptobyte.String) error {
+func (o *KEYTAG) unpack(s *dnsnet.String) error {
 	for !s.Empty() {
 		var t uint16
 		if !s.ReadUint16(&t) {
