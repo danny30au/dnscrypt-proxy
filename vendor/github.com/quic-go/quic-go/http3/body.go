@@ -68,7 +68,12 @@ func (r *body) Read(b []byte) (int, error) {
 	if err := r.checkContentLengthViolation(); err != nil {
 		return n, err
 	}
-	return n, maybeReplaceError(err)
+	// The peer ended the stream before sending as much content as it announced.
+	// There's nothing left to reset at this point, so only surface the error, like net/http does.
+	if err == io.EOF && r.hasContentLength && r.remainingContentLength > 0 {
+		return n, io.ErrUnexpectedEOF
+	}
+	return n, err
 }
 
 func (r *body) Close() error {
@@ -118,7 +123,7 @@ func (r *hijackableBody) Read(b []byte) (int, error) {
 	if err != nil {
 		r.requestDone()
 	}
-	return n, maybeReplaceError(err)
+	return n, err
 }
 
 func (r *hijackableBody) requestDone() {

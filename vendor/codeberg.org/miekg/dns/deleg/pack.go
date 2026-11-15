@@ -5,7 +5,7 @@ import (
 
 	"codeberg.org/miekg/dns/internal/pack"
 	"codeberg.org/miekg/dns/internal/unpack"
-	"golang.org/x/crypto/cryptobyte"
+	"codeberg.org/miekg/dns/pkg/dnsnet"
 )
 
 // should all be generated...
@@ -26,7 +26,7 @@ func _pack(i Info, msg []byte, off int) (int, error) {
 }
 
 // unpack converts wire-format to an info.
-func _unpack(i Info, data *cryptobyte.String) error {
+func _unpack(i Info, data *dnsnet.String) error {
 	switch x := i.(type) {
 	case *SERVERIPV4:
 		return x.unpack(data)
@@ -54,7 +54,7 @@ func (s *SERVERIPV4) pack(msg []byte, off int) (int, error) {
 	return off, nil
 }
 
-func (s *SERVERIPV4) unpack(sc *cryptobyte.String) error {
+func (s *SERVERIPV4) unpack(sc *dnsnet.String) error {
 	for !sc.Empty() {
 		ip, err := unpack.A(sc)
 		if err != nil {
@@ -79,7 +79,7 @@ func (s *SERVERIPV6) pack(msg []byte, off int) (int, error) {
 	return off, nil
 }
 
-func (s *SERVERIPV6) unpack(sc *cryptobyte.String) error {
+func (s *SERVERIPV6) unpack(sc *dnsnet.String) error {
 	for !sc.Empty() {
 		ip, err := unpack.AAAA(sc)
 		if err != nil {
@@ -104,8 +104,8 @@ func (s *SERVERNAME) pack(msg []byte, off int) (int, error) {
 	return off, nil
 }
 
-func (s *SERVERNAME) unpack(sc *cryptobyte.String) error {
-	if !sc.Empty() {
+func (s *SERVERNAME) unpack(sc *dnsnet.String) error {
+	for !sc.Empty() {
 		hostname, err := unpack.Name(sc, nil)
 		if err != nil {
 			return err
@@ -129,8 +129,8 @@ func (s *INCLUDEDELEGPARAM) pack(msg []byte, off int) (int, error) {
 	return off, nil
 }
 
-func (s *INCLUDEDELEGPARAM) unpack(sc *cryptobyte.String) error {
-	if !sc.Empty() {
+func (s *INCLUDEDELEGPARAM) unpack(sc *dnsnet.String) error {
+	for !sc.Empty() {
 		domain, err := unpack.Name(sc, nil)
 		if err != nil {
 			return err

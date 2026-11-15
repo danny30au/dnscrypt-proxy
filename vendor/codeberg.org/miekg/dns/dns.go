@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"codeberg.org/miekg/dns/pkg/dnsnet"
 	"codeberg.org/miekg/dns/pkg/pool"
 )
 
@@ -122,7 +123,7 @@ type Header struct {
 	Class uint16 // Class is the class of the RR, this is almost always [ClassINET].
 }
 
-func (h *Header) Len() int        { return len(h.Name) + 1 + 10 } // +1 because miek.nl. is actually .miek.nl.
+func (h *Header) Len() int        { return len(h.Name) + dnsutilIsRoot(h.Name) + 10 } // +1 because miek.nl. is actually .miek.nl, but root is .
 func (h *Header) Header() *Header { return h }
 func (h *Header) Data() RDATA     { return nil }
 func (h *Header) Clone() RR       { return &Header{h.Name, h.TTL, h.Class} }
@@ -205,11 +206,11 @@ type MsgHeader struct {
 	AuthenticatedData  bool
 	CheckingDisabled   bool
 
-	// Extended DNS.
+	// Extended DNS Flags
 	Security       bool   // Security is the DNSSEC OK bit, see RFC 403{3,4,5}, see [OPT.security].
 	CompactAnswers bool   // Compact Answers OK, see RFC 9824, see [OPT.compactAnswers].
 	Delegation     bool   // Delegation is the DELEG OK bit, see https://datatracker.ietf.org/doc/draft-ietf-deleg/ and [OPT.delegation].
-	Z              uint16 // Z holds the OPT's unassigned Z bits, see [OPT.z].
+	Flags          uint16 // Flags holds the OPT's remaining, unassigned flags bits, see [OPT.flags].
 }
 
 // Msg is a DNS message. Each message has a Data field that contains the binary data buffer. This is filled when
@@ -262,7 +263,10 @@ const (
 	MsgOptionUnpackHeader   MsgOption = 1 << iota // Unpack only the header of the message.
 	MsgOptionUnpackQuestion                       // Unpack up the question section of the message.
 	MsgOptionUnpackAnswer                         // Unpack up to the answer section of the message.
+)
 
+const (
+	MsgOptionPackExpand MsgOption = 255 - iota // Pack without compression.
 )
 
 // Convert a MsgHeader to a string, with dig-like headers:
@@ -333,7 +337,9 @@ func (rr *RFC3597) ToRFC3597(r RR) error {
 		return nil
 	}
 
-	return rr.unpack(buf[headerEnd:], buf)
+	s := dnsnet.New(buf)
+	s.Skip(headerEnd)
+	return rr.unpack(&s, buf)
 }
 
 // fromRFC3597 converts an unknown RR representation from RFC 3597 to the known RR type.
@@ -352,7 +358,8 @@ func (rr *RFC3597) fromRFC3597(r RR) error {
 	if len(msg) == 0 { // no rdata
 		return nil
 	}
-	return zunpack(r, msg, msg)
+	s := dnsnet.New(msg)
+	return zunpack(r, &s, msg)
 }
 
 const msgArcount = 10 // offset in the message where the Arcount is, 2 octets long.

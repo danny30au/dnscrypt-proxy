@@ -5,17 +5,17 @@ import (
 
 	"codeberg.org/miekg/dns/internal/pack"
 	"codeberg.org/miekg/dns/internal/unpack"
-	"golang.org/x/crypto/cryptobyte"
+	"codeberg.org/miekg/dns/pkg/dnsnet"
 )
 
-func unpackOPT(s *cryptobyte.String) ([]EDNS0, error) {
+func unpackOPT(s *dnsnet.String) ([]EDNS0, error) {
 	edns0 := []EDNS0{}
+	var (
+		code uint16
+		data dnsnet.String
+	)
 	for !s.Empty() {
-		var (
-			code uint16
-			data cryptobyte.String
-		)
-		if !s.ReadUint16(&code) || !s.ReadUint16LengthPrefixed(&data) {
+		if !s.ReadUint16(&code) || !s.ReadUint16LengthPrefixed(&data.String) {
 			return nil, unpack.ErrOverflow
 		}
 		var option EDNS0
@@ -27,6 +27,8 @@ func unpackOPT(s *cryptobyte.String) ([]EDNS0, error) {
 		if err := unpackOptionCode(option, &data); err != nil {
 			return nil, err
 		}
+		// !data.Empty() does not work here because unpackOptionCode might not use dnsnet.String to drain it
+		// but just uses the []byte.
 		edns0 = append(edns0, option)
 	}
 	return edns0, nil
